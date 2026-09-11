@@ -1,0 +1,41 @@
+[package]
+name = "primordia"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "A GPU artificial-life laboratory: slime molds, particle life, Lenia and reaction-diffusion rendered as living light."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/skulitom/primordia"
+homepage = "https://github.com/skulitom/primordia"
+keywords = ["artificial-life", "wgpu", "simulation", "generative-art", "physarum"]
+categories = ["simulation", "graphics", "visualization"]
+
+[dependencies]
+# Rendering / windowing. Versions are pinned to the newest releases that still
+# build on Rust 1.86 (egui-wgpu 0.32 requires wgpu 25 + winit 0.30).
+wgpu = "25.0.2"
+winit = "0.30.13"
+egui = "0.32.3"
+egui-wgpu = { version = "0.32.3", features = ["winit"] }
+egui-winit = "0.32.3"
+
+pollster = "0.4"
+bytemuck = { version = "1.23", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 1
+
+# Dependencies (wgpu, naga, egui, png) are compiled optimised even in dev
+# builds so the debug binary still runs at full speed.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
