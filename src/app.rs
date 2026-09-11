@@ -1,6 +1,7 @@
 //! Interactive window: winit event loop, wgpu surface, egui control panel.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -99,6 +100,13 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_mut() else { return };
+        if let Some(problem) = state.gpu.fatal_error() {
+            self.error = Some(anyhow!(
+                "{problem}\nIf another program is using most of the GPU or its memory, close it and try again."
+            ));
+            event_loop.exit();
+            return;
+        }
         if state.exit_due() {
             event_loop.exit();
             return;
@@ -106,6 +114,10 @@ impl ApplicationHandler for App {
         if state.minimized {
             // Nothing is presented, so vsync no longer paces the loop: sleep instead of spinning.
             event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(100)));
+        } else if !state.gpu_ready() {
+            // The GPU is still working on the previous frame: look again shortly
+            // rather than spinning (and rather than acquiring the next image).
+            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(2)));
         } else {
             event_loop.set_control_flow(ControlFlow::Poll);
             state.window.request_redraw();
@@ -279,6 +291,21 @@ struct State {
     /// Frames to wait before honouring `--record`, so the window can settle
     /// (its first resize events would otherwise end the recording at once).
     record_start_in: Option<u32>,
+
+    /// Set once the GPU has finished the previous frame. The next swapchain
+    /// image is only acquired after that: when another program saturates the
+    /// GPU and a frame takes over a second, wgpu 25 would otherwise reuse a
+    /// swapchain semaphore that is still in flight
+    /// (VUID-vkAcquireNextImageKHR-semaphore-01779) and the driver can hang.
+    frame_done: Arc<AtomicBool>,
+    /// When we started waiting for a busy GPU.
+    gpu_wait_since: Option<Instant>,
+    /// Until when the title shows "GPU busy" (extended by every slow frame).
+    gpu_busy_until: Option<Instant>,
+    /// Last time a slow-GPU warning was logged (they are rate-limited).
+    gpu_warned_at: Option<Instant>,
+    /// Development aid: extra GPU work per frame (`PRIMORDIA_DEBUG_GPU_STALL_MS`).
+    stall: Option<crate::stall::Stall>,
 }
 
 impl Drop for State {
@@ -370,6 +397,7 @@ impl State {
             world.size()[1]
         );
         let now = Instant::now();
+        let stall = crate::stall::Stall::from_env(&gpu);
         let mut state = Self {
             window,
             gpu,
@@ -411,6 +439,11 @@ impl State {
             recorder: None,
             record_clock: 0.0,
             record_start_in: opts.record.then_some(3),
+            frame_done: Arc::new(AtomicBool::new(true)),
+            gpu_wait_since: None,
+            gpu_busy_until: None,
+            gpu_warned_at: None,
+            stall,
         };
         state.toast_for(
             "Drag to interact · wheel zooms · middle-drag pans · H hides the panel · Space pauses".to_string(),
@@ -652,24 +685,43 @@ impl State {
                 if index != self.world_index {
                     let size = scaled(self.target_size(), self.sim_scale);
                     self.gpu.wait_idle();
-                    let (i, world) = world::create(&self.gpu, WORLDS[index].id, size, None, seed)?;
-                    self.world = world;
-                    self.world_index = i;
-                    self.look = self.world.post_settings();
-                    self.camera = Camera::default();
-                    self.modified = false;
-                    self.toast(format!("{} — {}", WORLDS[i].name, WORLDS[i].tagline));
+                    self.gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                    let created = world::create(&self.gpu, WORLDS[index].id, size, None, seed);
+                    let oom = pollster::block_on(self.gpu.device.pop_error_scope());
+                    let (i, world) = created?;
+                    if let Some(err) = oom {
+                        // Keep the current world rather than switching to a half-built one.
+                        drop(world);
+                        self.report_oom(&err);
+                    } else {
+                        self.world = world;
+                        self.world_index = i;
+                        self.look = self.world.post_settings();
+                        self.camera = Camera::default();
+                        self.modified = false;
+                        self.toast(format!("{} — {}", WORLDS[i].name, WORLDS[i].tagline));
+                    }
                 }
             }
             Action::LoadPreset(index) => {
-                self.world.load_preset(&self.gpu, index, seed);
+                if let Some(err) = self.catch_oom(|s| s.world.load_preset(&s.gpu, index, seed)) {
+                    self.report_oom(&err);
+                    return Ok(());
+                }
                 self.look = self.world.post_settings();
                 self.modified = false;
                 self.toast(self.preset_name().to_string());
             }
-            Action::Reset => self.world.reset(&self.gpu, seed),
+            Action::Reset => {
+                if let Some(err) = self.catch_oom(|s| s.world.reset(&s.gpu, seed)) {
+                    self.report_oom(&err);
+                }
+            }
             Action::Mutate => {
-                self.world.mutate(&self.gpu, seed);
+                if let Some(err) = self.catch_oom(|s| s.world.mutate(&s.gpu, seed)) {
+                    self.report_oom(&err);
+                    return Ok(());
+                }
                 self.look = self.world.post_settings();
                 self.modified = true;
                 self.toast("Mutated".to_string());
@@ -685,6 +737,21 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// Runs `f` inside an out-of-memory error scope and returns the error, if any.
+    fn catch_oom(&mut self, f: impl FnOnce(&mut Self)) -> Option<wgpu::Error> {
+        self.gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        f(self);
+        pollster::block_on(self.gpu.device.pop_error_scope())
+    }
+
+    fn report_oom(&mut self, err: &wgpu::Error) {
+        log::error!("out of GPU memory: {err}");
+        self.toast_for(
+            "Out of GPU memory. Close other GPU-heavy programs, or make the window smaller.".to_string(),
+            6.0,
+        );
     }
 
     fn toast(&mut self, text: String) {
@@ -747,17 +814,65 @@ impl State {
         }
     }
 
-    fn redraw(&mut self) -> Result<()> {
+    /// True when the GPU has finished the previous frame, so a new frame may
+    /// acquire the next swapchain image. Notes (in the log and the title bar)
+    /// when another program keeps the GPU busy for a long time.
+    fn gpu_ready(&mut self) -> bool {
+        let _ = self.gpu.device.poll(wgpu::PollType::Poll);
         let now = Instant::now();
-        let dt = (now - self.last_instant).as_secs_f32().min(0.1);
-        self.last_instant = now;
-        if dt > 0.0 {
-            self.fps = if self.fps == 0.0 { 1.0 / dt } else { self.fps * 0.95 + 0.05 / dt };
+        if self.frame_done.load(Ordering::Acquire) {
+            if let Some(since) = self.gpu_wait_since.take() {
+                let waited = now - since;
+                if waited > Duration::from_millis(250) {
+                    self.gpu_busy_until = Some(now + Duration::from_secs(5));
+                    self.warn_gpu_busy(&format!("waited {:.1}s for the GPU to finish a frame", waited.as_secs_f32()));
+                }
+            }
+            return true;
         }
-        self.frames_since_start += 1;
-        if self.minimized {
+        let since = *self.gpu_wait_since.get_or_insert(now);
+        if now - since > Duration::from_millis(1500) && !self.gpu_busy_until.is_some_and(|t| t > now) {
+            self.gpu_busy_until = Some(now + Duration::from_secs(5));
+            self.warn_gpu_busy("the GPU is taking very long to finish frames");
+            let title = self.title();
+            self.window.set_title(&title);
+        }
+        false
+    }
+
+    /// Logs a slow-GPU warning, at most once every 10 seconds.
+    fn warn_gpu_busy(&mut self, what: &str) {
+        let now = Instant::now();
+        if self.gpu_warned_at.is_none_or(|t| now - t > Duration::from_secs(10)) {
+            self.gpu_warned_at = Some(now);
+            log::warn!("{what}; another program may be using the GPU heavily");
+        }
+    }
+
+    fn title(&self) -> String {
+        let paused = if self.paused { " · paused" } else { "" };
+        let busy = if self.gpu_busy_until.is_some_and(|t| Instant::now() < t) {
+            " · GPU busy (another program may be using it heavily)"
+        } else {
+            ""
+        };
+        format!("Primordia — {} · {} — {:.0} fps{paused}{busy}", self.world.name(), self.preset_label(), self.fps)
+    }
+
+    fn redraw(&mut self) -> Result<()> {
+        // The OS can ask for redraws (resize, expose) while the GPU is still busy.
+        if self.minimized || !self.gpu_ready() {
             return Ok(());
         }
+        let now = Instant::now();
+        let elapsed = (now - self.last_instant).as_secs_f32();
+        // The simulation step is clamped; the fps readout uses the real frame time.
+        let dt = elapsed.min(0.1);
+        self.last_instant = now;
+        if elapsed > 0.0 {
+            self.fps = if self.fps == 0.0 { 1.0 / elapsed } else { self.fps * 0.95 + 0.05 / elapsed };
+        }
+        self.frames_since_start += 1;
         if let Some(n) = self.record_start_in {
             if n == 0 {
                 self.record_start_in = None;
@@ -818,6 +933,9 @@ impl State {
             }
             self.world.render(&frame, &mut encoder, self.post.scene_view());
         }
+        if let Some(stall) = &self.stall {
+            stall.record(&mut encoder);
+        }
         let mut look = self.look;
         look.exposure *= self.tour_fade();
         self.post.bloom(&self.gpu, &mut encoder, &look, self.time);
@@ -857,11 +975,18 @@ impl State {
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen);
         }
         self.gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        self.gpu.queue.on_submitted_work_done(move || flag.store(true, Ordering::Release));
+        self.frame_done = done;
         let suboptimal = surface_texture.suboptimal;
         self.window.pre_present_notify();
         surface_texture.present();
         self.free_egui_textures(&full_output.textures_delta.free);
-        if suboptimal {
+        // Some setups (e.g. a window on a display driven by another adapter)
+        // report every present as suboptimal; only rebuild the swapchain when
+        // the window size actually changed.
+        if suboptimal && self.window.inner_size() != PhysicalSize::new(self.config.width, self.config.height) {
             self.reconfigure();
         }
 
@@ -895,8 +1020,7 @@ impl State {
 
         if self.last_title.elapsed().as_secs_f32() > 0.5 {
             self.last_title = Instant::now();
-            let paused = if self.paused { " · paused" } else { "" };
-            let title = format!("Primordia — {} · {} — {:.0} fps{paused}", self.world.name(), self.preset_label(), self.fps);
+            let title = self.title();
             self.window.set_title(&title);
         }
         Ok(())

@@ -207,6 +207,9 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
             readback.copy_from(&mut encoder, &out_texture);
         }
         gpu.queue.submit([encoder.finish()]);
+        if let Some(problem) = gpu.fatal_error() {
+            bail!("GPU error while rendering: {problem}");
+        }
 
         if capture {
             let pixels = readback.read(gpu)?;

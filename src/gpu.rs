@@ -1,6 +1,7 @@
 //! GPU context plus small helpers that keep the world implementations terse.
 
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context as _, Result};
 use wgpu::util::DeviceExt as _;
@@ -20,6 +21,8 @@ pub struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// First unrecoverable GPU problem (device lost, out of memory, validation).
+    fatal: Arc<Mutex<Option<String>>>,
 }
 
 impl Gpu {
@@ -61,7 +64,31 @@ impl Gpu {
             .await
             .context("failed to open GPU device")?;
 
-        Ok(Self { instance, adapter, device, queue })
+        // Record problems instead of panicking inside wgpu's callbacks, so the
+        // app and headless renders can stop cleanly with a readable message.
+        let fatal = Arc::new(Mutex::new(None::<String>));
+        let record = |fatal: &Arc<Mutex<Option<String>>>, text: String| {
+            log::error!("{text}");
+            fatal.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(text);
+        };
+        {
+            let fatal = fatal.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                record(&fatal, format!("the GPU device was lost ({reason:?}): {message}"));
+            });
+        }
+        {
+            let fatal = fatal.clone();
+            device.on_uncaptured_error(Box::new(move |error| record(&fatal, format!("wgpu error: {error}"))));
+        }
+
+        Ok(Self { instance, adapter, device, queue, fatal })
+    }
+
+    /// The first unrecoverable problem wgpu reported (device lost, out of memory,
+    /// a validation error), if any. Callers should stop using the GPU when set.
+    pub fn fatal_error(&self) -> Option<String> {
+        self.fatal.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     pub fn adapter_name(&self) -> String {

@@ -8,6 +8,7 @@ mod palette;
 mod post;
 mod rng;
 mod selftest;
+mod stall;
 mod world;
 
 use std::path::PathBuf;
