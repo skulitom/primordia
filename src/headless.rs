@@ -109,6 +109,46 @@ pub enum Encode {
     Realtime,
 }
 
+/// Own the encoder until it is finalized, including early returns on GPU or file errors.
+struct VideoEncoder {
+    child: Option<Child>,
+}
+
+impl VideoEncoder {
+    fn write(&mut self, pixels: &[u8]) -> Result<()> {
+        let child = self.child.as_mut().expect("encoder is running");
+        let written = match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(pixels),
+            None => Err(std::io::Error::other("stdin closed")),
+        };
+        if let Err(e) = written {
+            return Err(ffmpeg_failure(self.child.take().expect("encoder is running"), e));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let child = self.child.as_mut().expect("encoder is running");
+        drop(child.stdin.take());
+        let status = child.wait().context("waiting for ffmpeg")?;
+        self.child.take();
+        if !status.success() {
+            bail!("ffmpeg exited with {status}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub fn render(job: &RenderJob) -> Result<()> {
     let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))?;
     render_with(&gpu, job).map(|_| ())
@@ -116,6 +156,8 @@ pub fn render(job: &RenderJob) -> Result<()> {
 
 /// Renders `job`; returns the path of the PNG written, if any.
 pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
+    // Validate the entire pacing interval before rendering or writing any files.
+    frame_deadline(Instant::now(), job.frames.max(1), job.max_fps)?;
     // yuv420p video needs even dimensions; stills keep the exact size.
     let size = if job.video.is_some() {
         [job.size[0].max(2) & !1, job.size[1].max(2) & !1]
@@ -177,7 +219,7 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
     let readback = Readback::new(gpu, size, OUTPUT_FORMAT);
     let view = ViewXform::fit(world.size(), size, &job.camera);
     let mut ffmpeg = match &job.video {
-        Some(path) => Some(spawn_ffmpeg(path, size, job.fps, Encode::Quality)?),
+        Some(path) => Some(VideoEncoder { child: Some(spawn_ffmpeg(path, size, job.fps, Encode::Quality)?) }),
         None => None,
     };
 
@@ -213,14 +255,8 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
 
         if capture {
             let pixels = readback.read(gpu)?;
-            if let Some(child) = ffmpeg.as_mut() {
-                let written = match child.stdin.as_mut() {
-                    Some(stdin) => stdin.write_all(&pixels),
-                    None => Err(std::io::Error::other("stdin closed")),
-                };
-                if let Err(e) = written {
-                    return Err(ffmpeg_failure(ffmpeg.take().expect("ffmpeg is running"), e));
-                }
+            if let Some(encoder) = ffmpeg.as_mut() {
+                encoder.write(&pixels)?;
             }
             if save_frame {
                 let path = job.frames_dir.join(format!("{}_{:05}.png", world.id(), f + 1));
@@ -238,7 +274,7 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         }
         if job.max_fps > 0.0 {
             // Pace submissions so the GPU idles between frames instead of running flat out.
-            let due = started + std::time::Duration::from_secs_f32((f + 1) as f32 / job.max_fps);
+            let due = frame_deadline(started, f + 1, job.max_fps)?;
             let now = Instant::now();
             if due > now {
                 std::thread::sleep(due - now);
@@ -257,17 +293,25 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         }
     }
 
-    if let Some(mut child) = ffmpeg {
-        drop(child.stdin.take());
-        let status = child.wait().context("waiting for ffmpeg")?;
-        if !status.success() {
-            bail!("ffmpeg exited with {status}");
-        }
+    if let Some(encoder) = ffmpeg {
+        encoder.finish()?;
         log::info!("wrote {}", job.video.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
     }
     let secs = started.elapsed().as_secs_f32();
     log::log!(progress_level, "done: {frames} frames in {secs:.1}s ({:.1} fps)", frames as f32 / secs.max(1e-3));
     Ok(out)
+}
+
+fn frame_deadline(started: Instant, frames: u32, max_fps: f32) -> Result<Instant> {
+    if !max_fps.is_finite() || max_fps < 0.0 {
+        bail!("--max-fps must be a finite, non-negative number (0 = unlimited)");
+    }
+    if max_fps == 0.0 {
+        return Ok(started);
+    }
+    let interval = std::time::Duration::try_from_secs_f64(f64::from(frames) / f64::from(max_fps))
+        .context("--max-fps is too small for the requested frame count")?;
+    started.checked_add(interval).context("--max-fps is too small for the system clock")
 }
 
 pub struct GalleryJob {
@@ -418,5 +462,20 @@ pub fn ffmpeg_failure(mut child: Child, err: std::io::Error) -> anyhow::Error {
     match child.wait() {
         Ok(status) => anyhow!("ffmpeg exited with {status} while encoding ({err})"),
         Err(wait_err) => anyhow!("ffmpeg failed while encoding ({err}; {wait_err})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_rejects_unrepresentable_and_nonfinite_intervals() {
+        let start = Instant::now();
+        for fps in [1e-40, f32::NAN, f32::INFINITY, -1.0] {
+            assert!(frame_deadline(start, 600, fps).is_err(), "fps: {fps}");
+        }
+        assert_eq!(frame_deadline(start, 600, 0.0).unwrap(), start);
+        assert_eq!(frame_deadline(start, 600, 60.0).unwrap() - start, std::time::Duration::from_secs(10));
     }
 }

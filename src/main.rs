@@ -66,19 +66,19 @@ struct RunArgs {
     #[arg(long)]
     no_vsync: bool,
     /// Simulation resolution relative to the window's pixel size
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = finite_float)]
     sim_scale: f32,
     /// Start with the control panel hidden (H or Tab shows it)
     #[arg(long)]
     hide_ui: bool,
     /// Quit automatically after this many seconds (useful for smoke tests)
-    #[arg(long, value_name = "SECS")]
+    #[arg(long, value_name = "SECS", value_parser = finite_float)]
     exit_after: Option<f32>,
     /// Folder for screenshots and recordings
     #[arg(long, default_value = "screenshots")]
     screenshot_dir: PathBuf,
     /// Screensaver mode: fade to the next preset (then world) every SECS seconds
-    #[arg(long, value_name = "SECS")]
+    #[arg(long, value_name = "SECS", value_parser = finite_float)]
     tour: Option<f32>,
     /// Start recording an MP4 (into --screenshot-dir) immediately; V toggles it
     #[arg(long)]
@@ -149,34 +149,34 @@ struct RenderArgs {
     #[arg(long, default_value = "frames")]
     frames_dir: PathBuf,
     /// Override the preset's exposure
-    #[arg(long)]
+    #[arg(long, value_parser = finite_float)]
     exposure: Option<f32>,
     /// Override the preset's bloom strength (0 disables bloom)
-    #[arg(long)]
+    #[arg(long, value_parser = finite_float)]
     bloom: Option<f32>,
     /// Override the preset's bloom threshold
-    #[arg(long)]
+    #[arg(long, value_parser = finite_float)]
     bloom_threshold: Option<f32>,
     /// Override the preset's tonemapper
     #[arg(long, value_enum)]
     tonemap: Option<TonemapArg>,
     /// Camera zoom (1 = whole world, >1 = close-up, <1 = show the torus tiling)
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = finite_float)]
     zoom: f32,
     /// Camera centre in world uv, e.g. --center 0.25,0.5
-    #[arg(long, value_delimiter = ',', default_values_t = [0.5, 0.5], allow_negative_numbers = true)]
+    #[arg(long, value_delimiter = ',', default_values_t = [0.5, 0.5], allow_negative_numbers = true, value_parser = finite_float)]
     center: Vec<f32>,
     /// Hold a scripted mouse button for the whole render (tests interaction)
     #[arg(long, value_enum)]
     brush: Option<BrushArg>,
     /// Where to hold the brush, in world uv (e.g. 0.3,0.6) [default: orbit the centre]
-    #[arg(long, value_delimiter = ',', allow_negative_numbers = true)]
+    #[arg(long, value_delimiter = ',', allow_negative_numbers = true, value_parser = finite_float)]
     brush_at: Vec<f32>,
     /// Brush radius in world cells
-    #[arg(long, default_value_t = 40.0)]
+    #[arg(long, default_value_t = 40.0, value_parser = finite_float)]
     brush_radius: f32,
     /// Frame-rate ceiling that keeps the GPU from running flat out (0 = unlimited)
-    #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS)]
+    #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS, value_parser = finite_float)]
     max_fps: f32,
 }
 
@@ -204,8 +204,16 @@ struct GalleryArgs {
     #[arg(long)]
     no_sheet: bool,
     /// Frame-rate ceiling per render, keeps the GPU from running flat out (0 = unlimited)
-    #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS)]
+    #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS, value_parser = finite_float)]
     max_fps: f32,
+}
+
+fn finite_float(value: &str) -> std::result::Result<f32, String> {
+    let number = value.parse::<f32>().map_err(|e| e.to_string())?;
+    if !number.is_finite() {
+        return Err("expected a finite number (NaN and infinity are not supported)".to_string());
+    }
+    Ok(number)
 }
 
 fn main() {
@@ -275,7 +283,7 @@ fn run() -> Result<()> {
                 tonemap: r.tonemap.map(Into::into),
                 camera: world::Camera { center: [r.center[0], r.center[1]], zoom: r.zoom.clamp(0.05, 256.0) },
                 brush,
-                max_fps: r.max_fps.max(0.0),
+                max_fps: r.max_fps,
                 quiet: false,
             })
         }
@@ -286,7 +294,7 @@ fn run() -> Result<()> {
             seed: g.seed,
             world: g.world,
             sheet: !g.no_sheet,
-            max_fps: g.max_fps.max(0.0),
+            max_fps: g.max_fps,
         }),
         Some(Command::List) => list(),
         Some(Command::Selftest) => selftest::run(),
@@ -308,4 +316,38 @@ fn list() -> Result<()> {
         println!("  {}", p.name);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_rejects_nonfinite_numbers_in_every_float_option() {
+        for invalid in ["NaN", "inf", "-inf", "1e100"] {
+            for flag in ["--sim-scale", "--exit-after", "--tour"] {
+                assert!(Cli::try_parse_from(["primordia", &format!("{flag}={invalid}")]).is_err());
+            }
+            for flag in ["--exposure", "--bloom", "--bloom-threshold", "--zoom", "--brush-radius", "--max-fps"] {
+                assert!(Cli::try_parse_from(["primordia", "render", &format!("{flag}={invalid}")]).is_err());
+            }
+            for flag in ["--center", "--brush-at"] {
+                assert!(Cli::try_parse_from(["primordia", "render", &format!("{flag}=0.5,{invalid}")]).is_err());
+            }
+            assert!(Cli::try_parse_from(["primordia", "gallery", &format!("--max-fps={invalid}")]).is_err());
+        }
+    }
+
+    #[test]
+    fn cli_accepts_finite_coordinates_and_unlimited_rendering() {
+        assert!(Cli::try_parse_from(["primordia"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "primordia", "render", "--center=-0.25,1.5", "--brush-at=2,-1", "--max-fps=0", "--bloom=0",
+        ]).unwrap();
+        let Some(Command::Render(args)) = cli.command else { panic!("expected render") };
+        assert_eq!(args.center, [-0.25, 1.5]);
+        assert_eq!(args.brush_at, [2.0, -1.0]);
+        assert_eq!(args.max_fps, 0.0);
+        assert_eq!(args.bloom, Some(0.0));
+    }
 }

@@ -1506,7 +1506,7 @@ impl World for Physarum {
         let speed = rng.range(0.8, 1.8);
         let curl = if rng.chance(0.2) { rng.range(0.5, 2.0) * if rng.chance(0.5) { 1.0 } else { -1.0 } } else { 0.0 };
         let colors = *rng.pick(COLOR_SETS);
-        for s in 0..MAX_SPECIES {
+        for (s, color) in colors.iter().enumerate().take(MAX_SPECIES) {
             let v = |rng: &mut Rng| rng.range(0.75, 1.3);
             self.params.species[s] = Species {
                 sensor_angle: (sensor_angle * v(&mut rng)).clamp(10.0, 90.0),
@@ -1517,7 +1517,7 @@ impl World for Physarum {
                 wander: if rng.chance(0.3) { rng.range(1.0, 6.0) } else { 0.0 },
                 curl,
                 spread: if rng.chance(0.6) { rng.range(0.3, 1.2) } else { 0.0 },
-                color: rgb(colors[s]),
+                color: rgb(*color),
             };
         }
 

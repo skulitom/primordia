@@ -137,7 +137,7 @@ fn k(source: usize, target: usize, radius: f32, b: &[f32], mu: f32, sigma: f32, 
 
 /// mu / sigma at which the growth function vanishes in empty space:
 /// 2 exp(-mu^2 / (2 sigma^2)) - 1 = 0  <=>  mu = sigma sqrt(2 ln 2).
-const NEUTRAL_MU: f32 = 1.177_410_0;
+const NEUTRAL_MU: f32 = 1.177_41;
 
 /// A cross-species kernel that is silent while its source channel is absent
 /// (G(0) = 0), so it leaves each species' own dynamics untouched until another
@@ -1557,7 +1557,7 @@ fn nursery_state(
     let n = w * h;
     let channels = params.active_channels();
     let mut cells = vec![0.0f32; n * CHANNELS];
-    let mut rng = Rng::new(seed ^ 0x5EED_0F_11FE);
+    let mut rng = Rng::new(seed ^ 0x005E_ED0F_11FE);
     let weights = species_weights(&brood.iter().map(|c| c.species).collect::<Vec<_>>(), params);
     let total: f32 = weights.iter().sum();
     // Creatures are sized by their own species (template species' cross-

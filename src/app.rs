@@ -287,7 +287,7 @@ struct State {
     tour_clock: f32,
 
     recorder: Option<Recorder>,
-    record_clock: f32,
+    record_frames: u64,
     /// Frames to wait before honouring `--record`, so the window can settle
     /// (its first resize events would otherwise end the recording at once).
     record_start_in: Option<u32>,
@@ -437,7 +437,7 @@ impl State {
             tour_secs: opts.tour.unwrap_or(20.0).clamp(*TOUR_RANGE.start(), *TOUR_RANGE.end()),
             tour_clock: 0.0,
             recorder: None,
-            record_clock: 0.0,
+            record_frames: 0,
             record_start_in: opts.record.then_some(3),
             frame_done: Arc::new(AtomicBool::new(true)),
             gpu_wait_since: None,
@@ -494,8 +494,8 @@ impl State {
         // Tab toggles the panel. Keep it away from egui, which would use it to move
         // keyboard focus onto a widget and then swallow every other shortcut.
         if let WindowEvent::KeyboardInput { event: key, .. } = &event {
-            if key.logical_key == Key::Named(NamedKey::Tab) {
-                if key.state == ElementState::Pressed && !key.repeat && !self.egui_ctx.wants_keyboard_input() {
+            if key.logical_key == Key::Named(NamedKey::Tab) && !self.egui_ctx.wants_keyboard_input() {
+                if key.state == ElementState::Pressed && !key.repeat {
                     self.show_panel = !self.show_panel;
                 }
                 return Ok(());
@@ -665,13 +665,9 @@ impl State {
 
     /// Re-applies the surface configuration from the window's current size.
     fn reconfigure(&mut self) {
-        let size = self.window.inner_size();
-        if size.width > 0 && size.height > 0 {
-            self.config.width = size.width;
-            self.config.height = size.height;
-            self.surface.configure(&self.gpu.device, &self.config);
-            self.post.resize(&self.gpu, [size.width, size.height]);
-        }
+        // Surface recovery can discover a resize before the OS resize event.
+        // Use the same path so minimization and recording size stay in sync.
+        self.resize(self.window.inner_size());
     }
 
     fn apply(&mut self, action: Action) -> Result<()> {
@@ -728,6 +724,8 @@ impl State {
             }
             Action::Screenshot => self.pending_screenshot = true,
             Action::ToggleRecording => {
+                // A manual choice overrides a pending --record startup request.
+                self.record_start_in = None;
                 if self.recorder.is_some() {
                     self.stop_recording(None);
                 } else if let Err(e) = self.start_recording() {
@@ -831,7 +829,7 @@ impl State {
             return true;
         }
         let since = *self.gpu_wait_since.get_or_insert(now);
-        if now - since > Duration::from_millis(1500) && !self.gpu_busy_until.is_some_and(|t| t > now) {
+        if now - since > Duration::from_millis(1500) && self.gpu_busy_until.is_none_or(|t| t <= now) {
             self.gpu_busy_until = Some(now + Duration::from_secs(5));
             self.warn_gpu_busy("the GPU is taking very long to finish frames");
             let title = self.title();
@@ -945,11 +943,9 @@ impl State {
         // display runs slower, frames are repeated so the video keeps real time.
         let mut record_repeats = 0;
         if let Some(rec) = &self.recorder {
-            self.record_clock += dt;
-            let due = (self.record_clock * RECORD_FPS).floor();
-            if due >= 1.0 {
-                record_repeats = (due as u32).min(10);
-                self.record_clock -= due / RECORD_FPS;
+            record_repeats = recording_frames_due(rec.started.elapsed(), self.record_frames);
+            if record_repeats > 0 {
+                self.record_frames += u64::from(record_repeats);
                 self.post.composite(&mut encoder, &rec.view);
                 rec.readback.copy_from(&mut encoder, &rec.texture);
             }
@@ -1097,7 +1093,7 @@ impl State {
             child,
             started: Instant::now(),
         });
-        self.record_clock = 1.0 / RECORD_FPS;
+        self.record_frames = 0;
         self.toast("Recording (V to stop)".to_string());
         Ok(())
     }
@@ -1325,6 +1321,12 @@ impl State {
     }
 }
 
+/// Use wall time, including stalls and skipped redraws, to keep videos at real speed.
+fn recording_frames_due(elapsed: Duration, written: u64) -> u32 {
+    let total = (elapsed.as_secs_f64() * f64::from(RECORD_FPS)).floor() as u64 + 1;
+    total.saturating_sub(written).min(u64::from(u32::MAX)) as u32
+}
+
 fn scaled(size: [u32; 2], scale: f32) -> [u32; 2] {
     let s = scale.clamp(0.1, 4.0);
     [((size[0] as f32 * s) as u32).max(16), ((size[1] as f32 * s) as u32).max(16)]
@@ -1356,4 +1358,17 @@ fn utc_timestamp() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}_{:02}-{:02}-{:02}", rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_catches_up_after_slow_or_skipped_frames() {
+        assert_eq!(recording_frames_due(Duration::ZERO, 0), 1);
+        assert_eq!(recording_frames_due(Duration::from_secs(1), 1), 60);
+        assert_eq!(recording_frames_due(Duration::from_secs(3), 61), 120);
+        assert_eq!(recording_frames_due(Duration::from_secs(3), 181), 0);
+    }
 }
