@@ -13,6 +13,7 @@ is a complete, full-featured reference that uses every convention below.
 ```
             ┌───────────── once per displayed frame ─────────────┐
  input ──►  world.step(frame, encoder)      compute: advance the simulation
+            world.measure(frame, encoder, sink) optional: reduce a few scalars for the sparklines / CSV
             world.render(frame, encoder, scene)   paint into the HDR scene
             post.run(...)                   bloom → exposure → tonemap → vignette/dither
             egui                            control panel (interactive app only)
@@ -68,6 +69,24 @@ is a complete, full-featured reference that uses every convention below.
    with the supplied seed. Recipes restart a simulation; they do not contain its
    evolving GPU buffers. Use serde defaults when adding optional fields to keep
    existing saves readable. The library tests exercise every registered preset.
+9. **Measurements** (optional). Publish a `const METRICS: &[MetricDesc]` table
+   from `metrics()` and implement `measure()`, which the app calls right after
+   `step` (never while paused). Embed a `crate::metrics::Reduction` sized for
+   your largest dispatch, write a `cs_measure` kernel in its own module compiled
+   from `metrics::WGSL` plus your source: every thread of a 256-thread workgroup
+   computes up to 16 already-normalised contributions (multiply by `1 / cells`
+   for a mean or a fraction), passes zeros when it is outside the domain, calls
+   `metric_reduce(li, m)` exactly once (it contains barriers, so no early
+   returns) and thread 0 stores the four `vec4`s at
+   `partials[(wg.y * nwg.x + wg.x) * 4 ..]`. Then `reduction.record(gpu,
+   encoder, workgroups)` and `sink.push(encoder, reduction.totals())`; push
+   once more for a comparison reference (self first, matching
+   `comparison_labels()`). Guard inputs with `finite_or_zero*` from the prelude
+   before clamping or comparing, keep fractions in `0..=1`, and bind your
+   ping-pong buffers so "previous" state is available for activity measures.
+   Cross-check the kernel in a test: read the state back with
+   `gpu.read_buffer`, recompute the lanes on the CPU with the same thresholds,
+   and compare (see `src/world/symbiosis_tests.rs`).
 
 For a custom viewport such as Symbiosis's comparison panes, override
 `map_position()` to match the display transform, so painting and cursor-anchored

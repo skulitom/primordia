@@ -270,6 +270,28 @@ impl Gpu {
     pub fn wait_idle(&self) {
         let _ = self.device.poll(wgpu::PollType::Wait);
     }
+
+    /// Blocking readback of a whole buffer, for tests that cross-check GPU
+    /// results against a CPU computation.
+    #[cfg(test)]
+    pub fn read_buffer<T: bytemuck::Pod>(&self, source: &wgpu::Buffer) -> Vec<T> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test readback"),
+            size: source.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, source.size());
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+        self.wait_idle();
+        rx.recv().unwrap().unwrap();
+        let values = bytemuck::pod_collect_to_vec(&staging.slice(..).get_mapped_range());
+        staging.unmap();
+        values
+    }
 }
 
 /// Records a render pass that draws the fullscreen triangle once into `target`.

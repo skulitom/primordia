@@ -11,6 +11,7 @@ use wgpu::ShaderStages;
 use super::{Frame, ViewXform, World};
 use crate::gpu::{Gpu, SCENE_FORMAT, layout};
 use crate::library::WorldSettings;
+use crate::metrics::{self, MetricDesc, Reduction, Unit};
 use crate::palette::{self, PaletteLut};
 use crate::post::PostSettings;
 use crate::rng::Rng;
@@ -20,6 +21,71 @@ use crate::rng::Rng;
 mod tests;
 
 const PRESETS: &[&str] = &["Living Reef", "Wandering Veins", "Coral Maze", "Spore Tide", "Root Atlas", "Fallow Gardens"];
+
+/// Activator concentration from which a cell counts as growth.
+const GROWTH_THRESHOLD: f32 = 0.1;
+/// Fertility below which ground counts as exhausted.
+const EXHAUSTED_THRESHOLD: f32 = 0.5;
+/// Change of V per frame from which a cell counts as still changing (measured
+/// on the last chemistry step and scaled by the steps per frame).
+const ACTIVE_THRESHOLD: f32 = 1e-3;
+/// Trail density from which a route counts as busy (where traffic starts to
+/// wear the ground, see `symbiosis.wgsl`). The mean trail itself is conserved
+/// by deposits and decay, so the share of busy cells is what tells a tight
+/// network from a diffuse one.
+const ROUTE_THRESHOLD: f32 = 0.6;
+
+/// Lane order of `symbiosis_measure.wgsl`.
+const METRICS: &[MetricDesc] = &[
+    MetricDesc {
+        id: "growth_cover",
+        label: "Growth cover",
+        unit: Unit::Fraction,
+        hint: "Cells whose activator V exceeds 0.1: the extent of the chemical colonies.",
+    },
+    MetricDesc {
+        id: "growth_mean",
+        label: "Mean growth",
+        unit: Unit::Scalar,
+        hint: "Mean activator concentration V over the habitat.",
+    },
+    MetricDesc {
+        id: "growth_active",
+        label: "Changing cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose V is changing by more than 0.001 per frame, judged from the last chemistry step: how much of the pattern is still evolving.",
+    },
+    MetricDesc {
+        id: "growth_drift",
+        label: "Growth drift",
+        unit: Unit::Scalar,
+        hint: "Mean change of V per chemistry step: positive while colonies grow, negative while they die back.",
+    },
+    MetricDesc {
+        id: "routes",
+        label: "Busy routes",
+        unit: Unit::Fraction,
+        hint: "Cells whose trail exceeds 0.6, the level from which traffic wears the ground: a tight network covers few, a diffuse one many.",
+    },
+    MetricDesc {
+        id: "fertility_mean",
+        label: "Mean fertility",
+        unit: Unit::Scalar,
+        hint: "Mean ground fertility; 1 is fully rested ground.",
+    },
+    MetricDesc {
+        id: "exhausted",
+        label: "Exhausted ground",
+        unit: Unit::Fraction,
+        hint: "Cells whose fertility has fallen below 0.5.",
+    },
+    MetricDesc {
+        id: "agents_on_growth",
+        label: "Agents on growth",
+        unit: Unit::Fraction,
+        hint: "Share of agents standing on a cell with growth (V above 0.1).",
+    },
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Relationship {
@@ -326,6 +392,19 @@ struct DrawUniform {
     ecology: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct MeasureUniform {
+    size: [u32; 2],
+    count: u32,
+    _pad0: u32,
+    inv_cells: f32,
+    inv_count: f32,
+    _pad1: [f32; 2],
+    /// Growth V, active |dV|, exhausted fertility, busy-route trail.
+    thresholds: [f32; 4],
+}
+
 pub struct Symbiosis {
     size: [u32; 2],
     params: Params,
@@ -345,6 +424,11 @@ pub struct Symbiosis {
     draw_uniform: wgpu::Buffer,
     draw_groups: [wgpu::BindGroup; 2],
     draw_pipeline: wgpu::RenderPipeline,
+    measure_uniform: wgpu::Buffer,
+    /// `[i]` measures `fields[i]` / `fertility[i]` against `fields[1 - i]`.
+    measure_groups: [wgpu::BindGroup; 2],
+    measure_pipeline: wgpu::ComputePipeline,
+    reduction: Reduction,
     seed: u64,
     /// Created only while comparing. The reference never owns another reference.
     reference: Option<Box<Symbiosis>>,
@@ -430,6 +514,40 @@ impl Symbiosis {
         let module = gpu.shader("symbiosis draw", include_str!("../shaders/symbiosis_display.wgsl"));
         let pl = gpu.pipeline_layout("symbiosis draw", &[&bgl]);
         let draw_pipeline = gpu.fullscreen_pipeline("symbiosis draw", &pl, &module, "fs_display", SCENE_FORMAT, None);
+        let measure_uniform = gpu.uniform_buffer("symbiosis measure", &MeasureUniform::zeroed());
+        let blocks = size.map(|n| n.div_ceil(16));
+        let reduction = Reduction::new(gpu, "symbiosis measure", blocks[0] * blocks[1]);
+        let bgl = gpu.bind_group_layout(
+            "symbiosis measure",
+            &[
+                layout::uniform(0, ShaderStages::COMPUTE),
+                layout::storage(1, ShaderStages::COMPUTE, true),
+                layout::storage(2, ShaderStages::COMPUTE, true),
+                layout::storage(3, ShaderStages::COMPUTE, true),
+                layout::storage(4, ShaderStages::COMPUTE, true),
+                layout::storage(5, ShaderStages::COMPUTE, false),
+            ],
+        );
+        let measure_groups = std::array::from_fn(|i| {
+            gpu.bind_group(
+                "symbiosis measure",
+                &bgl,
+                &[
+                    measure_uniform.as_entire_binding(),
+                    fields[i].as_entire_binding(),
+                    fields[1 - i].as_entire_binding(),
+                    fertility[i].as_entire_binding(),
+                    deposits.as_entire_binding(),
+                    reduction.partials().as_entire_binding(),
+                ],
+            )
+        });
+        let module = gpu.shader(
+            "symbiosis measure",
+            &format!("{}\n{}", metrics::WGSL, include_str!("../shaders/symbiosis_measure.wgsl")),
+        );
+        let pl = gpu.pipeline_layout("symbiosis measure", &[&bgl]);
+        let measure_pipeline = gpu.compute_pipeline("symbiosis measure", &pl, &module, "cs_measure");
         let mut world = Self {
             size,
             params,
@@ -449,11 +567,50 @@ impl Symbiosis {
             draw_uniform,
             draw_groups,
             draw_pipeline,
+            measure_uniform,
+            measure_groups,
+            measure_pipeline,
+            reduction,
             seed,
             reference: None,
         };
         world.reset(gpu, seed);
         world
+    }
+
+    /// Normalisation and thresholds of the measurement kernel. The tests
+    /// recompute the metrics on the CPU from the same values.
+    fn measure_uniform(&self) -> MeasureUniform {
+        MeasureUniform {
+            size: self.size,
+            count: self.count,
+            _pad0: 0,
+            inv_cells: 1.0 / (self.size[0] as f32 * self.size[1] as f32),
+            inv_count: if self.count == 0 { 0.0 } else { 1.0 / self.count as f32 },
+            _pad1: [0.0; 2],
+            thresholds: [
+                GROWTH_THRESHOLD,
+                ACTIVE_THRESHOLD / self.params.steps.max(1) as f32,
+                EXHAUSTED_THRESHOLD,
+                ROUTE_THRESHOLD,
+            ],
+        }
+    }
+
+    /// Reduces this habitat's latest state into `reduction`'s totals.
+    fn record_measure(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+        gpu.write(&self.measure_uniform, &self.measure_uniform());
+        let blocks = self.size.map(|n| n.div_ceil(16));
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("symbiosis measure"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.measure_pipeline);
+            pass.set_bind_group(0, &self.measure_groups[self.current], &[]);
+            pass.dispatch_workgroups(blocks[0], blocks[1], 1);
+        }
+        self.reduction.record(gpu, encoder, blocks[0] * blocks[1]);
     }
 
     fn look() -> PostSettings {
@@ -783,6 +940,23 @@ impl World for Symbiosis {
             Reference::CouplingOff => [format!("COUPLING {:.2}", self.params.coupling), "COUPLING OFF".into()],
             Reference::FertilityOff => [format!("CYCLE {:.2}", self.params.depletion), "CYCLE OFF".into()],
         })
+    }
+
+    fn metrics(&self) -> &'static [MetricDesc] {
+        METRICS
+    }
+
+    fn measure(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, sink: &mut metrics::Sink<'_>) {
+        if !sink.is_live() {
+            return;
+        }
+        // Left pane first, then the reference: the order of `comparison_labels`.
+        self.record_measure(frame.gpu, encoder);
+        sink.push(encoder, self.reduction.totals());
+        if let Some(reference) = &self.reference {
+            reference.record_measure(frame.gpu, encoder);
+            sink.push(encoder, reference.reduction.totals());
+        }
     }
 
     fn ui(&mut self, gpu: &Gpu, ui: &mut egui::Ui) {

@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 
 use crate::capture::{self, Readback};
 use crate::gpu::Gpu;
+use crate::metrics::{CsvLog, Sampler};
 use crate::post::{Post, Tonemap};
 use crate::world::{self, Camera, Frame, Pointer, ViewXform, WORLDS};
 
@@ -48,6 +49,8 @@ pub struct RenderJob {
     pub max_fps: f32,
     /// Suppress per-10% progress lines (the gallery prints one line per render).
     pub quiet: bool,
+    /// Write every frame's measurements to this CSV file (`frame,time,series,<metrics>`).
+    pub metrics: Option<PathBuf>,
 }
 
 /// Default headless frame-rate ceiling (see [`RenderJob::max_fps`]).
@@ -96,6 +99,7 @@ impl RenderJob {
             brush: None,
             max_fps: DEFAULT_MAX_FPS,
             quiet: false,
+            metrics: None,
         }
     }
 }
@@ -194,6 +198,16 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         job.frames,
         job.seed
     );
+    let mut metrics = match &job.metrics {
+        Some(_) if world.metrics().is_empty() => bail!("{} does not publish measurements", world.name()),
+        Some(path) => {
+            if let Some(labels) = world.comparison_labels() {
+                log::log!(progress_level, "measurement series 0: {} · series 1: {}", labels[0], labels[1]);
+            }
+            Some((CsvLog::create(path, world.metrics())?, Sampler::new(gpu, Sampler::HEADLESS_SLOTS)))
+        }
+        None => None,
+    };
 
     let mut look = world.post_settings();
     if let Some(e) = job.exposure {
@@ -239,6 +253,16 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         };
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("headless frame") });
         world.step(&frame, &mut encoder);
+        if let Some((log, sampler)) = &mut metrics {
+            // Never skip a frame of the log: wait for the ring when it is full.
+            if sampler.is_full() {
+                for sample in sampler.flush(gpu)? {
+                    log.write(&sample)?;
+                }
+            }
+            let mut sink = sampler.begin(frame.frame, frame.time);
+            world.measure(&frame, &mut encoder, &mut sink);
+        }
         world.render(&frame, &mut encoder, post.scene_view());
 
         let last = f + 1 == frames;
@@ -249,6 +273,9 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
             readback.copy_from(&mut encoder, &out_texture);
         }
         gpu.queue.submit([encoder.finish()]);
+        if let Some((_, sampler)) = &mut metrics {
+            sampler.map();
+        }
         if let Some(problem) = gpu.fatal_error() {
             bail!("GPU error while rendering: {problem}");
         }
@@ -271,6 +298,11 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         } else if f % 4 == 3 {
             // Keep the CPU from queueing hundreds of frames ahead of the GPU.
             gpu.wait_idle();
+        }
+        if let Some((log, sampler)) = &mut metrics {
+            for sample in sampler.collect(gpu) {
+                log.write(&sample)?;
+            }
         }
         if job.max_fps > 0.0 {
             // Pace submissions so the GPU idles between frames instead of running flat out.
@@ -296,6 +328,13 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
     if let Some(encoder) = ffmpeg {
         encoder.finish()?;
         log::info!("wrote {}", job.video.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
+    }
+    if let Some((mut log, mut sampler)) = metrics {
+        for sample in sampler.flush(gpu)? {
+            log.write(&sample)?;
+        }
+        let (path, rows) = log.finish()?;
+        log::log!(progress_level, "wrote {} ({rows} rows)", path.display());
     }
     let secs = started.elapsed().as_secs_f32();
     log::log!(progress_level, "done: {frames} frames in {secs:.1}s ({:.1} fps)", frames as f32 / secs.max(1e-3));
@@ -477,5 +516,85 @@ mod tests {
         }
         assert_eq!(frame_deadline(start, 600, 0.0).unwrap(), start);
         assert_eq!(frame_deadline(start, 600, 60.0).unwrap() - start, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn render_logs_one_measurement_row_per_frame_and_series() {
+        let _guard = crate::gpu::test_lock();
+        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("logs").join("run.csv");
+        let job = RenderJob {
+            size: [96, 64],
+            frames: 8,
+            every: 3,
+            frames_dir: dir.path().join("frames"),
+            out: Some(dir.path().join("final.png")),
+            max_fps: 0.0,
+            quiet: true,
+            metrics: Some(csv.clone()),
+            ..RenderJob::new("symbiosis")
+        };
+        render_with(&gpu, &job).unwrap();
+
+        let text = std::fs::read_to_string(&csv).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().unwrap();
+        let ids: Vec<&str> = header.split(',').collect();
+        assert_eq!(&ids[..3], &["frame", "time", "series"]);
+        let (_, world) = world::create(&gpu, "symbiosis", [96, 64], None, 1).unwrap();
+        let expected: Vec<&str> = world.metrics().iter().map(|m| m.id).collect();
+        assert_eq!(&ids[3..], &expected[..]);
+
+        let rows: Vec<Vec<&str>> = lines.map(|line| line.split(',').collect()).collect();
+        assert_eq!(rows.len(), 8, "one row per frame for a single habitat");
+        for (f, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), ids.len(), "{row:?}");
+            assert_eq!(row[0], f.to_string());
+            assert!((row[1].parse::<f32>().unwrap() - f as f32 / 60.0).abs() < 1e-5);
+            assert_eq!(row[2], "0");
+            for value in &row[3..] {
+                assert!(value.parse::<f32>().unwrap().is_finite(), "{row:?}");
+            }
+        }
+        // The frame after seeding already has growth, and it keeps evolving.
+        assert!(rows[0][3].parse::<f32>().unwrap() > 0.0);
+        assert!(rows.iter().any(|row| row[5].parse::<f32>().unwrap() > 0.0), "changing cells");
+
+        // A comparison logs two rows per frame, in the order of the pane labels.
+        let (_, mut paired) = world::create(&gpu, "symbiosis", [96, 64], None, 1).unwrap();
+        let mut recipe = paired.settings().unwrap();
+        if let crate::library::WorldSettings::Symbiosis { params, .. } = &mut recipe {
+            params.compare = true;
+        }
+        paired.restore_settings(&gpu, &recipe, 1).unwrap();
+        assert!(paired.comparison_labels().is_some());
+        let csv = dir.path().join("paired.csv");
+        let mut log = CsvLog::create(&csv, paired.metrics()).unwrap();
+        let mut sampler = Sampler::new(&gpu, Sampler::HEADLESS_SLOTS);
+        for f in 0..3u64 {
+            let frame = Frame {
+                gpu: &gpu,
+                time: f as f32 / 60.0,
+                dt: 1.0 / 60.0,
+                frame: f,
+                view: ViewXform::fit(paired.size(), [96, 64], &Camera::default()),
+                target_size: [96, 64],
+                pointer: None,
+            };
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            paired.step(&frame, &mut encoder);
+            let mut sink = sampler.begin(f, frame.time);
+            paired.measure(&frame, &mut encoder, &mut sink);
+            gpu.queue.submit([encoder.finish()]);
+            sampler.map();
+        }
+        for sample in sampler.flush(&gpu).unwrap() {
+            log.write(&sample).unwrap();
+        }
+        assert_eq!(log.finish().unwrap().1, 6);
+        let text = std::fs::read_to_string(&csv).unwrap();
+        let series: Vec<&str> = text.lines().skip(1).map(|line| line.split(',').nth(2).unwrap()).collect();
+        assert_eq!(series, ["0", "1", "0", "1", "0", "1"]);
     }
 }

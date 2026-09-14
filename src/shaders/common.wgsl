@@ -62,6 +62,30 @@ fn torus_delta(a: vec2<f32>, b: vec2<f32>, size: vec2<f32>) -> vec2<f32> {
     return d;
 }
 
+// --- finite guards ----------------------------------------------------------
+// Measurements must not let a NaN in a state buffer poison a whole sum. The
+// exponent-bit test is used because WGSL lets implementations assume floats
+// are never NaN, so `x != x` may be folded away. Apply these before any clamp,
+// mask multiply or comparison (NaN * 0 is still NaN).
+
+fn is_finite(x: f32) -> bool {
+    return (bitcast<u32>(x) & 0x7f800000u) != 0x7f800000u;
+}
+
+fn finite_or_zero(x: f32) -> f32 {
+    return select(0.0, x, is_finite(x));
+}
+
+fn finite_or_zero2(v: vec2<f32>) -> vec2<f32> {
+    let finite = (bitcast<vec2<u32>>(v) & vec2<u32>(0x7f800000u)) != vec2<u32>(0x7f800000u);
+    return select(vec2<f32>(0.0), v, finite);
+}
+
+fn finite_or_zero4(v: vec4<f32>) -> vec4<f32> {
+    let finite = (bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u)) != vec4<u32>(0x7f800000u);
+    return select(vec4<f32>(0.0), v, finite);
+}
+
 // --- hashing / random numbers ----------------------------------------------
 
 fn pcg_hash(v: u32) -> u32 {

@@ -19,6 +19,7 @@ use crate::capture::{self, Readback};
 use crate::gpu::Gpu;
 use crate::headless::{self, Encode};
 use crate::library::{Library, SavedWorld};
+use crate::metrics;
 use crate::post::{Post, PostSettings};
 use crate::rng;
 use crate::ui::{self as theme, ACCENT, Inspector, WARN};
@@ -132,6 +133,7 @@ enum Action {
     Mutate,
     Screenshot,
     ToggleRecording,
+    ToggleMetricsLog,
     SaveWorld,
     LoadWorld(usize),
     RenameWorld(usize, String),
@@ -322,12 +324,19 @@ struct State {
     gpu_warned_at: Option<Instant>,
     /// Development aid: extra GPU work per frame (`PRIMORDIA_DEBUG_GPU_STALL_MS`).
     stall: Option<crate::stall::Stall>,
+
+    /// Live measurements: the asynchronous readback ring, the run's traces
+    /// for the sparklines, and the optional CSV log.
+    sampler: metrics::Sampler,
+    history: metrics::History,
+    metrics_log: Option<metrics::CsvLog>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         // Close ffmpeg's input so an in-progress recording is finalised on exit.
         self.stop_recording(None);
+        self.stop_metrics_log(None);
     }
 }
 
@@ -401,6 +410,7 @@ impl State {
         log::info!("opened {} at {}x{} (world domain {}x{})", world.name(), w, h, world.size()[0], world.size()[1]);
         let now = Instant::now();
         let stall = crate::stall::Stall::from_env(&gpu);
+        let sampler = metrics::Sampler::new(&gpu, metrics::Sampler::APP_SLOTS);
         let mut state = Self {
             window,
             gpu,
@@ -455,6 +465,9 @@ impl State {
             gpu_busy_until: None,
             gpu_warned_at: None,
             stall,
+            sampler,
+            history: metrics::History::default(),
+            metrics_log: None,
         };
         state.toast_for(
             "Drag to interact · wheel zooms · middle-drag pans · H hides the panel · Space pauses".to_string(),
@@ -713,6 +726,7 @@ impl State {
                         self.seed = seed;
                         self.world_output_size = size;
                         self.saved_name = None;
+                        self.reset_measurements(true);
                         self.toast(format!("{} — {}", WORLDS[i].name, WORLDS[i].tagline));
                     }
                 }
@@ -726,6 +740,7 @@ impl State {
                 self.modified = false;
                 self.seed = seed;
                 self.saved_name = None;
+                self.reset_measurements(false);
                 self.toast(self.preset_name().to_string());
             }
             Action::Reset => {
@@ -734,6 +749,7 @@ impl State {
                 } else {
                     self.seed = seed;
                     self.saved_name = None;
+                    self.reset_measurements(false);
                 }
             }
             Action::Mutate => {
@@ -745,7 +761,15 @@ impl State {
                 self.modified = true;
                 self.seed = seed;
                 self.saved_name = None;
+                self.reset_measurements(false);
                 self.toast("Mutated".to_string());
+            }
+            Action::ToggleMetricsLog => {
+                if self.metrics_log.is_some() {
+                    self.stop_metrics_log(None);
+                } else if let Err(e) = self.start_metrics_log() {
+                    self.toast_for(format!("Could not start the measurement log: {e:#}"), 6.0);
+                }
             }
             Action::Screenshot => self.pending_screenshot = true,
             Action::SaveWorld => {
@@ -815,8 +839,61 @@ impl State {
         self.frame = 0;
         self.paused = false;
         self.single_step = false;
+        self.reset_measurements(true);
         self.toast(format!("Loaded {} · restarted from its saved seed", saved.name));
         Ok(())
+    }
+
+    /// Moves finished measurements into the history and the CSV log.
+    fn ingest_samples(&mut self) {
+        for sample in self.sampler.collect(&self.gpu) {
+            self.history.push(&sample);
+            let failed = match &mut self.metrics_log {
+                Some(log) => log.write(&sample).err(),
+                None => None,
+            };
+            if let Some(e) = failed {
+                log::error!("{e:#}");
+                self.stop_metrics_log(Some("the file could not be written"));
+            }
+        }
+    }
+
+    /// The run restarted: forget its traces. A world change also closes the
+    /// log, because the columns (and the frame counter) would no longer match.
+    fn reset_measurements(&mut self, world_changed: bool) {
+        self.history.clear();
+        self.sampler.discard();
+        if world_changed {
+            self.stop_metrics_log(Some("the world changed"));
+        }
+    }
+
+    fn start_metrics_log(&mut self) -> Result<()> {
+        let metrics = self.world.metrics();
+        if metrics.is_empty() {
+            return Err(anyhow!("{} has no measurements", self.world.name()));
+        }
+        std::fs::create_dir_all(&self.output_dir).with_context(|| format!("creating {}", self.output_dir.display()))?;
+        let path = unique_path(&self.output_dir, &self.capture_stem(), "csv");
+        let log = metrics::CsvLog::create(&path, metrics)?;
+        log::info!("logging measurements to {}", path.display());
+        self.toast(format!("Logging measurements to {}", path.display()));
+        self.metrics_log = Some(log);
+        Ok(())
+    }
+
+    /// Flushes and closes the measurement log, reporting where it went.
+    fn stop_metrics_log(&mut self, reason: Option<&str>) {
+        let Some(log) = self.metrics_log.take() else { return };
+        let prefix = reason.map(|r| format!("Measurement log stopped ({r}). ")).unwrap_or_default();
+        match log.finish() {
+            Ok((path, rows)) => {
+                log::info!("saved {} ({rows} rows)", path.display());
+                self.toast_for(format!("{prefix}Saved {} ({rows} rows)", path.display()), 5.0);
+            }
+            Err(e) => self.toast_for(format!("{prefix}Measurement log failed: {e:#}"), 6.0),
+        }
     }
 
     /// Runs `f` inside an out-of-memory error scope and returns the error, if any.
@@ -944,6 +1021,7 @@ impl State {
         if self.minimized || !self.gpu_ready() {
             return Ok(());
         }
+        self.ingest_samples();
         let now = Instant::now();
         let elapsed = (now - self.last_instant).as_secs_f32();
         // The simulation step is clamped; the fps readout uses the real frame time.
@@ -1008,6 +1086,8 @@ impl State {
                 Frame { gpu: &self.gpu, time: self.time, dt, frame: self.frame, view, target_size: target, pointer };
             if !self.paused || self.single_step {
                 self.world.step(&frame, &mut encoder);
+                let mut sink = self.sampler.begin(frame.frame, frame.time);
+                self.world.measure(&frame, &mut encoder, &mut sink);
                 self.frame += 1;
                 self.time += dt;
                 self.single_step = false;
@@ -1056,6 +1136,7 @@ impl State {
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen);
         }
         self.gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
+        self.sampler.map();
         let done = Arc::new(AtomicBool::new(false));
         let flag = done.clone();
         self.gpu.queue.on_submitted_work_done(move || flag.store(true, Ordering::Release));
@@ -1245,7 +1326,7 @@ impl State {
                     ui.label(egui::RichText::new(format!("{:.0} fps", self.fps)).small().color(ACCENT))
                         .on_hover_text(self.gpu_name.as_str());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("PNG / MP4 · clean capture").small().weak())
+                        ui.label(egui::RichText::new("PNG / MP4 / CSV · clean capture").small().weak())
                             .on_hover_text(format!("Saved to {}", self.output_dir.display()));
                     });
                 });
@@ -1439,6 +1520,15 @@ impl State {
             Inspector::World => {
                 theme::section(ui, "World parameters", WORLDS[self.world_index].tagline);
                 ui.label(egui::RichText::new(self.world.stats()).small().color(theme::MUTED));
+                ui.add_space(4.0);
+                let names = self.world.comparison_labels();
+                let status = theme::MeasurementsStatus {
+                    logging: self.metrics_log.as_ref().map(|log| (log.path(), log.rows())),
+                    dropped: self.sampler.dropped(),
+                };
+                if theme::measurements(ui, self.world.metrics(), &self.history, names.as_ref(), status) {
+                    actions.push(Action::ToggleMetricsLog);
+                }
                 ui.add_space(4.0);
                 ui.push_id(self.world.id(), |ui| self.world.ui(&self.gpu, ui));
             }

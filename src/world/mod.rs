@@ -22,6 +22,10 @@
 //!   (fullscreen vertex shader `vs_fullscreen`, `ViewXform`, hashing, palettes).
 //! * Parameters are plain Rust structs mirrored into uniform buffers; `ui` edits
 //!   them with egui and the next `step` uploads them.
+//! * Measurements (`metrics` / `measure`) are optional: a world reduces a few
+//!   scalars of its state on the GPU right after `step`, and the engine reads
+//!   them back asynchronously for the panel's sparklines and CSV logs
+//!   ([`crate::metrics`]).
 
 pub mod lenia;
 pub mod particle_life;
@@ -152,6 +156,20 @@ pub trait World {
 
     /// Optional labels for a left/right comparison, drawn by the app's HUD.
     fn comparison_labels(&self) -> Option<[String; 2]> { None }
+
+    /// Scalar measurements this world computes on the GPU every frame
+    /// (`&[]` = none). The order is the lane order of the totals record the
+    /// world pushes in [`World::measure`] and the column order of CSV logs.
+    fn metrics(&self) -> &'static [crate::metrics::MetricDesc] {
+        &[]
+    }
+
+    /// Records the measurement passes for the state `step` just produced and
+    /// pushes one totals record per series into `sink`: once for a single
+    /// habitat, twice for a comparison (self first, then the reference, matching
+    /// [`World::comparison_labels`]). Called right after `step`, never while
+    /// paused. Skip the passes when `!sink.is_live()`.
+    fn measure(&mut self, _frame: &Frame, _encoder: &mut wgpu::CommandEncoder, _sink: &mut crate::metrics::Sink<'_>) {}
 
     /// Parameter controls, drawn inside the side panel.
     fn ui(&mut self, gpu: &Gpu, ui: &mut egui::Ui);

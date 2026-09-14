@@ -10,12 +10,13 @@ fn render_inspector_previews() {
     let _guard = crate::gpu::test_lock();
     let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
     for width in [320, 364] {
-        for tab in ["world", "appearance", "symbiosis", "comparison", "fertility"] {
+        for tab in ["world", "appearance", "symbiosis", "comparison", "fertility", "measurements"] {
             let appearance = tab == "appearance";
+            let measurements = tab == "measurements";
             let size = [width, 900];
             let ctx = egui::Context::default();
             configure(&ctx);
-            let (world_index, mut specimen) = if tab == "symbiosis" || tab == "comparison" || tab == "fertility" {
+            let (world_index, mut specimen) = if tab == "symbiosis" || tab == "comparison" || tab == "fertility" || measurements {
                 world::create(&gpu, "symbiosis", [800, 600], None, 42).unwrap()
             } else {
                 world::create(&gpu, "lenia", [800, 600], Some("Necklaces"), 42).unwrap()
@@ -23,7 +24,23 @@ fn render_inspector_previews() {
             if tab == "fertility" {
                 specimen.load_preset(&gpu, 5, 42);
             }
-            if tab == "comparison" || tab == "fertility" {
+            // A synthetic two-habitat run: the traces are what a comparison looks like.
+            let mut history = crate::metrics::History::default();
+            if measurements {
+                use crate::metrics::{MAX_METRICS, MAX_SERIES, Sample};
+                for frame in 0..1500u64 {
+                    let t = frame as f32 / 60.0;
+                    let mut values = [[0.0; MAX_METRICS]; MAX_SERIES];
+                    for (s, lanes) in values.iter_mut().enumerate() {
+                        for (k, v) in lanes.iter_mut().enumerate() {
+                            let phase = k as f32 * 0.9 + s as f32 * 0.6;
+                            *v = 0.5 + 0.35 * (t * (0.3 + 0.1 * k as f32) + phase).sin() * (-t * 0.02).exp();
+                        }
+                    }
+                    history.push(&Sample { frame, time: t, series: 2, values });
+                }
+            }
+            if tab == "comparison" || tab == "fertility" || measurements {
                 let mut recipe = specimen.settings().unwrap();
                 if let crate::library::WorldSettings::Symbiosis { params, .. } = &mut recipe {
                     params.compare = true;
@@ -77,6 +94,13 @@ fn render_inspector_previews() {
                                 );
                                 ui.label(RichText::new(specimen.stats()).small().color(MUTED));
                                 ui.add_space(4.0);
+                                if measurements {
+                                    let names = specimen.comparison_labels();
+                                    let path = std::path::Path::new("screenshots/symbiosis_living-reef.csv");
+                                    let status = MeasurementsStatus { logging: Some((path, 3000)), dropped: 0 };
+                                    super::measurements(ui, specimen.metrics(), &history, names.as_ref(), status);
+                                    ui.add_space(4.0);
+                                }
                                 specimen.ui(&gpu, ui);
                             }
                         });

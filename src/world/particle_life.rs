@@ -40,9 +40,14 @@ use wgpu::ShaderStages;
 
 use super::{Frame, ViewXform, World};
 use crate::gpu::{self, layout, Gpu, SCENE_FORMAT};
+use crate::metrics::{self, MetricDesc, Reduction, Unit};
 use crate::palette::{self, PALETTES};
 use crate::post::{PostSettings, Tonemap};
 use crate::rng::Rng;
+
+#[cfg(test)]
+#[path = "particle_life_tests.rs"]
+mod tests;
 
 const MAX_KINDS: usize = 8;
 const WORKGROUP: u32 = 256;
@@ -67,6 +72,56 @@ const REFERENCE_NEIGHBOURS: f32 = 30.0;
 const REFERENCE_HEIGHT: f32 = 1080.0;
 /// Speed (in r_max per second) at which a particle is ~63% "hot".
 const SPEED_REF: f32 = 1.5;
+/// Speed (in r_max per second) below which a particle counts as settled.
+const SLOW_REF: f32 = 0.1;
+/// Cell-mates, relative to a uniform spread, from which a particle counts as clustered.
+const DENSE_FACTOR: f32 = 3.0;
+
+/// Lane order of `particle_life_measure.wgsl`.
+const METRICS: &[MetricDesc] = &[
+    MetricDesc {
+        id: "speed",
+        label: "Mean speed",
+        unit: Unit::Scalar,
+        hint: "Mean particle speed in interaction radii per second.",
+    },
+    MetricDesc {
+        id: "hot",
+        label: "Fast particles",
+        unit: Unit::Fraction,
+        hint: "Particles moving faster than 1.5 radii per second: chases and boiling.",
+    },
+    MetricDesc {
+        id: "slow",
+        label: "Settled particles",
+        unit: Unit::Fraction,
+        hint: "Particles moving slower than 0.1 radii per second: frozen lattices and resting cells.",
+    },
+    MetricDesc {
+        id: "crowding",
+        label: "Crowding",
+        unit: Unit::Scalar,
+        hint: "Mean particles per grid cell around each particle, relative to a uniform spread (1 = random, higher = clustered).",
+    },
+    MetricDesc {
+        id: "dense",
+        label: "Clustered particles",
+        unit: Unit::Fraction,
+        hint: "Particles whose grid cell holds more than three times the uniform expectation.",
+    },
+    MetricDesc {
+        id: "segregation",
+        label: "Species segregation",
+        unit: Unit::Scalar,
+        hint: "How much cell-mates share a particle's species beyond chance: 0 = mixed, 1 = pure species clusters, negative = alternating.",
+    },
+    MetricDesc {
+        id: "void",
+        label: "Empty cells",
+        unit: Unit::Fraction,
+        hint: "Grid cells without any particle: the open space between structures.",
+    },
+];
 /// Per-species size multipliers.
 const MIN_SPECIES_SIZE: f32 = 0.25;
 const MAX_SPECIES_SIZE: f32 = 3.0;
@@ -694,6 +749,28 @@ fn cell_capacity(size: [u32; 2]) -> u32 {
     gx * gy
 }
 
+/// Mirrors `Measure` in particle_life_measure.wgsl (64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct MeasureUniform {
+    count: u32,
+    cells: u32,
+    grid: [u32; 2],
+    cell: [f32; 2],
+    inv_count: f32,
+    inv_cells: f32,
+    inv_r_max: f32,
+    hot: f32,
+    slow: f32,
+    inv_crowd: f32,
+    dense: f32,
+    mix: f32,
+    inv_unmix: f32,
+    _pad: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<MeasureUniform>() == 64);
+
 /// Buffers whose size depends on the particle count and the domain.
 struct Buffers {
     particles: u32,
@@ -704,17 +781,23 @@ struct Buffers {
     counts: wgpu::Buffer,
     sim_group: wgpu::BindGroup,
     draw_group: wgpu::BindGroup,
+    measure_group: wgpu::BindGroup,
+    /// Sized for one measure thread per particle or grid cell, whichever is more.
+    reduction: Reduction,
     /// Sorted copies, cell starts and scratch: only referenced by `sim_group`.
     _scratch: [wgpu::Buffer; 4],
 }
 
 impl Buffers {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         gpu: &Gpu,
         sim_layout: &wgpu::BindGroupLayout,
         draw_layout: &wgpu::BindGroupLayout,
+        measure_layout: &wgpu::BindGroupLayout,
         sim_uniform: &wgpu::Buffer,
         draw_uniform: &wgpu::Buffer,
+        measure_uniform: &wgpu::Buffer,
         particles: u32,
         cells: u32,
     ) -> Self {
@@ -747,7 +830,32 @@ impl Buffers {
             draw_layout,
             &[draw_uniform.as_entire_binding(), pos.as_entire_binding(), vel.as_entire_binding()],
         );
-        Self { particles, cells, pos, vel, counts, sim_group, draw_group, _scratch: [sorted_pos, sorted_vel, starts, scratch] }
+        let (mx, my) = gpu::dispatch_linear(particles.max(cells), WORKGROUP);
+        let reduction = Reduction::new(gpu, "pl measure", mx * my);
+        let measure_group = gpu.bind_group(
+            "pl measure",
+            measure_layout,
+            &[
+                measure_uniform.as_entire_binding(),
+                pos.as_entire_binding(),
+                vel.as_entire_binding(),
+                sorted_pos.as_entire_binding(),
+                starts.as_entire_binding(),
+                reduction.partials().as_entire_binding(),
+            ],
+        );
+        Self {
+            particles,
+            cells,
+            pos,
+            vel,
+            counts,
+            sim_group,
+            draw_group,
+            measure_group,
+            reduction,
+            _scratch: [sorted_pos, sorted_vel, starts, scratch],
+        }
     }
 }
 
@@ -867,8 +975,11 @@ pub struct ParticleLife {
     pending_motion: f32,
     sim_uniform: wgpu::Buffer,
     draw_uniform: wgpu::Buffer,
+    measure_uniform: wgpu::Buffer,
     sim_layout: wgpu::BindGroupLayout,
     draw_layout: wgpu::BindGroupLayout,
+    measure_layout: wgpu::BindGroupLayout,
+    measure_pipeline: wgpu::ComputePipeline,
     canvas_layout: wgpu::BindGroupLayout,
     count_pipeline: wgpu::ComputePipeline,
     scan_pipeline: wgpu::ComputePipeline,
@@ -924,6 +1035,27 @@ impl ParticleLife {
                 layout::storage(2, vs, true),
             ],
         );
+        let measure_layout = gpu.bind_group_layout(
+            "pl measure",
+            &[
+                layout::uniform(0, cs),
+                layout::storage(1, cs, true),
+                layout::storage(2, cs, true),
+                layout::storage(3, cs, true),
+                layout::storage(4, cs, true),
+                layout::storage(5, cs, false),
+            ],
+        );
+        let measure_module = gpu.shader(
+            "pl measure",
+            &format!("{}\n{}", metrics::WGSL, include_str!("../shaders/particle_life_measure.wgsl")),
+        );
+        let measure_pipeline = gpu.compute_pipeline(
+            "pl measure",
+            &gpu.pipeline_layout("pl measure", &[&measure_layout]),
+            &measure_module,
+            "cs_measure",
+        );
         let fs = ShaderStages::FRAGMENT;
         let canvas_layout =
             gpu.bind_group_layout("pl canvas", &[layout::texture(0, fs, false), layout::texture(1, fs, false)]);
@@ -938,6 +1070,7 @@ impl ParticleLife {
 
         let sim_uniform = gpu.uniform_buffer("pl sim", &SimUniform::zeroed());
         let draw_uniform = gpu.uniform_buffer("pl draw", &DrawUniform::zeroed());
+        let measure_uniform = gpu.uniform_buffer("pl measure", &MeasureUniform::zeroed());
 
         let params = Params::from_preset(&PRESETS[0]);
         let size = domain_for(params.count, params.density, aspect);
@@ -945,8 +1078,10 @@ impl ParticleLife {
             gpu,
             &sim_layout,
             &draw_layout,
+            &measure_layout,
             &sim_uniform,
             &draw_uniform,
+            &measure_uniform,
             params.count,
             cell_capacity(size),
         );
@@ -967,8 +1102,11 @@ impl ParticleLife {
             pending_motion: 0.0,
             sim_uniform,
             draw_uniform,
+            measure_uniform,
             sim_layout,
             draw_layout,
+            measure_layout,
+            measure_pipeline,
             canvas_layout,
             count_pipeline,
             scan_pipeline,
@@ -985,6 +1123,54 @@ impl ParticleLife {
         };
         world.load_preset(gpu, 0, seed);
         world
+    }
+
+    /// Normalisation and thresholds of the measurement kernel. The tests
+    /// recompute the metrics on the CPU from the same values.
+    fn measure_uniform(&self) -> MeasureUniform {
+        let r_max = self.r_max();
+        let grid = self.grid();
+        let cells = grid[0] * grid[1];
+        let domain = [self.size[0] as f32, self.size[1] as f32];
+        // Particles per cell under a uniform spread.
+        let lambda = self.count as f32 / cells as f32;
+        // Chance that two random particles share a species.
+        let kinds = self.params.kinds.clamp(2, MAX_KINDS);
+        let cdf = self.species_cdf();
+        let mix: f32 = (0..kinds).map(|s| cdf[s] - if s == 0 { 0.0 } else { cdf[s - 1] }).map(|w| w * w).sum();
+        MeasureUniform {
+            count: self.count,
+            cells,
+            grid,
+            cell: [domain[0] / grid[0] as f32, domain[1] / grid[1] as f32],
+            inv_count: if self.count == 0 { 0.0 } else { 1.0 / self.count as f32 },
+            inv_cells: 1.0 / cells as f32,
+            inv_r_max: 1.0 / r_max,
+            hot: SPEED_REF * r_max,
+            slow: SLOW_REF * r_max,
+            inv_crowd: 1.0 / (1.0 + lambda),
+            dense: DENSE_FACTOR * (1.0 + lambda),
+            mix,
+            inv_unmix: if mix < 0.999 { 1.0 / (1.0 - mix) } else { 0.0 },
+            _pad: 0.0,
+        }
+    }
+
+    /// Reduces the latest particle state into the buffers' totals.
+    fn record_measure(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+        let uniform = self.measure_uniform();
+        gpu.write(&self.measure_uniform, &uniform);
+        let (x, y) = gpu::dispatch_linear(uniform.count.max(uniform.cells), WORKGROUP);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pl measure"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.measure_pipeline);
+            pass.set_bind_group(0, &self.buffers.measure_group, &[]);
+            pass.dispatch_workgroups(x, y, 1);
+        }
+        self.buffers.reduction.record(gpu, encoder, x * y);
     }
 
     /// Effective interaction radius: the requested one, capped so that about
@@ -1332,8 +1518,10 @@ impl World for ParticleLife {
                 gpu,
                 &self.sim_layout,
                 &self.draw_layout,
+                &self.measure_layout,
                 &self.sim_uniform,
                 &self.draw_uniform,
+                &self.measure_uniform,
                 p.count,
                 cells,
             );
@@ -1383,6 +1571,18 @@ impl World for ParticleLife {
         }
         self.pending_steps += 1;
         self.pending_motion += self.sim_dt() * substeps as f32;
+    }
+
+    fn metrics(&self) -> &'static [MetricDesc] {
+        METRICS
+    }
+
+    fn measure(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, sink: &mut metrics::Sink<'_>) {
+        if !sink.is_live() {
+            return;
+        }
+        self.record_measure(frame.gpu, encoder);
+        sink.push(encoder, self.buffers.reduction.totals());
     }
 
     fn render(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {

@@ -35,9 +35,14 @@ use wgpu::ShaderStages;
 
 use super::{Frame, ViewXform, World};
 use crate::gpu::{self, layout, Gpu, SCENE_FORMAT};
+use crate::metrics::{self, MetricDesc, Reduction, Unit};
 use crate::palette::{self, PaletteLut, PALETTES};
 use crate::post::{PostSettings, Tonemap};
 use crate::rng::Rng;
+
+#[cfg(test)]
+#[path = "lenia_tests.rs"]
+mod tests;
 
 /// State channels held by the GPU buffers (a parameter set may use fewer).
 const CHANNELS: usize = 3;
@@ -60,6 +65,60 @@ const RADIUS_CAP: u32 = 36;
 const MAX_CELLS: f32 = 640_000.0;
 /// Fixed-point scale of the GPU mass counter (see `cs_compose`).
 const MASS_SCALE: f32 = 256.0;
+/// Summed cell value from which a cell counts as occupied (`Trial::occupancy`).
+const OCCUPIED_A: f32 = 0.1;
+/// Summed cell value from which a cell counts as a dense core.
+const DENSE_A: f32 = 0.5;
+/// Summed change per frame from which a cell counts as still changing
+/// (measured on the last step and scaled by the steps per frame).
+const ACTIVE_DA: f32 = 1e-3;
+
+/// Lane order of `lenia_measure.wgsl`.
+const METRICS: &[MetricDesc] = &[
+    MetricDesc {
+        id: "mass",
+        label: "Mean density",
+        unit: Unit::Scalar,
+        hint: "Mean cell value summed over the channels: the creatures' total mass per cell.",
+    },
+    MetricDesc { id: "mass_1", label: "Channel 1 density", unit: Unit::Scalar, hint: "Mean value of channel 1." },
+    MetricDesc {
+        id: "mass_2",
+        label: "Channel 2 density",
+        unit: Unit::Scalar,
+        hint: "Mean value of channel 2 (zero when the preset uses fewer channels).",
+    },
+    MetricDesc {
+        id: "mass_3",
+        label: "Channel 3 density",
+        unit: Unit::Scalar,
+        hint: "Mean value of channel 3 (zero when the preset uses fewer channels).",
+    },
+    MetricDesc {
+        id: "occupied",
+        label: "Occupied cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose summed value exceeds 0.1: the creatures' footprint.",
+    },
+    MetricDesc {
+        id: "active",
+        label: "Changing cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose summed value is changing by more than 0.001 per frame, judged from the last step.",
+    },
+    MetricDesc {
+        id: "growth",
+        label: "Net growth",
+        unit: Unit::Scalar,
+        hint: "Mean growth rate of the last step summed over the channels: positive while creatures grow, negative while they fade.",
+    },
+    MetricDesc {
+        id: "dense",
+        label: "Dense cores",
+        unit: Unit::Fraction,
+        hint: "Cells whose summed value exceeds 0.5: the solid bodies of the creatures.",
+    },
+];
 /// A world whose mean density falls below this counts as extinct (revival).
 const EXTINCT_LEVEL: f32 = 0.0004;
 /// Revival drops a new patch every this many frames while the world is extinct.
@@ -1780,6 +1839,21 @@ const QUENCH_RATE: f32 = 0.35;
 /// Share of the medium's light kept from one frame to the next (its lag).
 const LIGHT_KEEP: f32 = 0.96;
 
+/// Mirrors `Measure` in lenia_measure.wgsl (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct MeasureUniform {
+    size: [u32; 2],
+    channels: u32,
+    _pad: u32,
+    inv_cells: f32,
+    occupied: f32,
+    active: f32,
+    dense: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<MeasureUniform>() == 32);
+
 /// Layouts, pipelines and uniforms of the brush, quench, compose, light and
 /// draw passes (independent of the domain size).
 struct Graphics {
@@ -1804,6 +1878,9 @@ struct Graphics {
     draw_uniform: wgpu::Buffer,
     /// Linear, repeating: the display wraps the torus through it.
     wrap: wgpu::Sampler,
+    measure_layout: wgpu::BindGroupLayout,
+    measure: wgpu::ComputePipeline,
+    measure_uniform: wgpu::Buffer,
 }
 
 impl Graphics {
@@ -1859,6 +1936,26 @@ impl Graphics {
                 layout::storage(8, fs, true),
             ],
         );
+        let measure_layout = gpu.bind_group_layout(
+            "lenia measure",
+            &[
+                layout::uniform(0, cs),
+                layout::storage(1, cs, true),
+                layout::storage(2, cs, true),
+                layout::storage(3, cs, true),
+                layout::storage(4, cs, false),
+            ],
+        );
+        let measure_module = gpu.shader(
+            "lenia measure",
+            &format!("{}\n{}", metrics::WGSL, include_str!("../shaders/lenia_measure.wgsl")),
+        );
+        let measure = gpu.compute_pipeline(
+            "lenia measure",
+            &gpu.pipeline_layout("lenia measure", &[&measure_layout]),
+            &measure_module,
+            "cs_measure",
+        );
         let compute = |label: &str, layout: &wgpu::BindGroupLayout, entry: &str| {
             gpu.compute_pipeline(label, &gpu.pipeline_layout(label, &[layout]), &module, entry)
         };
@@ -1888,6 +1985,9 @@ impl Graphics {
             light_uniform: gpu.uniform_buffer("lenia light", &LightUniform::zeroed()),
             draw_uniform: gpu.uniform_buffer("lenia draw", &DrawUniform::zeroed()),
             wrap: gpu.sampler(wgpu::FilterMode::Linear, wgpu::AddressMode::Repeat),
+            measure_layout,
+            measure,
+            measure_uniform: gpu.uniform_buffer("lenia measure", &MeasureUniform::zeroed()),
         }
     }
 }
@@ -1938,6 +2038,9 @@ struct Domain {
     compose_binds: [[wgpu::BindGroup; 2]; 2],
     light_bind: wgpu::BindGroup,
     draw_bind: wgpu::BindGroup,
+    /// `[i]` measures `sim.state[i]` against `sim.state[1 - i]`.
+    measure_binds: [wgpu::BindGroup; 2],
+    reduction: Reduction,
 }
 
 impl Domain {
@@ -1986,6 +2089,20 @@ impl Domain {
                 )
             })
         });
+        let reduction = Reduction::new(gpu, "lenia measure", (grid[0] * grid[1]) as u32);
+        let measure_binds = [0, 1].map(|i| {
+            gpu.bind_group(
+                "lenia measure",
+                &gfx.measure_layout,
+                &[
+                    gfx.measure_uniform.as_entire_binding(),
+                    sim.state[i].as_entire_binding(),
+                    sim.state[1 - i].as_entire_binding(),
+                    sim.growth.as_entire_binding(),
+                    reduction.partials().as_entire_binding(),
+                ],
+            )
+        });
         let light_bind = gpu.bind_group(
             "lenia light",
             &gfx.light_layout,
@@ -2019,6 +2136,8 @@ impl Domain {
             compose_binds,
             light_bind,
             draw_bind,
+            measure_binds,
+            reduction,
         }
     }
 
@@ -2113,6 +2232,36 @@ fn domain_size(output: [u32; 2], cell_px: f32) -> [u32; 2] {
 }
 
 impl Lenia {
+    /// Normalisation and thresholds of the measurement kernel. The tests
+    /// recompute the metrics on the CPU from the same values.
+    fn measure_uniform(&self) -> MeasureUniform {
+        MeasureUniform {
+            size: self.dom.size,
+            channels: self.params.active_channels() as u32,
+            _pad: 0,
+            inv_cells: 1.0 / self.dom.cells(),
+            occupied: OCCUPIED_A,
+            active: ACTIVE_DA / self.params.steps_per_frame.clamp(1, 16) as f32,
+            dense: DENSE_A,
+        }
+    }
+
+    /// Reduces the latest state into the domain's totals.
+    fn record_measure(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+        gpu.write(&self.gfx.measure_uniform, &self.measure_uniform());
+        let grid = self.dom.grid();
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("lenia measure"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gfx.measure);
+            pass.set_bind_group(0, &self.dom.measure_binds[self.dom.sim.current], &[]);
+            pass.dispatch_workgroups(grid[0], grid[1], 1);
+        }
+        self.dom.reduction.record(gpu, encoder, grid[0] * grid[1]);
+    }
+
     fn new(gpu: &Gpu, output: [u32; 2], seed: u64) -> Self {
         let pipes = StepPipelines::new(gpu);
         let gfx = Graphics::new(gpu);
@@ -2531,6 +2680,19 @@ impl World for Lenia {
         drop(pass);
         self.tick += 1;
         self.stepped = true;
+    }
+
+    fn metrics(&self) -> &'static [MetricDesc] {
+        METRICS
+    }
+
+    fn measure(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, sink: &mut metrics::Sink<'_>) {
+        // A run that has not started yet has no previous state to compare with.
+        if !sink.is_live() || self.pending.is_some() {
+            return;
+        }
+        self.record_measure(frame.gpu, encoder);
+        sink.push(encoder, self.dom.reduction.totals());
     }
 
     fn render(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {

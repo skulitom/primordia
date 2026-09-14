@@ -296,6 +296,170 @@ impl egui::Widget for Slider<'_> {
     }
 }
 
+/// Colours of the first and second measurement series: a habitat and, while
+/// comparing, its reference.
+pub const SERIES_COLORS: [Color32; 2] = [ACCENT, Color32::from_rgb(235, 194, 130)];
+
+/// A compact time-series card: `label` top-left, `value` top-right and one
+/// polyline per series (oldest to newest) on a shared y-range. Non-finite
+/// points are skipped, a single point becomes a dot and a flat trace sits in
+/// the middle of the plot. `tooltip` is shown on hover.
+pub fn sparkline(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    value: &str,
+    series: &[(&[f32], Color32)],
+    tooltip: &str,
+) -> egui::Response {
+    const HEIGHT: f32 = 52.0;
+    const PAD: f32 = 10.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect(rect, 8.0, SURFACE, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    painter.text(rect.min + egui::vec2(PAD, 12.0), egui::Align2::LEFT_CENTER, label, FontId::proportional(11.0), MUTED);
+    painter.text(
+        egui::pos2(rect.max.x - PAD, rect.min.y + 12.0),
+        egui::Align2::RIGHT_CENTER,
+        value,
+        FontId::monospace(11.5),
+        TEXT,
+    );
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + PAD, rect.min.y + 22.0),
+        egui::pos2(rect.max.x - PAD, rect.max.y - 7.0),
+    );
+    let (lo, hi) = series
+        .iter()
+        .flat_map(|(values, _)| values.iter().copied())
+        .filter(|v| v.is_finite())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    if lo <= hi {
+        let (lo, hi) = if hi > lo {
+            (lo, hi)
+        } else {
+            let pad = lo.abs().max(1e-6) * 0.5;
+            (lo - pad, hi + pad)
+        };
+        let painter = ui.painter_at(plot);
+        for (values, colour) in series {
+            let n = values.len();
+            let points: Vec<egui::Pos2> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(i, v)| {
+                    let t = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+                    egui::pos2(plot.min.x + t * plot.width(), plot.max.y - (v - lo) / (hi - lo) * plot.height())
+                })
+                .collect();
+            match points.len() {
+                0 => {}
+                1 => {
+                    painter.circle_filled(points[0], 2.0, *colour);
+                }
+                _ => {
+                    painter.add(egui::Shape::line(points, Stroke::new(1.25, *colour)));
+                }
+            }
+        }
+    }
+    if tooltip.is_empty() { response } else { response.on_hover_text(tooltip) }
+}
+
+/// What the measurements section reports besides the traces.
+pub struct MeasurementsStatus<'a> {
+    /// The open CSV log: its path and the rows written so far.
+    pub logging: Option<(&'a std::path::Path, u64)>,
+    /// Frames whose measurements were skipped because the readback ring was full.
+    pub dropped: u64,
+}
+
+/// The World tab's "Measurements" section: a collapsible header carrying the
+/// CSV log toggle, a legend while two habitats are compared, one sparkline
+/// per metric and a status line. Returns true when the log toggle was
+/// clicked. Draws nothing for a world without measurements.
+pub fn measurements(
+    ui: &mut egui::Ui,
+    metrics: &[crate::metrics::MetricDesc],
+    history: &crate::metrics::History,
+    series_names: Option<&[String; 2]>,
+    status: MeasurementsStatus<'_>,
+) -> bool {
+    use std::fmt::Write as _;
+    if metrics.is_empty() {
+        return false;
+    }
+    let mut toggle_log = false;
+    let id = ui.make_persistent_id("measurements");
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            ui.label(RichText::new("Measurements").strong().color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (text, colour, hint) = match status.logging {
+                    Some((path, rows)) => {
+                        ("Stop log", WARN, format!("Logging every frame to {}\n{rows} rows so far", path.display()))
+                    }
+                    None => ("Log CSV", TEXT, "Write every frame's measurements to a CSV file in the capture folder".to_string()),
+                };
+                if ui.add(egui::Button::new(RichText::new(text).small().color(colour))).on_hover_text(hint).clicked() {
+                    toggle_log = true;
+                }
+            });
+        })
+        .body_unindented(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let series = history.series();
+            if let Some(names) = series_names.filter(|_| series > 1) {
+                ui.horizontal_wrapped(|ui| {
+                    for (name, colour) in names.iter().zip(SERIES_COLORS) {
+                        status_dot(ui, colour);
+                        ui.label(RichText::new(name).small().color(MUTED));
+                    }
+                });
+            }
+            let width = ui.available_width();
+            for (i, metric) in metrics.iter().enumerate() {
+                let traces: Vec<Vec<f32>> = (0..series).map(|s| history.trace(s, i)).collect();
+                let lines: Vec<(&[f32], Color32)> =
+                    traces.iter().zip(SERIES_COLORS).map(|(trace, colour)| (trace.as_slice(), colour)).collect();
+                let value = history.latest(0, i).map_or_else(|| "—".to_string(), |v| metric.unit.format(v));
+                let mut tooltip = format!("{}\n{}", metric.label, metric.hint);
+                for s in 0..series {
+                    if let (Some(latest), Some((lo, hi))) = (history.latest(s, i), history.range(s, i)) {
+                        let name = series_names.filter(|_| series > 1).map_or(String::new(), |n| format!("{}: ", n[s]));
+                        let _ = write!(
+                            tooltip,
+                            "\n{name}{} (range {} to {})",
+                            metric.unit.format(latest),
+                            metric.unit.format(lo),
+                            metric.unit.format(hi)
+                        );
+                    }
+                }
+                if let Some((first, last)) = history.frame_span() {
+                    let _ = write!(tooltip, "\nframes {first} to {last}, one point every {} frame(s)", history.stride());
+                }
+                sparkline(ui, width, metric.label, &value, &lines, &tooltip);
+            }
+            let mut line = match history.latest_frame() {
+                Some(frame) => format!("frame {frame}"),
+                None => "waiting for the first frame".to_string(),
+            };
+            if history.stride() > 1 {
+                let _ = write!(line, " · one point every {} frames", history.stride());
+            }
+            if status.dropped > 0 {
+                let _ = write!(line, " · {} frame(s) skipped", status.dropped);
+            }
+            if let Some((_, rows)) = status.logging {
+                let _ = write!(line, " · logging, {rows} rows");
+            }
+            ui.label(RichText::new(line).small().weak());
+        });
+    toggle_log
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +564,153 @@ mod tests {
                 assert!(!(is_vertical && over_art && stroke.width > 0.0 && stroke.color != egui::Color32::TRANSPARENT));
             }
         }
+    }
+
+    /// Runs `draw` once in a 300 px wide panel and returns the painted shapes.
+    fn paint(draw: impl FnOnce(&mut egui::Ui)) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut draw = Some(draw);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    if let Some(draw) = draw.take() {
+                        draw(ui);
+                    }
+                });
+            },
+        )
+        .shapes
+    }
+
+    /// The trace polylines: paths stroked in a series colour (the collapsing
+    /// header's arrow is a path too, in the text colour).
+    fn paths(shapes: &[egui::epaint::ClippedShape]) -> Vec<&egui::epaint::PathShape> {
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Path(path)
+                    if SERIES_COLORS.iter().any(|c| path.stroke.color == egui::epaint::ColorMode::Solid(*c)) =>
+                {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                    assert_eq!(text.galley.rows.len(), 1, "{} wrapped", text.galley.job.text);
+                    Some(text.galley.job.text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sparkline_draws_each_series_inside_its_card() {
+        let rising: Vec<f32> = (0..50).map(|i| i as f32 * 0.01).collect();
+        let falling: Vec<f32> = (0..50).map(|i| 1.0 - i as f32 * 0.02).collect();
+        let shapes = paint(|ui| {
+            sparkline(ui, 280.0, "Growth cover", "12.3%", &[(&rising, ACCENT), (&falling, SERIES_COLORS[1])], "hint");
+        });
+        let lines = paths(&shapes);
+        assert_eq!(lines.len(), 2);
+        let card = shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == SURFACE => Some(rect.rect),
+                _ => None,
+            })
+            .expect("the card background");
+        assert_eq!(card.size(), egui::vec2(280.0, 52.0));
+        for (line, colour) in lines.iter().zip(SERIES_COLORS) {
+            assert_eq!(line.points.len(), 50);
+            assert!(!line.closed);
+            assert_eq!(line.stroke.color, egui::epaint::ColorMode::Solid(colour));
+            assert!(line.points.iter().all(|p| card.contains(*p)), "points leave the card");
+        }
+        // The rising trace ends at the top of the shared range, the falling one at the bottom.
+        assert!(lines[0].points[49].y < lines[1].points[49].y);
+        assert!(lines[0].points[0].y > lines[1].points[0].y);
+        assert_eq!(texts(&shapes), ["Growth cover", "12.3%"]);
+    }
+
+    #[test]
+    fn sparkline_survives_empty_constant_and_non_finite_series() {
+        let shapes = paint(|ui| {
+            sparkline(ui, 280.0, "Nothing yet", "—", &[(&[], ACCENT)], "");
+        });
+        assert!(paths(&shapes).is_empty());
+        assert!(!shapes.iter().any(|c| matches!(c.shape, egui::epaint::Shape::Circle(_))));
+
+        let shapes = paint(|ui| {
+            sparkline(ui, 280.0, "One point", "1.00", &[(&[1.0], ACCENT)], "");
+        });
+        assert!(paths(&shapes).is_empty());
+        assert!(shapes.iter().any(|c| matches!(c.shape, egui::epaint::Shape::Circle(_))));
+
+        let flat = [0.25; 20];
+        let mixed = [0.0, f32::NAN, 1.0, f32::INFINITY, 0.5];
+        let shapes = paint(|ui| {
+            sparkline(ui, 280.0, "Flat", "0.250", &[(&flat, ACCENT)], "");
+            sparkline(ui, 280.0, "Mixed", "0.500", &[(&mixed, ACCENT)], "");
+        });
+        let lines = paths(&shapes);
+        assert_eq!(lines.len(), 2);
+        let ys: Vec<f32> = lines[0].points.iter().map(|p| p.y).collect();
+        assert!(ys.iter().all(|y| (y - ys[0]).abs() < 1e-3), "a flat trace stays level");
+        assert_eq!(lines[1].points.len(), 3, "non-finite points are skipped");
+        assert!(lines[1].points.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+    }
+
+    #[test]
+    fn measurements_section_shows_one_card_per_metric_and_nothing_without_metrics() {
+        use crate::metrics::{History, MetricDesc, Sample, Unit, MAX_METRICS, MAX_SERIES};
+        let metrics = [
+            MetricDesc { id: "cover", label: "Cover", unit: Unit::Fraction, hint: "Covered cells." },
+            MetricDesc { id: "mean", label: "Mean", unit: Unit::Scalar, hint: "Mean value." },
+            MetricDesc { id: "active", label: "Active", unit: Unit::Fraction, hint: "Changing cells." },
+        ];
+        let mut history = History::default();
+        for frame in 0..40 {
+            let mut values = [[0.0; MAX_METRICS]; MAX_SERIES];
+            for (s, lanes) in values.iter_mut().enumerate() {
+                for (k, v) in lanes.iter_mut().enumerate() {
+                    *v = (frame as f32 * 0.1 + k as f32 + s as f32 * 0.5).sin() * 0.5 + 0.5;
+                }
+            }
+            history.push(&Sample { frame, time: frame as f32 / 60.0, series: 2, values });
+        }
+        let names = ["COUPLING 0.70".to_string(), "COUPLING OFF".to_string()];
+        let dir = std::path::Path::new("screenshots/run.csv");
+        let shapes = paint(|ui| {
+            let status = MeasurementsStatus { logging: Some((dir, 80)), dropped: 2 };
+            assert!(!measurements(ui, &metrics, &history, Some(&names), status));
+        });
+        assert_eq!(paths(&shapes).len(), metrics.len() * 2, "two traces per metric");
+        let labels = texts(&shapes);
+        for metric in &metrics {
+            assert!(labels.iter().any(|t| t == metric.label), "{} card missing", metric.label);
+        }
+        assert!(labels.iter().any(|t| t == "Stop log"));
+        assert!(labels.iter().any(|t| t == "COUPLING OFF"), "legend for the second series");
+        assert!(labels.iter().any(|t| t.starts_with("frame 39") && t.contains("2 frame(s) skipped") && t.contains("80 rows")));
+
+        let shapes = paint(|ui| {
+            let status = MeasurementsStatus { logging: None, dropped: 0 };
+            assert!(!measurements(ui, &[], &history, None, status));
+        });
+        assert!(texts(&shapes).is_empty() && paths(&shapes).is_empty());
     }
 }

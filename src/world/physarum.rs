@@ -36,9 +36,14 @@ use wgpu::ShaderStages;
 
 use super::{Frame, ViewXform, World};
 use crate::gpu::{self, layout, Gpu, SCENE_FORMAT};
+use crate::metrics::{self, MetricDesc, Reduction, Unit};
 use crate::palette::{self, Palette, PALETTES};
 use crate::post::{PostSettings, Tonemap};
 use crate::rng::Rng;
+
+#[cfg(test)]
+#[path = "physarum_tests.rs"]
+mod tests;
 
 const AGENT_WG: u32 = 256;
 const CELL_WG: u32 = 16;
@@ -56,6 +61,64 @@ const FOOD_GAIN: f32 = 30.0;
 const TRAFFIC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Time constant of the adaptive black point's glide, in seconds.
 const GROUND_SECONDS: f32 = 0.33;
+/// Relative trail density (1 = an even spread) from which ground counts as marked.
+const MARKED_X: f32 = 0.1;
+/// Relative trail density from which a cell counts as a vein.
+const VEIN_X: f32 = 4.0;
+/// Traffic (1 = an even spread) from which ground counts as travelled.
+const TRAVELLED_G: f32 = 0.25;
+
+/// Lane order of `physarum_measure.wgsl`.
+const METRICS: &[MetricDesc] = &[
+    MetricDesc {
+        id: "ground",
+        label: "Marked ground",
+        unit: Unit::Fraction,
+        hint: "Cells holding at least a tenth of the trail an even spread of the agents would leave.",
+    },
+    MetricDesc {
+        id: "veins",
+        label: "Vein cells",
+        unit: Unit::Fraction,
+        hint: "Cells holding more than four times the trail of an even spread: the network's arteries.",
+    },
+    MetricDesc {
+        id: "concentration",
+        label: "Concentration",
+        unit: Unit::Scalar,
+        hint: "Mean log2 of the relative trail density: an even spread at the nominal level gives 0, and the value drops the more the trail gathers into a network.",
+    },
+    MetricDesc {
+        id: "travelled",
+        label: "Travelled ground",
+        unit: Unit::Fraction,
+        hint: "Cells whose long-exposure traffic is at least a quarter of an even spread.",
+    },
+    MetricDesc {
+        id: "trail_mass",
+        label: "Trail mass",
+        unit: Unit::Scalar,
+        hint: "Mean relative trail density; about 1, shifted by terrain and crowding.",
+    },
+    MetricDesc {
+        id: "reinforced",
+        label: "Reinforced cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose trail grew during the last step, against those decaying.",
+    },
+    MetricDesc {
+        id: "on_vein",
+        label: "Agents on veins",
+        unit: Unit::Fraction,
+        hint: "Agents standing on a cell where their own species' trail exceeds four times an even spread.",
+    },
+    MetricDesc {
+        id: "agent_trail",
+        label: "Trail under agents",
+        unit: Unit::Scalar,
+        hint: "Mean relative trail density of the agents' own species under them: about 1 when scattered, far more on a network.",
+    },
+];
 /// How strongly the terrain scales agents (reach and stride), relative to how
 /// strongly it scales the trail's decay rate (both in log2 units).
 const TERRAIN_SIZE: f32 = 0.5;
@@ -949,6 +1012,25 @@ struct DrawUniform {
     colors: [[f32; 4]; 4],
 }
 
+/// Mirrors `Measure` in physarum_measure.wgsl (64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct MeasureUniform {
+    size: [u32; 2],
+    agent_count: u32,
+    species_count: u32,
+    inv_cells: f32,
+    inv_agents: f32,
+    cell_workgroups: u32,
+    _pad: u32,
+    /// 1 / mean trail level per species (0 for dead species).
+    inv_level: [f32; 4],
+    /// Marked ground x, vein x, travelled traffic, reserved.
+    thresholds: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<MeasureUniform>() == 64);
+
 /// Simulation resources shared by both ping-pong bind groups: everything but
 /// the agent buffer, which is reallocated when the population changes.
 struct SimResources {
@@ -957,8 +1039,37 @@ struct SimResources {
     seed_uniform: wgpu::Buffer,
     trail: [wgpu::TextureView; 2],
     traffic: [wgpu::TextureView; 2],
+    /// The textures behind the views, kept so tests can read them back.
+    _trail_textures: [wgpu::Texture; 2],
+    _traffic_textures: [wgpu::Texture; 2],
     counts: wgpu::Buffer,
     sampler: wgpu::Sampler,
+}
+
+/// Measurement bind groups: `[i]` measures the fields at index `i` against
+/// the trail at `1 - i`. Rebuilt with the agent buffer.
+fn measure_groups(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    sim: &SimResources,
+    agents: &wgpu::Buffer,
+    uniform: &wgpu::Buffer,
+    reduction: &Reduction,
+) -> [wgpu::BindGroup; 2] {
+    [0, 1].map(|i| {
+        gpu.bind_group(
+            "physarum measure",
+            layout,
+            &[
+                uniform.as_entire_binding(),
+                wgpu::BindingResource::TextureView(&sim.trail[i]),
+                wgpu::BindingResource::TextureView(&sim.trail[1 - i]),
+                wgpu::BindingResource::TextureView(&sim.traffic[i]),
+                agents.as_entire_binding(),
+                reduction.partials().as_entire_binding(),
+            ],
+        )
+    })
 }
 
 impl SimResources {
@@ -1036,6 +1147,12 @@ pub struct Physarum {
     ground_pipeline: wgpu::ComputePipeline,
     /// `ground_groups[i]` measures the fields at index `i`.
     ground_groups: [wgpu::BindGroup; 2],
+    measure_uniform: wgpu::Buffer,
+    measure_layout: wgpu::BindGroupLayout,
+    measure_groups: [wgpu::BindGroup; 2],
+    measure_cells_pipeline: wgpu::ComputePipeline,
+    measure_agents_pipeline: wgpu::ComputePipeline,
+    reduction: Reduction,
     /// Index of the fields holding the latest state.
     current: usize,
 }
@@ -1069,15 +1186,19 @@ fn agent_buffer(gpu: &Gpu, count: u32) -> wgpu::Buffer {
     gpu.storage_buffer("physarum agents", u64::from(count) * 16, wgpu::BufferUsages::empty())
 }
 
+/// f32 trails keep single deposits resolvable on top of dense veins; sampling
+/// them with filtering needs FLOAT32_FILTERABLE.
+fn trail_format(gpu: &Gpu) -> wgpu::TextureFormat {
+    if gpu.device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+        wgpu::TextureFormat::Rgba32Float
+    } else {
+        wgpu::TextureFormat::Rgba16Float
+    }
+}
+
 impl Physarum {
     pub fn new(gpu: &Gpu, size: [u32; 2], seed: u64) -> Self {
-        // f32 trails keep single deposits resolvable on top of dense veins;
-        // sampling them with filtering needs FLOAT32_FILTERABLE.
-        let trail_format = if gpu.device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
-            wgpu::TextureFormat::Rgba32Float
-        } else {
-            wgpu::TextureFormat::Rgba16Float
-        };
+        let trail_format = trail_format(gpu);
         let sim_source = include_str!("../shaders/physarum.wgsl")
             .replace("TRAIL_FORMAT", wgsl_format(trail_format))
             .replace("TRAFFIC_FORMAT", wgsl_format(TRAFFIC_FORMAT));
@@ -1090,8 +1211,13 @@ impl Physarum {
             .min((limits.max_buffer_size / 16).min(u64::from(u32::MAX)) as u32)
             .max(MIN_AGENTS);
 
-        let field_usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
+        let field_usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
         let cs = ShaderStages::COMPUTE;
+        let [trail_a, trail_b] = [0, 1].map(|_| gpu.texture_2d("physarum trail", size, trail_format, field_usage));
+        let [traffic_a, traffic_b] =
+            [0, 1].map(|_| gpu.texture_2d("physarum traffic", size, TRAFFIC_FORMAT, field_usage));
         let sim = SimResources {
             layout: gpu.bind_group_layout(
                 "physarum sim",
@@ -1109,8 +1235,10 @@ impl Physarum {
             ),
             uniform: gpu.uniform_buffer("physarum sim", &SimUniform::zeroed()),
             seed_uniform: gpu.uniform_buffer("physarum seeding", &SeedUniform::zeroed()),
-            trail: [0, 1].map(|_| gpu.texture_2d("physarum trail", size, trail_format, field_usage).1),
-            traffic: [0, 1].map(|_| gpu.texture_2d("physarum traffic", size, TRAFFIC_FORMAT, field_usage).1),
+            trail: [trail_a.1.clone(), trail_b.1.clone()],
+            traffic: [traffic_a.1.clone(), traffic_b.1.clone()],
+            _trail_textures: [trail_a.0, trail_b.0],
+            _traffic_textures: [traffic_a.0, traffic_b.0],
             counts: gpu.storage_buffer(
                 "physarum deposit counts",
                 u64::from(size[0]) * u64::from(size[1]) * 16,
@@ -1205,6 +1333,33 @@ impl Physarum {
             })
         });
 
+        let measure_uniform = gpu.uniform_buffer("physarum measure", &MeasureUniform::zeroed());
+        let measure_layout = gpu.bind_group_layout(
+            "physarum measure",
+            &[
+                layout::uniform(0, cs),
+                layout::texture(1, cs, false),
+                layout::texture(2, cs, false),
+                layout::texture(3, cs, false),
+                layout::storage(4, cs, true),
+                layout::storage(5, cs, false),
+            ],
+        );
+        let measure_module = gpu.shader(
+            "physarum measure",
+            &format!("{}\n{}", metrics::WGSL, include_str!("../shaders/physarum_measure.wgsl")),
+        );
+        let measure_pl = gpu.pipeline_layout("physarum measure", &[&measure_layout]);
+        let measure_cells_pipeline =
+            gpu.compute_pipeline("physarum measure cells", &measure_pl, &measure_module, "cs_measure_cells");
+        let measure_agents_pipeline =
+            gpu.compute_pipeline("physarum measure agents", &measure_pl, &measure_module, "cs_measure_agents");
+        // One record per cell block plus one per agent block at the largest population.
+        let cell_blocks = size[0].div_ceil(CELL_WG) * size[1].div_ceil(CELL_WG);
+        let (ax, ay) = gpu::dispatch_linear(max_agents, AGENT_WG);
+        let reduction = Reduction::new(gpu, "physarum measure", cell_blocks + ax * ay);
+        let measure_groups = measure_groups(gpu, &measure_layout, &sim, &agents, &measure_uniform, &reduction);
+
         let mut world = Self {
             size,
             params: Params::from_preset(&PRESETS[0]),
@@ -1230,6 +1385,12 @@ impl Physarum {
             ground,
             ground_pipeline,
             ground_groups,
+            measure_uniform,
+            measure_layout,
+            measure_groups,
+            measure_cells_pipeline,
+            measure_agents_pipeline,
+            reduction,
             current: 0,
         };
         world.load_preset(gpu, 0, seed);
@@ -1252,7 +1413,48 @@ impl Physarum {
             self.agents = agent_buffer(gpu, needed);
             self.agent_capacity = needed;
             self.sim_groups = self.sim.groups(gpu, &self.agents);
+            self.measure_groups =
+                measure_groups(gpu, &self.measure_layout, &self.sim, &self.agents, &self.measure_uniform, &self.reduction);
         }
+    }
+
+    /// Normalisation and thresholds of the measurement kernels. The tests
+    /// recompute the metrics on the CPU from the same values.
+    fn measure_uniform(&self) -> MeasureUniform {
+        let levels = self.mean_levels();
+        let k = self.population.species;
+        let agents = self.population.agents;
+        MeasureUniform {
+            size: self.size,
+            agent_count: agents,
+            species_count: k as u32,
+            inv_cells: 1.0 / self.cells(),
+            inv_agents: if agents == 0 { 0.0 } else { 1.0 / agents as f32 },
+            cell_workgroups: self.size[0].div_ceil(CELL_WG) * self.size[1].div_ceil(CELL_WG),
+            _pad: 0,
+            inv_level: std::array::from_fn(|s| if s < k && levels[s] > 0.0 { 1.0 / levels[s] } else { 0.0 }),
+            thresholds: [MARKED_X, VEIN_X, TRAVELLED_G, 0.0],
+        }
+    }
+
+    /// Reduces the latest fields and the agents into `reduction`'s totals.
+    fn record_measure(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+        let uniform = self.measure_uniform();
+        gpu.write(&self.measure_uniform, &uniform);
+        let cells = [self.size[0].div_ceil(CELL_WG), self.size[1].div_ceil(CELL_WG)];
+        let (ax, ay) = gpu::dispatch_linear(uniform.agent_count, AGENT_WG);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("physarum measure"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &self.measure_groups[self.current], &[]);
+            pass.set_pipeline(&self.measure_cells_pipeline);
+            pass.dispatch_workgroups(cells[0], cells[1], 1);
+            pass.set_pipeline(&self.measure_agents_pipeline);
+            pass.dispatch_workgroups(ax, ay, 1);
+        }
+        self.reduction.record(gpu, encoder, uniform.cell_workgroups + ax * ay);
     }
 
     /// Mean steady-state trail level of every live species. Deposits are
@@ -1642,6 +1844,18 @@ impl World for Physarum {
             let period = f64::from(self.size[a]);
             self.terrain.offset[a] = (self.terrain.offset[a] + drift * self.terrain.dir[a]).rem_euclid(period);
         }
+    }
+
+    fn metrics(&self) -> &'static [MetricDesc] {
+        METRICS
+    }
+
+    fn measure(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, sink: &mut metrics::Sink<'_>) {
+        if !sink.is_live() {
+            return;
+        }
+        self.record_measure(frame.gpu, encoder);
+        sink.push(encoder, self.reduction.totals());
     }
 
     fn render(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {

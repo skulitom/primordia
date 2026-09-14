@@ -5,6 +5,7 @@ mod capture;
 mod gpu;
 mod headless;
 mod library;
+mod metrics;
 mod palette;
 mod post;
 mod rng;
@@ -33,6 +34,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at startup: the size of the render arguments is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Render a world offscreen to a PNG (and optionally a video via ffmpeg)
     Render(RenderArgs),
@@ -180,6 +183,9 @@ struct RenderArgs {
     /// Frame-rate ceiling that keeps the GPU from running flat out (0 = unlimited)
     #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS, value_parser = finite_float)]
     max_fps: f32,
+    /// Write every frame's measurements to a CSV file (frame, time, series, one column per metric)
+    #[arg(long, value_name = "PATH")]
+    metrics: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -287,6 +293,7 @@ fn run() -> Result<()> {
                 brush,
                 max_fps: r.max_fps,
                 quiet: false,
+                metrics: r.metrics,
             })
         }
         Some(Command::Gallery(g)) => headless::gallery(&headless::GalleryJob {
@@ -351,5 +358,14 @@ mod tests {
         assert_eq!(args.brush_at, [2.0, -1.0]);
         assert_eq!(args.max_fps, 0.0);
         assert_eq!(args.bloom, Some(0.0));
+        assert_eq!(args.metrics, None);
+    }
+
+    #[test]
+    fn cli_accepts_a_measurement_log_path() {
+        let cli = Cli::try_parse_from(["primordia", "render", "--metrics", "runs/reef.csv"]).unwrap();
+        let Some(Command::Render(args)) = cli.command else { panic!("expected render") };
+        assert_eq!(args.metrics, Some(PathBuf::from("runs/reef.csv")));
+        assert!(Cli::try_parse_from(["primordia", "render", "--metrics"]).is_err());
     }
 }

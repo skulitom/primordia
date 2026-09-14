@@ -116,6 +116,7 @@ cargo run --release -- --world symbiosis --preset "Fallow Gardens" --seed 42
 - **Interactive.** Paint, feed, attract, repel and erase with the mouse. Zoom into any detail, and pan across the seamless toroidal world.
 - **Cinematic look.** HDR bloom (the Jimenez 13-tap chain with level falloff), AgX, ACES or Reinhard tonemapping, perceptual OKLab palettes, vignette, film grain and dithering.
 - **Live control panel** (egui) exposing every parameter of every world.
+- **Live measurements.** Every world reduces a few scalars of its state on the GPU each frame (coverage, mean concentrations, activity, clustering, fertility) and plots them as sparklines in the panel; log them to CSV from the app or with `primordia render --metrics`.
 - **Saved worlds library.** Name and keep your discoveries, including their seed, all world settings, colours, post effects and camera view.
 - **Tour mode** (`T`): a screensaver that fades through every preset of every world.
 - **Screenshots** (`F12`) and **MP4 recording** (`V`) straight from the app.
@@ -164,6 +165,8 @@ Shortcuts use physical key positions, so they work on any keyboard layout.
 
 The control panel keeps world selection, presets, playback and capture within reach. Use **World** for simulation parameters and materials, **Appearance** for bloom and colour grading, and **Tools** for the brush, camera, tour and keyboard reference. Settings scroll independently of the playback and capture controls; shorter windows use a compact world picker.
 
+The **Measurements** section at the top of the World tab plots the world's measurements as sparklines: for example growth cover, mean fertility and the share of agents standing on growth in Symbiosis, alive and boundary cells in reaction-diffusion, mass and net growth in Lenia, speed, crowding and species segregation in Particle Life, and vein cover and trail concentration in Physarum. Hover a card for the definition and the range so far. The traces show the whole run since the last reset (or preset change or mutation) and thin out to one point every few frames as it grows; the number is always the latest value. In Symbiosis's comparison mode every card carries two traces, your habitat in teal and the reference in amber. **Log CSV** writes every frame's measurements to the capture folder (`frame,time,series,…`, one row per frame and habitat) until you stop it or switch worlds. Measurements run on the GPU and are read back asynchronously, so they never stall the frame; they cost about 0.05 ms per frame at 1080p, and about 0.25 ms for Physarum, whose three million agents are each looked up. Headless renders only measure when `--metrics` is given.
+
 The tabs fit their labels without wrapping, and the panel adapts to narrow windows. Dropdown labels sit above their fields, with gradient previews for palettes. When the panel is collapsed, click **Controls** at the top left or press **H / Tab** to reopen it.
 
 Use **Save settings** or the **Library** tab, enter a name, and choose **Save current world**. The library supports loading, renaming and deleting saves across all five worlds. Saving keeps the current simulation running. Loading restarts from the saved seed with its settings and original world dimensions; evolving patterns and brush edits at the saved moment are not snapshots. Duplicate names create separate saves.
@@ -190,6 +193,9 @@ primordia gallery --out-dir gallery --width 1280 --height 720
 # Scripted mouse input, to test interaction headlessly
 primordia render --world physarum --brush primary --brush-at 0.5,0.5
 
+# Every frame's measurements as CSV (frame, time, series, one column per metric)
+primordia render --world symbiosis --preset "Fallow Gardens" --seed 42 --frames 7200 --metrics fallow.csv
+
 primordia list       # worlds, presets and palettes
 primordia selftest   # verify this GPU's torus-wrapping maths
 ```
@@ -200,6 +206,7 @@ Headless renders are capped at 240 fps by default, so long batch jobs don't run 
 
 ```
  each frame:  world.step()    compute passes advance the simulation (usually several sub-steps)
+              world.measure() a reduction pass sums a few scalars of the new state (read back asynchronously)
               world.render()  a fullscreen pass paints the state into an HDR (Rgba16Float) scene
               post            bloom -> exposure -> tonemap -> vignette / grain / dither
               egui            control panel (interactive app only)
@@ -264,7 +271,7 @@ cargo build --release --locked
 cargo run --release --locked -- selftest
 ```
 
-The tests need a supported GPU, but no window. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, fertility depletion and recovery, and control-panel layout. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons. `cargo test --locked render_fertility_cycle_preview -- --ignored --nocapture` records a two-minute, same-seed experiment as living and fertility-view timelapse frames in `target/fertility-preview`.
+The tests need a supported GPU, but no window. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, fertility depletion and recovery, control-panel layout, and the measurements: every world's GPU reduction is checked against the same metrics recomputed on the CPU from the read-back state, the readback ring is exercised, and headless CSV logs are parsed back. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons. `cargo test --locked render_fertility_cycle_preview -- --ignored --nocapture` records a two-minute, same-seed experiment as living and fertility-view timelapse frames in `target/fertility-preview`.
 
 ## Inspiration and references
 

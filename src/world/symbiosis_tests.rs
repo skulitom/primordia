@@ -2,22 +2,51 @@ use super::*;
 use crate::world::Camera;
 
 fn read<T: Pod>(gpu: &Gpu, source: &wgpu::Buffer) -> Vec<T> {
-    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("symbiosis test readback"),
-        size: source.size(),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    gpu.read_buffer(source)
+}
+
+/// Runs the measurement kernel on the habitat's latest state and reads its totals.
+fn measure(gpu: &Gpu, world: &Symbiosis) -> Vec<f32> {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
-    encoder.copy_buffer_to_buffer(source, 0, &buffer, 0, source.size());
+    world.record_measure(gpu, &mut encoder);
     gpu.queue.submit([encoder.finish()]);
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
-    gpu.wait_idle();
-    rx.recv().unwrap().unwrap();
-    let values = bytemuck::cast_slice(&buffer.slice(..).get_mapped_range()).to_vec();
-    buffer.unmap();
-    values
+    let totals = read::<f32>(gpu, world.reduction.totals());
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+    totals
+}
+
+/// The metrics of `symbiosis_measure.wgsl`, recomputed on the CPU: the
+/// per-cell terms in f32 exactly as the kernel evaluates them, the sums in f64.
+fn cpu_metrics(gpu: &Gpu, world: &Symbiosis) -> Vec<f64> {
+    let latest = read::<[f32; 4]>(gpu, &world.fields[world.current]);
+    let previous = read::<[f32; 4]>(gpu, &world.fields[1 - world.current]);
+    let soil = read::<f32>(gpu, &world.fertility[world.current]);
+    let deposits = read::<u32>(gpu, &world.deposits);
+    let mu = world.measure_uniform();
+    let [growth, active, exhausted, route] = mu.thresholds;
+    let mut sums = [0.0_f64; 8];
+    for i in 0..latest.len() {
+        let v = latest[i][1].clamp(0.0, 1.0);
+        let dv = v - previous[i][1].clamp(0.0, 1.0);
+        let f = soil[i].clamp(0.0, 1.0);
+        let d = deposits[i].min(mu.count) as f32;
+        let growing = f32::from(v > growth);
+        let cell = [
+            growing,
+            v,
+            f32::from(dv.abs() > active),
+            dv,
+            f32::from(latest[i][2] > route),
+            f,
+            f32::from(f < exhausted),
+            d * growing,
+        ];
+        for (sum, term) in sums.iter_mut().zip(cell) {
+            *sum += f64::from(term);
+        }
+    }
+    let weights = [f64::from(mu.inv_cells); 7].into_iter().chain([f64::from(mu.inv_count)]);
+    sums.into_iter().zip(weights).map(|(sum, weight)| sum * weight).collect()
 }
 
 fn advance(gpu: &Gpu, world: &mut Symbiosis, frames: u32) {
@@ -659,4 +688,116 @@ fn render_fertility_cycle_preview() {
         }
     }
     assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}
+
+#[test]
+fn gpu_measurements_match_a_cpu_reduction_of_the_habitat() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [160, 120], 42);
+    world.params.steps = 7;
+    world.params.depletion = 0.8;
+    world.reset(&gpu, 42);
+    advance(&gpu, &mut world, 200);
+    let cells = (world.size[0] * world.size[1]) as f64;
+    assert_eq!(read::<u32>(&gpu, &world.deposits).iter().sum::<u32>(), world.count, "one deposit per agent");
+
+    let totals = measure(&gpu, &world);
+    let expected = cpu_metrics(&gpu, &world);
+    assert_eq!(expected.len(), METRICS.len());
+    for ((metric, gpu_value), cpu_value) in METRICS.iter().zip(&totals).zip(&expected) {
+        let tolerance = 1e-4 * cpu_value.abs().max(1.0) + 8.0 / cells;
+        assert!(
+            (f64::from(*gpu_value) - cpu_value).abs() <= tolerance,
+            "{}: GPU {gpu_value} vs CPU {cpu_value}",
+            metric.id
+        );
+    }
+    assert!(totals[METRICS.len()..].iter().all(|v| *v == 0.0), "unused lanes stay zero");
+    // A busy habitat has growth, moving chemistry, busy routes and some worn ground.
+    assert!(totals[0] > 0.01 && totals[2] > 0.0 && totals[4] > 0.01 && totals[4] < 1.0 && totals[6] > 0.0, "{totals:?}");
+
+    // Without agents the agent share is exactly zero, not NaN.
+    world.count = 0;
+    advance(&gpu, &mut world, 1);
+    let totals = measure(&gpu, &world);
+    assert_eq!(totals[7], 0.0);
+    assert!(totals.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn gpu_comparison_measures_both_panes_in_label_order() {
+    use crate::metrics::Sampler;
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    world.params.coupling = 0.0;
+    world.params.reference = Reference::CouplingOff;
+    world.set_comparison(&gpu, true);
+    let mut sampler = Sampler::new(&gpu, 2);
+    let mut sample_after = |world: &mut Symbiosis, frames: u32| {
+        advance(&gpu, world, frames);
+        let frame = Frame {
+            gpu: &gpu,
+            time: 0.0,
+            dt: 1.0 / 60.0,
+            frame: u64::from(frames),
+            view: ViewXform::fit(world.size, world.size, &Camera::default()),
+            target_size: world.size,
+            pointer: None,
+        };
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        world.step(&frame, &mut encoder);
+        let mut sink = sampler.begin(frame.frame, frame.time);
+        world.measure(&frame, &mut encoder, &mut sink);
+        gpu.queue.submit([encoder.finish()]);
+        sampler.map();
+        let samples = sampler.flush(&gpu).unwrap();
+        assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+        assert_eq!(samples.len(), 1);
+        samples[0]
+    };
+
+    // At zero coupling the reference is an identical habitat: both series agree bit for bit.
+    let sample = sample_after(&mut world, 30);
+    assert_eq!((sample.frame, sample.series), (30, 2));
+    assert_eq!(sample.values[0], sample.values[1]);
+    assert!(sample.values[0][0] > 0.0, "the seeded habitat has growth");
+    assert_eq!(world.comparison_labels().unwrap()[1], "COUPLING OFF");
+
+    // Coupling only changes the left pane, which is series 0.
+    let reference_before = sample.values[1];
+    world.params.coupling = 0.9;
+    let sample = sample_after(&mut world, 60);
+    assert_eq!(sample.series, 2);
+    assert_ne!(sample.values[0], sample.values[1], "coupling must change the measured habitat");
+    let reference = read::<[f32; 4]>(&gpu, &world.reference.as_ref().unwrap().fields[0]);
+    assert!(reference.iter().all(|f| f.iter().all(|v| v.is_finite())));
+    assert!(reference_before[0] > 0.0);
+
+    // Leaving comparison mode drops the second series.
+    world.set_comparison(&gpu, false);
+    let sample = sample_after(&mut world, 1);
+    assert_eq!(sample.series, 1);
+}
+
+#[test]
+fn gpu_measurements_are_finite_and_bounded_for_every_preset() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [256, 144], 42);
+    for (index, name) in PRESETS.iter().enumerate() {
+        world.load_preset(&gpu, index, 314159);
+        advance(&gpu, &mut world, 60);
+        let totals = measure(&gpu, &world);
+        for (metric, value) in METRICS.iter().zip(&totals) {
+            assert!(value.is_finite(), "{name}: {} is {value}", metric.id);
+            if metric.unit == Unit::Fraction {
+                assert!((0.0..=1.0).contains(value), "{name}: {} = {value}", metric.id);
+            }
+        }
+        assert!((0.0..=1.0).contains(&totals[1]), "{name}: mean growth {}", totals[1]);
+        assert!((0.0..=1.0).contains(&totals[5]), "{name}: mean fertility {}", totals[5]);
+        assert!(totals[0] > 0.0 && totals[4] > 0.0, "{name}: growth {} routes {}", totals[0], totals[4]);
+    }
 }

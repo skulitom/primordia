@@ -26,7 +26,12 @@ use wgpu::ShaderStages;
 
 use super::{Frame, ViewXform, World};
 use crate::gpu::{self, Gpu, SCENE_FORMAT, layout};
+use crate::metrics::{self, MetricDesc, Reduction, Unit};
 use crate::palette::{self, PaletteLut};
+
+#[cfg(test)]
+#[path = "reaction_diffusion_tests.rs"]
+mod tests;
 use crate::post::{PostSettings, Tonemap};
 use crate::rng::Rng;
 
@@ -39,6 +44,57 @@ const MAX_DROPS: usize = 4;
 const HIST_BYTES: u64 = 256 * 4;
 /// Contrast window + revive state (`array<f32, 8>` in the shader).
 const STATS_BYTES: u64 = 8 * 4;
+/// V from which a cell counts as alive (the revive logic's threshold in `cs_resolve`).
+const ALIVE_V: f32 = 0.03;
+/// V from which a cell counts as pattern body rather than fringe.
+const BODY_V: f32 = 0.25;
+/// V from which a cell counts as flooded (foam, solid fill).
+const FILLED_V: f32 = 0.4;
+/// Change of V per frame from which a cell counts as still changing (measured
+/// on the last step and scaled by the steps per frame).
+const ACTIVE_DV: f32 = 1e-3;
+
+/// Lane order of `reaction_diffusion_measure.wgsl`.
+const METRICS: &[MetricDesc] = &[
+    MetricDesc {
+        id: "alive",
+        label: "Alive cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose V exceeds 0.03: the footprint of the pattern.",
+    },
+    MetricDesc {
+        id: "body",
+        label: "Body cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose V exceeds 0.25: the solid interior of spots, stripes and worms.",
+    },
+    MetricDesc { id: "v_mean", label: "Mean V", unit: Unit::Scalar, hint: "Mean concentration of the activator V." },
+    MetricDesc { id: "u_mean", label: "Mean U", unit: Unit::Scalar, hint: "Mean concentration of the substrate U." },
+    MetricDesc {
+        id: "active",
+        label: "Changing cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose V is changing by more than 0.001 per frame, judged from the last step: zero once a pattern has frozen.",
+    },
+    MetricDesc {
+        id: "v_drift",
+        label: "V drift",
+        unit: Unit::Scalar,
+        hint: "Mean change of V per step: positive while the pattern spreads, negative while it dies back.",
+    },
+    MetricDesc {
+        id: "edge",
+        label: "Boundary cells",
+        unit: Unit::Fraction,
+        hint: "Alive cells with a dead neighbour: the pattern's perimeter, high for fine labyrinths and low for blobs.",
+    },
+    MetricDesc {
+        id: "filled",
+        label: "Filled cells",
+        unit: Unit::Fraction,
+        hint: "Cells whose V exceeds 0.4: flooded ground, the state the revive logic watches for.",
+    },
+];
 /// Drift phase advanced per unit of simulated time at drift speed 1.
 const DRIFT_RATE: f64 = 1.0 / 2000.0;
 /// The drift phase wraps at this period. Every multiple of the phase the
@@ -831,8 +887,20 @@ struct DrawUniform {
     clarity: f32,
 }
 
+/// Mirrors `Measure` in reaction_diffusion_measure.wgsl (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct MeasureUniform {
+    size: [u32; 2],
+    inv_cells: f32,
+    _pad: f32,
+    /// Alive V, body V, filled V, active |dV|.
+    thresholds: [f32; 4],
+}
+
 // The WGSL structs must match byte for byte.
 const _: () = assert!(std::mem::size_of::<SimUniform>() == 192);
+const _: () = assert!(std::mem::size_of::<MeasureUniform>() == 32);
 const _: () = assert!(std::mem::size_of::<PrepUniform>() == 32);
 const _: () = assert!(std::mem::size_of::<DrawUniform>() == 96);
 
@@ -864,6 +932,11 @@ pub struct ReactionDiffusion {
     draw_pipeline: wgpu::RenderPipeline,
     draw_group: wgpu::BindGroup,
     _field: wgpu::Texture,
+    measure_uniform: wgpu::Buffer,
+    measure_pipeline: wgpu::ComputePipeline,
+    /// `measure_groups[i]` measures `buffers[i]` against `buffers[1 - i]`.
+    measure_groups: [wgpu::BindGroup; 2],
+    reduction: Reduction,
 
     /// Frames stepped since the last reset.
     frame: u64,
@@ -1029,6 +1102,41 @@ impl ReactionDiffusion {
             ],
         );
 
+        let measure_uniform = gpu.uniform_buffer("rd measure", &MeasureUniform::zeroed());
+        let blocks = [size[0].div_ceil(WORKGROUP), size[1].div_ceil(WORKGROUP)];
+        let reduction = Reduction::new(gpu, "rd measure", blocks[0] * blocks[1]);
+        let measure_layout = gpu.bind_group_layout(
+            "rd measure",
+            &[
+                layout::uniform(0, cs),
+                layout::storage(1, cs, true),
+                layout::storage(2, cs, true),
+                layout::storage(3, cs, false),
+            ],
+        );
+        let measure_module = gpu.shader(
+            "rd measure",
+            &format!("{}\n{}", metrics::WGSL, include_str!("../shaders/reaction_diffusion_measure.wgsl")),
+        );
+        let measure_pipeline = gpu.compute_pipeline(
+            "rd measure",
+            &gpu.pipeline_layout("rd measure", &[&measure_layout]),
+            &measure_module,
+            "cs_measure",
+        );
+        let measure_groups = [0, 1].map(|i| {
+            gpu.bind_group(
+                "rd measure",
+                &measure_layout,
+                &[
+                    measure_uniform.as_entire_binding(),
+                    buffers[i].as_entire_binding(),
+                    buffers[1 - i].as_entire_binding(),
+                    reduction.partials().as_entire_binding(),
+                ],
+            )
+        });
+
         let mut world = Self {
             size,
             params: PRESETS[0].params,
@@ -1050,6 +1158,10 @@ impl ReactionDiffusion {
             draw_pipeline,
             draw_group,
             _field: field,
+            measure_uniform,
+            measure_pipeline,
+            measure_groups,
+            reduction,
             frame: 0,
             sim_time: 0.0,
             drift_clock: 0.0,
@@ -1060,6 +1172,33 @@ impl ReactionDiffusion {
         };
         world.load_preset(gpu, 0, seed);
         world
+    }
+
+    /// Normalisation and thresholds of the measurement kernel. The tests
+    /// recompute the metrics on the CPU from the same values.
+    fn measure_uniform(&self) -> MeasureUniform {
+        MeasureUniform {
+            size: self.size,
+            inv_cells: 1.0 / (self.size[0] as f32 * self.size[1] as f32),
+            _pad: 0.0,
+            thresholds: [ALIVE_V, BODY_V, FILLED_V, ACTIVE_DV / self.params.steps_per_frame.max(1) as f32],
+        }
+    }
+
+    /// Reduces the latest field into `reduction`'s totals.
+    fn record_measure(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+        gpu.write(&self.measure_uniform, &self.measure_uniform());
+        let blocks = [self.size[0].div_ceil(WORKGROUP), self.size[1].div_ceil(WORKGROUP)];
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rd measure"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.measure_pipeline);
+            pass.set_bind_group(0, &self.measure_groups[self.current], &[]);
+            pass.dispatch_workgroups(blocks[0], blocks[1], 1);
+        }
+        self.reduction.record(gpu, encoder, blocks[0] * blocks[1]);
     }
 
     /// Builds the initial (u, v) field on the CPU: u = 1, v = 0 with seeded patches.
@@ -1494,6 +1633,18 @@ impl World for ReactionDiffusion {
         self.sim_time += elapsed;
         let advance = elapsed * self.params.drift_speed as f64 * DRIFT_RATE;
         self.drift_clock = (self.drift_clock + advance).rem_euclid(DRIFT_PERIOD);
+    }
+
+    fn metrics(&self) -> &'static [MetricDesc] {
+        METRICS
+    }
+
+    fn measure(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, sink: &mut metrics::Sink<'_>) {
+        if !sink.is_live() {
+            return;
+        }
+        self.record_measure(frame.gpu, encoder);
+        sink.push(encoder, self.reduction.totals());
     }
 
     fn render(
