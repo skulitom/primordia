@@ -19,7 +19,7 @@ use crate::post::{Post, Tonemap};
 use crate::world::{self, Camera, Frame, Pointer, ViewXform, WORLDS};
 
 /// Headless output format: 8-bit sRGB so readback bytes can be written straight to PNG.
-const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub(crate) const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 #[derive(Clone, Debug)]
 pub struct RenderJob {
@@ -341,7 +341,7 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
     Ok(out)
 }
 
-fn frame_deadline(started: Instant, frames: u32, max_fps: f32) -> Result<Instant> {
+pub(crate) fn frame_deadline(started: Instant, frames: u32, max_fps: f32) -> Result<Instant> {
     if !max_fps.is_finite() || max_fps < 0.0 {
         bail!("--max-fps must be a finite, non-negative number (0 = unlimited)");
     }
@@ -411,7 +411,7 @@ pub fn gallery(job: &GalleryJob) -> Result<()> {
     }
     if job.sheet && !rendered.is_empty() {
         let sheet = job.out_dir.join("contact-sheet.png");
-        contact_sheet(&rendered, &sheet, 5)?;
+        contact_sheet(&rendered, &sheet, 5, 4)?;
         log::info!("wrote {}", sheet.display());
     }
     log::info!("gallery done: {total} images in {:.1}s", started.elapsed().as_secs_f32());
@@ -420,7 +420,9 @@ pub fn gallery(job: &GalleryJob) -> Result<()> {
 
 /// Tiles gallery images (quarter size) into one overview image. Each world
 /// starts a new row; rows hold at most `cols` images.
-pub(crate) fn contact_sheet(images: &[(&str, PathBuf)], out: &Path, cols: usize) -> Result<()> {
+/// Tiles `images` (each paired with a grouping key: a new row starts when the
+/// key changes) at `1 / divisor` of the first image's size.
+pub(crate) fn contact_sheet(images: &[(&str, PathBuf)], out: &Path, cols: usize, divisor: u32) -> Result<()> {
     const GAP: u32 = 8;
     const BACKGROUND: image::Rgba<u8> = image::Rgba([11, 13, 18, 255]);
 
@@ -437,7 +439,8 @@ pub(crate) fn contact_sheet(images: &[(&str, PathBuf)], out: &Path, cols: usize)
     }
 
     let first = image::open(&images[0].1).with_context(|| format!("reading {}", images[0].1.display()))?;
-    let (tw, th) = ((first.width() / 4).max(1), (first.height() / 4).max(1));
+    let divisor = divisor.max(1);
+    let (tw, th) = ((first.width() / divisor).max(1), (first.height() / divisor).max(1));
     let width = cols as u32 * tw + (cols as u32 + 1) * GAP;
     let height = rows.len() as u32 * th + (rows.len() as u32 + 1) * GAP;
     let mut sheet = image::RgbaImage::from_pixel(width, height, BACKGROUND);

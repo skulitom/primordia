@@ -2,6 +2,7 @@
 
 mod app;
 mod capture;
+mod explore;
 mod gpu;
 mod headless;
 mod library;
@@ -41,6 +42,8 @@ enum Command {
     Render(RenderArgs),
     /// Render the final frame of every preset into a folder
     Gallery(GalleryArgs),
+    /// Search a world's mutations for the most novel behaviour and keep them as recipes
+    Explore(ExploreArgs),
     /// List worlds, presets and palettes
     List,
     /// Verify on this GPU the shader maths the simulations rely on
@@ -216,6 +219,64 @@ struct GalleryArgs {
     max_fps: f32,
 }
 
+#[derive(Args)]
+struct ExploreArgs {
+    /// World to explore
+    #[arg(short, long, default_value = "physarum")]
+    world: String,
+    /// Preset to start from (mutations of some worlds keep parts of it)
+    #[arg(short, long)]
+    preset: Option<String>,
+    /// Master seed: every candidate seed and perturbation follows from it
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// Mutations to evaluate in the first round (the preset itself is evaluated too)
+    #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..))]
+    runs: u32,
+    /// Refinement rounds, each perturbing recipes of the current archive
+    #[arg(long, default_value_t = 1)]
+    refine: u32,
+    /// Children to evaluate per refinement round
+    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..))]
+    children: u32,
+    /// Relative size of a perturbation (log-normal noise on the recipe's numbers)
+    #[arg(long, default_value_t = 0.15, value_parser = finite_float)]
+    strength: f32,
+    /// Candidates to keep
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..))]
+    keep: u32,
+    /// Frames to simulate per candidate
+    #[arg(short, long, default_value_t = 600)]
+    frames: u32,
+    /// Image width in pixels
+    #[arg(long, default_value_t = 640)]
+    width: u32,
+    /// Image height in pixels
+    #[arg(long, default_value_t = 360)]
+    height: u32,
+    /// Frame-rate ceiling per candidate, keeps the GPU from running flat out (0 = unlimited)
+    #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS, value_parser = finite_float)]
+    max_fps: f32,
+    /// Folder for the images, contact sheet, candidates.csv and recipes/
+    #[arg(short, long, default_value = "explore")]
+    out_dir: PathBuf,
+    /// What to keep: "novelty" (mutually most different), "max:<metric>" or "min:<metric>"
+    #[arg(long, default_value = "novelty")]
+    select: explore::Select,
+    /// Also save the kept recipes into the app's library
+    #[arg(long)]
+    install: bool,
+    /// Don't write contact-sheet.png
+    #[arg(long)]
+    no_sheet: bool,
+    /// Also write every evaluated candidate's final frame under all/
+    #[arg(long)]
+    all: bool,
+    /// Let dead, empty or frozen candidates into the archive
+    #[arg(long)]
+    keep_inert: bool,
+}
+
 fn finite_float(value: &str) -> std::result::Result<f32, String> {
     let number = value.parse::<f32>().map_err(|e| e.to_string())?;
     if !number.is_finite() {
@@ -305,6 +366,26 @@ fn run() -> Result<()> {
             sheet: !g.no_sheet,
             max_fps: g.max_fps,
         }),
+        Some(Command::Explore(e)) => {
+            let mut job = explore::ExploreJob::new(&e.world);
+            job.preset = e.preset;
+            job.seed = e.seed;
+            job.runs = e.runs;
+            job.refine = e.refine;
+            job.children = e.children;
+            job.strength = e.strength;
+            job.keep = e.keep as usize;
+            job.frames = e.frames;
+            job.size = [e.width, e.height];
+            job.max_fps = e.max_fps;
+            job.out_dir = e.out_dir;
+            job.select = e.select;
+            job.library = e.install.then(library::default_directory);
+            job.sheet = !e.no_sheet;
+            job.all = e.all;
+            job.inert = e.keep_inert;
+            explore::explore(&job)
+        }
         Some(Command::List) => list(),
         Some(Command::Selftest) => selftest::run(),
     }
@@ -344,7 +425,29 @@ mod tests {
                 assert!(Cli::try_parse_from(["primordia", "render", &format!("{flag}=0.5,{invalid}")]).is_err());
             }
             assert!(Cli::try_parse_from(["primordia", "gallery", &format!("--max-fps={invalid}")]).is_err());
+            for flag in ["--strength", "--max-fps"] {
+                assert!(Cli::try_parse_from(["primordia", "explore", &format!("{flag}={invalid}")]).is_err());
+            }
         }
+    }
+
+    #[test]
+    fn cli_parses_an_exploration_and_rejects_bad_selections() {
+        let cli = Cli::try_parse_from([
+            "primordia", "explore", "--world", "symbiosis", "--select", "max:growth_cover", "--install", "--keep", "4",
+            "--runs", "8", "--no-sheet", "--all",
+        ])
+        .unwrap();
+        let Some(Command::Explore(args)) = cli.command else { panic!("expected explore") };
+        assert_eq!(args.world, "symbiosis");
+        assert_eq!(args.select, explore::Select::Max("growth_cover".into()));
+        assert!(args.install && args.no_sheet && args.all);
+        assert_eq!((args.keep, args.runs, args.refine, args.children), (4, 8, 1, 24));
+        assert_eq!(args.strength, 0.15);
+        assert_eq!(args.out_dir, PathBuf::from("explore"));
+        assert!(Cli::try_parse_from(["primordia", "explore", "--select", "best"]).is_err());
+        assert!(Cli::try_parse_from(["primordia", "explore", "--keep", "0"]).is_err());
+        assert!(Cli::try_parse_from(["primordia", "explore", "--runs", "0"]).is_err());
     }
 
     #[test]

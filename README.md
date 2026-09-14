@@ -21,6 +21,7 @@ Primordia is a playground for **emergence** and **self-organisation**. It has fo
 - [Quick start](#quick-start)
 - [Controls](#controls)
 - [Rendering without a window](#rendering-without-a-window)
+- [Exploring by novelty](#exploring-by-novelty)
 - [How it works](#how-it-works)
 - [Inspiration and references](#inspiration-and-references)
 
@@ -117,6 +118,7 @@ cargo run --release -- --world symbiosis --preset "Fallow Gardens" --seed 42
 - **Cinematic look.** HDR bloom (the Jimenez 13-tap chain with level falloff), AgX, ACES or Reinhard tonemapping, perceptual OKLab palettes, vignette, film grain and dithering.
 - **Live control panel** (egui) exposing every parameter of every world.
 - **Live measurements.** Every world reduces a few scalars of its state on the GPU each frame (coverage, mean concentrations, activity, clustering, fertility) and plots them as sparklines in the panel; log them to CSV from the app or with `primordia render --metrics`.
+- **Exploration by novelty.** `primordia explore` runs dozens of mutations headlessly, measures each one, keeps the most mutually different behaviours (or the extremes of one metric) and hands back images, a contact sheet and recipes for your library.
 - **Saved worlds library.** Name and keep your discoveries, including their seed, all world settings, colours, post effects and camera view.
 - **Tour mode** (`T`): a screensaver that fades through every preset of every world.
 - **Screenshots** (`F12`) and **MP4 recording** (`V`) straight from the app.
@@ -201,6 +203,25 @@ primordia selftest   # verify this GPU's torus-wrapping maths
 ```
 
 Headless renders are capped at 240 fps by default, so long batch jobs don't run your GPU flat out; `--max-fps 0` removes the cap. `primordia help render` lists every option.
+
+## Exploring by novelty
+
+The Mutate button is a random roll judged by eye. `primordia explore` turns the same mutations into a search: it evaluates the base preset and a batch of mutations headlessly, measures every one, and keeps the candidates whose behaviour is most different from all the others. Refinement rounds then nudge the numbers of the kept recipes and evaluate the children, so the search moves rather than just samples.
+
+```bash
+# 48 mutations of Physarum, one refinement round of 24 children, keep the 12 most novel
+primordia explore --world physarum --max-fps 0
+
+# The eight Symbiosis mutations with the most growth, without refinement
+primordia explore --world symbiosis --select max:growth_cover --keep 8 --refine 0
+
+# Keep the recipes in the app's library as well (they appear under Library after a refresh)
+primordia explore --world lenia --install
+```
+
+Everything lands in `explore/` (or `--out-dir`): the final frame of every kept candidate as `NN-seedS.png`, `contact-sheet.png` in rank order, `recipes/NN-seedS.json` (the same format as the library, so a copied file loads too), and `candidates.csv` with one row per evaluated candidate: its seed, origin (preset, mutation or child of a kept candidate), rank, novelty and the behaviour descriptor. The descriptor holds, for every measurement, the mean over the last 40% of the run, its variation over that window, and its drift from the first 20%. Candidates are scaled against each other robustly (median and MAD), novelty is the mean distance to the five nearest candidates, and the archive is filled by farthest-point selection, so near-duplicates never take two slots. `--select max:<metric>` or `min:<metric>` keeps the extremes of one measurement instead; `--all` also writes every candidate's image under `all/`. Candidates whose vital measurements sit at zero (no living cells, no activity, no mass, no motion) are logged as inert and left out of the archive, because a dead world is novel but never interesting; `--keep-inert` admits them.
+
+Every kept candidate is re-simulated from its recipe for its image, which proves the recipe reproduces the run. Runs are deterministic from `--seed`. Perturbations multiply numbers by log-normal noise (`--strength`), so a parameter that a mutation left at zero stays at zero through refinement; colours, names and switches are never perturbed. A default run evaluates 73 candidates and takes a few minutes at the frame-rate cap, or one to two minutes with `--max-fps 0`; Lenia is slower because every mutation hatches creatures in its nursery.
 
 ## How it works
 

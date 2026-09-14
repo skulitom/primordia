@@ -294,7 +294,7 @@ fn render_symbiosis_previews() {
             PRESETS.iter().position(|name| path.file_stem().unwrap() == crate::headless::slug(name).as_str()).unwrap();
         (*seed != "42", index)
     });
-    crate::headless::contact_sheet(&images, std::path::Path::new("target/symbiosis-preview/presets.png"), 5).unwrap();
+    crate::headless::contact_sheet(&images, std::path::Path::new("target/symbiosis-preview/presets.png"), 5, 4).unwrap();
 }
 
 #[test]
