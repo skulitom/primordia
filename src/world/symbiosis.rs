@@ -19,7 +19,7 @@ use crate::rng::Rng;
 #[path = "symbiosis_tests.rs"]
 mod tests;
 
-const PRESETS: &[&str] = &["Living Reef", "Wandering Veins", "Coral Maze", "Spore Tide", "Root Atlas"];
+const PRESETS: &[&str] = &["Living Reef", "Wandering Veins", "Coral Maze", "Spore Tide", "Root Atlas", "Fallow Gardens"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Relationship {
@@ -75,11 +75,32 @@ fn one() -> f32 {
     1.0
 }
 
+fn recovery_default() -> f32 {
+    30.0
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Reference {
+    #[default]
+    CouplingOff,
+    FertilityOff,
+}
+
+impl Reference {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CouplingOff => "Coupling off",
+            Self::FertilityOff => "Fertility cycle off",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Layer {
     Together,
     Chemistry,
     Trails,
+    Fertility,
 }
 
 impl Layer {
@@ -88,6 +109,7 @@ impl Layer {
             Self::Together => "Together",
             Self::Chemistry => "Chemistry",
             Self::Trails => "Agent trails",
+            Self::Fertility => "Fertility",
         }
     }
 }
@@ -121,6 +143,14 @@ pub struct Params {
     pub scale: f32,
     #[serde(default = "one")]
     pub trail_light: f32,
+    /// Zero preserves recipes made before the fertility cycle was introduced.
+    #[serde(default)]
+    pub depletion: f32,
+    /// Recovery time constant at 60 simulation frames per second.
+    #[serde(default = "recovery_default")]
+    pub recovery: f32,
+    #[serde(default)]
+    pub reference: Reference,
 }
 
 impl Params {
@@ -144,6 +174,9 @@ impl Params {
             terrain: 0.8,
             scale: 1.35,
             trail_light: 0.55,
+            depletion: 0.0,
+            recovery: recovery_default(),
+            reference: Reference::CouplingOff,
         };
         let palette = match index {
             1 => {
@@ -211,6 +244,22 @@ impl Params {
                 p.trail_light = 0.7;
                 5 // Moss
             }
+            5 => {
+                p.relationship = Relationship::Weave;
+                p.feed = 0.03;
+                p.kill = 0.061;
+                p.sensor_distance = 18.0;
+                p.speed = 1.2;
+                p.retention = 0.97;
+                p.coupling = 0.9;
+                p.scale = 1.2;
+                p.terrain = 0.45;
+                p.trail_light = 0.4;
+                p.depletion = 0.8;
+                p.recovery = 24.0;
+                p.reference = Reference::FertilityOff;
+                0 // Bioluminescence
+            }
             _ => 0, // Bioluminescence
         };
         (p, palette)
@@ -233,6 +282,8 @@ impl Params {
             (self.terrain, 0.0, 1.0),
             (self.scale, 0.6, 2.0),
             (self.trail_light, 0.0, 2.0),
+            (self.depletion, 0.0, 1.0),
+            (self.recovery, 5.0, 120.0),
         ] {
             ensure!((lo..=hi).contains(&value), "Invalid Symbiosis setting");
         }
@@ -259,6 +310,7 @@ struct SimUniform {
     motion: [f32; 4],
     trail: [f32; 4],
     ecology: [f32; 4],
+    fertility: [f32; 4],
     pointer: [f32; 2],
     radius: f32,
     pointer_mode: u32,
@@ -281,6 +333,7 @@ pub struct Symbiosis {
     post: PostSettings,
     lut: PaletteLut,
     fields: [wgpu::Buffer; 2],
+    fertility: [wgpu::Buffer; 2],
     current: usize,
     agents: wgpu::Buffer,
     count: u32,
@@ -311,6 +364,9 @@ impl Symbiosis {
         let fields = std::array::from_fn(|_| {
             gpu.storage_buffer("symbiosis habitat", size[0] as u64 * size[1] as u64 * 16, wgpu::BufferUsages::empty())
         });
+        let fertility = std::array::from_fn(|_| {
+            gpu.storage_buffer("symbiosis fertility", size[0] as u64 * size[1] as u64 * 4, wgpu::BufferUsages::empty())
+        });
         let agents = gpu.storage_buffer("symbiosis agents", count as u64 * 16, wgpu::BufferUsages::empty());
         let deposits =
             gpu.storage_buffer("symbiosis deposits", size[0] as u64 * size[1] as u64 * 4, wgpu::BufferUsages::empty());
@@ -323,6 +379,8 @@ impl Symbiosis {
                 layout::storage(2, ShaderStages::COMPUTE, false),
                 layout::storage(3, ShaderStages::COMPUTE, false),
                 layout::storage(4, ShaderStages::COMPUTE, false),
+                layout::storage(5, ShaderStages::COMPUTE, true),
+                layout::storage(6, ShaderStages::COMPUTE, false),
             ],
         );
         let groups = std::array::from_fn(|i| {
@@ -335,6 +393,8 @@ impl Symbiosis {
                     fields[1 - i].as_entire_binding(),
                     agents.as_entire_binding(),
                     deposits.as_entire_binding(),
+                    fertility[i].as_entire_binding(),
+                    fertility[1 - i].as_entire_binding(),
                 ],
             )
         });
@@ -351,6 +411,7 @@ impl Symbiosis {
                 layout::storage(1, ShaderStages::FRAGMENT, true),
                 layout::texture(2, ShaderStages::FRAGMENT, true),
                 layout::sampler(3, ShaderStages::FRAGMENT, true),
+                layout::storage(4, ShaderStages::FRAGMENT, true),
             ],
         );
         let draw_groups = std::array::from_fn(|i| {
@@ -362,6 +423,7 @@ impl Symbiosis {
                     fields[i].as_entire_binding(),
                     wgpu::BindingResource::TextureView(&lut.view),
                     wgpu::BindingResource::Sampler(&lut.sampler),
+                    fertility[i].as_entire_binding(),
                 ],
             )
         });
@@ -375,6 +437,7 @@ impl Symbiosis {
             post: Self::look(),
             lut,
             fields,
+            fertility,
             current: 0,
             agents,
             count,
@@ -411,7 +474,12 @@ impl Symbiosis {
     }
 
     fn reference_params(&self) -> Params {
-        Params { coupling: 0.0, compare: false, ..self.params }
+        let mut p = Params { compare: false, ..self.params };
+        match p.reference {
+            Reference::CouplingOff => p.coupling = 0.0,
+            Reference::FertilityOff => p.depletion = 0.0,
+        }
+        p
     }
 
     fn draw_region(
@@ -563,6 +631,10 @@ impl World for Symbiosis {
         for buffer in &self.fields {
             gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&field));
         }
+        let fertile = vec![1.0_f32; (w * h) as usize];
+        for buffer in &self.fertility {
+            gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&fertile));
+        }
         // A separate stream keeps agent positions independent of the chemistry
         // seed layout, useful when comparing changes to either half.
         let mut rng = Rng::new(seed ^ 0x736c_696d_655f_7264);
@@ -601,7 +673,10 @@ impl World for Symbiosis {
         // Keep each chemistry family near a viable regime while exploring
         // scale, geography, seeding and agents much more broadly.
         p.kill = (p.kill + rng.range(-0.001, 0.001)).clamp(0.03, 0.08);
+        p.depletion = if rng.f32() < 0.25 { 0.0 } else { rng.range(0.2, 1.0) };
+        p.recovery = rng.range(8.0, 60.0);
         p.compare = self.params.compare;
+        p.reference = self.params.reference;
         self.params = p;
         self.lut.set(gpu, palette);
         self.reset(gpu, seed);
@@ -647,6 +722,7 @@ impl World for Symbiosis {
                 motion: [p.sensor_distance, p.sensor_angle, p.turn_angle, p.speed],
                 trail: [p.retention.powf(1.0 / p.steps as f32), 0.08 / p.steps as f32, p.wander, 0.28 / p.steps as f32],
                 ecology: [p.relationship as u32 as f32, p.terrain, p.scale * p.scale, 0.0],
+                fertility: [p.depletion * p.coupling, 1.0 / (60.0 * p.recovery), 1.0 / p.steps as f32, 0.0],
                 pointer: [
                     pointer.pos[0].rem_euclid(1.0) * self.size[0] as f32,
                     pointer.pos[1].rem_euclid(1.0) * self.size[1] as f32,
@@ -703,7 +779,10 @@ impl World for Symbiosis {
     }
 
     fn comparison_labels(&self) -> Option<[String; 2]> {
-        self.reference.as_ref().map(|_| [format!("COUPLING {:.2}", self.params.coupling), "COUPLING OFF".into()])
+        self.reference.as_ref().map(|_| match self.params.reference {
+            Reference::CouplingOff => [format!("COUPLING {:.2}", self.params.coupling), "COUPLING OFF".into()],
+            Reference::FertilityOff => [format!("CYCLE {:.2}", self.params.depletion), "CYCLE OFF".into()],
+        })
     }
 
     fn ui(&mut self, gpu: &Gpu, ui: &mut egui::Ui) {
@@ -726,24 +805,49 @@ impl World for Symbiosis {
             .color(crate::ui::ACCENT),
         );
         crate::ui::dropdown(ui, "View", self.params.layer.name(), |ui| {
-            for layer in [Layer::Together, Layer::Chemistry, Layer::Trails] {
+            for layer in [Layer::Together, Layer::Chemistry, Layer::Trails, Layer::Fertility] {
                 ui.selectable_value(&mut self.params.layer, layer, layer.name());
             }
         });
+        if self.params.layer == Layer::Fertility {
+            ui.label(egui::RichText::new("Rust: exhausted · Teal: fertile").small().color(crate::ui::MUTED));
+        }
+        egui::CollapsingHeader::new("Fertility cycle").default_open(true).show(ui, |ui| {
+            ui.add(Slider::new(&mut self.params.depletion, 0.0..=1.0).text("Depletion strength"))
+                .on_hover_text("Busy trails exhaust local fertility and inhibit growth. Zero bypasses the cycle.");
+            ui.add(Slider::new(&mut self.params.recovery, 5.0..=120.0).text("Recovery time (s)"))
+                .on_hover_text(
+                    "Rested ground recovers about 63% of its missing fertility in this many seconds at 60 frames/s. Pausing stops recovery.",
+                );
+            ui.label(
+                egui::RichText::new(
+                    "Ground remembers traffic after trails fade. Clearing growth leaves fertility intact; restart restores it.",
+                ).small().weak(),
+            );
+        });
         let mut compare = self.params.compare;
         if ui
-            .checkbox(&mut compare, "Compare with coupling off")
+            .checkbox(&mut compare, "Compare habitats")
             .on_hover_text(
-                "Starts both sides from this seed. Left uses your coupling setting; right keeps coupling at zero.",
+                "Starts both sides from this seed. The reference switches off one part of the ecology.",
             )
             .changed()
         {
             self.set_comparison(gpu, compare);
         }
         if compare {
+            let old_reference = self.params.reference;
+            crate::ui::dropdown(ui, "Reference (restarts both)", self.params.reference.name(), |ui| {
+                for reference in [Reference::CouplingOff, Reference::FertilityOff] {
+                    ui.selectable_value(&mut self.params.reference, reference, reference.name());
+                }
+            });
+            if self.params.reference != old_reference {
+                self.reset(gpu, self.seed);
+            }
             ui.label(
                 egui::RichText::new(
-                    "Left: your coupling · Right: coupling off\nBrush strokes and all other settings affect both.",
+                    "Left: your settings · Right: reference\nBrush strokes and all other settings affect both.",
                 )
                 .small()
                 .color(crate::ui::MUTED),

@@ -7,6 +7,15 @@ struct Draw {
 @group(0) @binding(1) var<storage, read> field: array<vec4<f32>>;
 @group(0) @binding(2) var lut: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var<storage, read> soil: array<f32>;
+
+fn fertility_at(p: vec2<i32>) -> f32 { return soil[wrap_index(p, draw.size)]; }
+fn sample_fertility(p: vec2<f32>) -> f32 {
+    let q = vec2<i32>(floor(p));
+    let t = fract(p);
+    return mix(mix(fertility_at(q), fertility_at(q + vec2<i32>(1, 0)), t.x),
+               mix(fertility_at(q + vec2<i32>(0, 1)), fertility_at(q + vec2<i32>(1, 1)), t.x), t.y);
+}
 
 fn cell(p: vec2<i32>) -> vec4<f32> { return field[wrap_index(p, draw.size)]; }
 fn sample_field(p: vec2<f32>) -> vec4<f32> {
@@ -35,5 +44,13 @@ fn fs_display(in: FullscreenOut) -> @location(0) vec4<f32> {
                + palette_lookup(lut, samp, 0.72) * rim * 0.3;
     if draw.layer == 1u { colour = chemistry + palette_lookup(lut, samp, 0.72) * rim * 0.3; }
     if draw.layer == 2u { colour = vec3<f32>(0.002, 0.004, 0.009) + network_colour * trail; }
+    if draw.layer == 3u {
+        // Fixed diagnostic colours keep fertile and exhausted ground readable
+        // across palette changes. Subtle growth edges locate the colonies.
+        let reserve = clamp(sample_fertility(p), 0.0, 1.0);
+        let dry = vec3<f32>(0.34, 0.065, 0.018);
+        let rested = vec3<f32>(0.025, 0.42, 0.32);
+        colour = mix(dry, rested, reserve) + vec3<f32>(0.15, 0.23, 0.22) * rim;
+    }
     return vec4<f32>(colour * draw.brightness, 1.0);
 }

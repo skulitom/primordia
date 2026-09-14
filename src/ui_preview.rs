@@ -10,20 +10,26 @@ fn render_inspector_previews() {
     let _guard = crate::gpu::test_lock();
     let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
     for width in [320, 364] {
-        for tab in ["world", "appearance", "symbiosis", "comparison"] {
+        for tab in ["world", "appearance", "symbiosis", "comparison", "fertility"] {
             let appearance = tab == "appearance";
             let size = [width, 900];
             let ctx = egui::Context::default();
             configure(&ctx);
-            let (world_index, mut specimen) = if tab == "symbiosis" || tab == "comparison" {
+            let (world_index, mut specimen) = if tab == "symbiosis" || tab == "comparison" || tab == "fertility" {
                 world::create(&gpu, "symbiosis", [800, 600], None, 42).unwrap()
             } else {
                 world::create(&gpu, "lenia", [800, 600], Some("Necklaces"), 42).unwrap()
             };
-            if tab == "comparison" {
+            if tab == "fertility" {
+                specimen.load_preset(&gpu, 5, 42);
+            }
+            if tab == "comparison" || tab == "fertility" {
                 let mut recipe = specimen.settings().unwrap();
                 if let crate::library::WorldSettings::Symbiosis { params, .. } = &mut recipe {
                     params.compare = true;
+                    if tab == "fertility" {
+                        params.layer = world::symbiosis::Layer::Fertility;
+                    }
                 }
                 specimen.restore_settings(&gpu, &recipe, 42).unwrap();
             }

@@ -53,6 +53,7 @@ fn gpu_feedback_works_in_both_directions_and_zero_decouples() {
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     // Odd sub-step counts also exercise alternating frame-start bind groups.
     world.params.steps = 7;
+    world.params.depletion = 0.8;
     let count = world.count;
     for (relationship, coupling) in Relationship::ALL.into_iter().flat_map(|r| [0.0, 1.0].map(|c| (r, c))) {
         world.params.relationship = relationship;
@@ -109,6 +110,7 @@ fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
         world.params.coupling = 1.0;
         advance(&gpu, &mut world, 3600);
         let field = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+        assert!(read::<f32>(&gpu, &world.fertility[world.current]).iter().all(|f| (0.0..=1.0).contains(f)));
         for f in &field {
             assert!(f.iter().all(|v| v.is_finite()), "{name}: {f:?}");
             assert!((0.0..=1.0).contains(&f[0]) && (0.0..=1.0).contains(&f[1]), "{name}: {f:?}");
@@ -218,7 +220,8 @@ fn gpu_brush_wraps_at_the_edges_and_display_layers_leave_simulation_unchanged() 
     frame.pointer = None;
     frame.target_size = size;
     frame.view = ViewXform::fit(world.size, size, &Camera { zoom: 0.5, ..Camera::default() });
-    for layer in [Layer::Together, Layer::Chemistry, Layer::Trails] {
+    let soil_before = read::<f32>(&gpu, &world.fertility[world.current]);
+    for layer in [Layer::Together, Layer::Chemistry, Layer::Trails, Layer::Fertility] {
         world.params.layer = layer;
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         world.render(&frame, &mut encoder, post.scene_view());
@@ -233,7 +236,9 @@ fn gpu_brush_wraps_at_the_edges_and_display_layers_leave_simulation_unchanged() 
     assert_ne!(views[0], views[1]);
     assert_ne!(views[0], views[2]);
     assert_ne!(views[1], views[2]);
+    assert!(views[..3].iter().all(|view| *view != views[3]));
     assert_eq!(before, read::<[f32; 4]>(&gpu, &world.fields[world.current]));
+    assert_eq!(soil_before, read::<f32>(&gpu, &world.fertility[world.current]));
     assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
 }
 
@@ -350,7 +355,7 @@ fn comparison_replays_the_seed_stays_independent_and_restores_saved_settings() {
     // original relationship, seeding, scale and uniform habitat.
     let mut old_recipe = serde_json::to_value(recipe).unwrap();
     old_recipe["params"].as_object_mut().unwrap().remove("compare");
-    for field in ["relationship", "seeding", "terrain", "scale", "trail_light"] {
+    for field in ["relationship", "seeding", "terrain", "scale", "trail_light", "depletion", "recovery", "reference"] {
         old_recipe["params"].as_object_mut().unwrap().remove(field);
     }
     let legacy: WorldSettings = serde_json::from_value(old_recipe).unwrap();
@@ -361,7 +366,142 @@ fn comparison_replays_the_seed_stays_independent_and_restores_saved_settings() {
     assert_eq!(world.params.terrain, 0.0);
     assert_eq!(world.params.scale, 1.0);
     assert_eq!(world.params.trail_light, 1.0);
+    assert_eq!(world.params.depletion, 0.0);
+    assert_eq!(world.params.recovery, recovery_default());
+    assert_eq!(world.params.reference, Reference::CouplingOff);
     assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}
+
+#[test]
+fn fertility_remembers_local_traffic_and_recovers_after_it_leaves() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    world.count = 0;
+    world.params.depletion = 1.0;
+    world.params.coupling = 1.0;
+    world.params.retention = 0.99;
+    world.params.steps = 7;
+    let mut cells = vec![[1.0_f32, 0.0, 0.0, 0.0]; 96 * 80];
+    for y in 25..55 {
+        for x in 30..66 {
+            cells[y * 96 + x][2] = 8.0;
+        }
+    }
+    for buffer in &world.fields {
+        gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&cells));
+    }
+    advance(&gpu, &mut world, 150);
+    let exhausted = read::<f32>(&gpu, &world.fertility[world.current]);
+    let centre = 40 * 96 + 48;
+    assert!(exhausted[centre] < 0.5, "busy ground must exhaust: {}", exhausted[centre]);
+    assert!(exhausted[0] > 0.999, "untouched ground must remain fertile");
+    // Remove the traffic. Fertility must retain its past, then recover slowly.
+    let blank = vec![[1.0_f32, 0.0, 0.0, 0.0]; 96 * 80];
+    for buffer in &world.fields {
+        gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&blank));
+    }
+    advance(&gpu, &mut world, 1);
+    let resting = read::<f32>(&gpu, &world.fertility[world.current]);
+    assert!((resting[centre] - exhausted[centre]).abs() < 0.001, "clearing trails must not erase history");
+    advance(&gpu, &mut world, 600);
+    let recovered = read::<f32>(&gpu, &world.fertility[world.current]);
+    assert!(recovered[centre] > resting[centre] + 0.1);
+    assert!(recovered.iter().all(|f| (0.0..=1.0).contains(f)));
+    world.reset(&gpu, 42);
+    assert!(read::<f32>(&gpu, &world.fertility[world.current]).iter().all(|f| *f == 1.0));
+}
+
+#[test]
+fn fertility_recovery_uses_frames_not_chemical_substeps_and_depletion_inhibits_growth() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [64, 64], 42);
+    world.count = 0;
+    world.params.depletion = 1.0;
+    world.params.coupling = 1.0;
+    world.params.recovery = 5.0;
+    for steps in [1, 7, 20] {
+        world.params.steps = steps;
+        world.params.scale = if steps == 7 { 2.0 } else { 0.6 };
+        for buffer in &world.fields {
+            gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vec![[1.0_f32, 0.0, 0.0, 0.0]; 64 * 64]));
+        }
+        for buffer in &world.fertility {
+            gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vec![0.25_f32; 64 * 64]));
+        }
+        advance(&gpu, &mut world, 300);
+        let recovered = read::<f32>(&gpu, &world.fertility[world.current]);
+        let expected = 1.0 - 0.75 * (-1.0_f32).exp();
+        assert!((recovered[0] - expected).abs() < 0.0005, "{steps} steps: {} != {expected}", recovered[0]);
+    }
+    world.params.steps = 1;
+    world.params.scale = 1.0;
+    let mut growth = Vec::new();
+    for depletion in [0.0, 1.0] {
+        world.params.depletion = depletion;
+        for reserve in [0.0_f32, 1.0] {
+            for buffer in &world.fields {
+                gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vec![[0.8_f32, 0.2, 8.0, 0.0]; 64 * 64]));
+            }
+            for buffer in &world.fertility {
+                gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vec![reserve; 64 * 64]));
+            }
+            advance(&gpu, &mut world, 1);
+            growth.push(read::<[f32; 4]>(&gpu, &world.fields[world.current])[0][1]);
+        }
+    }
+    assert_eq!(growth[0], growth[1], "switching off depletion must bypass even an exhausted habitat's history");
+    assert!(growth[2] < growth[3], "exhausted ground must inhibit growth");
+}
+
+#[test]
+fn fertility_comparison_isolates_the_cycle_and_replays_saved_recipes() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [128, 96], 42);
+    world.load_preset(&gpu, 5, 42);
+    world.set_comparison(&gpu, true);
+    let recipe = world.settings().unwrap();
+    advance(&gpu, &mut world, 600);
+    let habitat = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+    let soil = read::<f32>(&gpu, &world.fertility[world.current]);
+    let reference = world.reference.as_ref().unwrap();
+    let control = read::<[f32; 4]>(&gpu, &reference.fields[reference.current]);
+    assert_eq!(reference.params.coupling, world.params.coupling);
+    assert_eq!(reference.params.depletion, 0.0);
+    assert_ne!(habitat, control);
+    assert!(soil.iter().any(|f| *f < 0.8));
+    assert!(read::<f32>(&gpu, &reference.fertility[reference.current]).iter().all(|f| *f == 1.0));
+    let decoded = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+    world.restore_settings(&gpu, &decoded, 42).unwrap();
+    advance(&gpu, &mut world, 600);
+    assert_eq!(habitat, read::<[f32; 4]>(&gpu, &world.fields[world.current]));
+    assert_eq!(soil, read::<f32>(&gpu, &world.fertility[world.current]));
+    world.set_comparison(&gpu, false);
+    assert_eq!(soil, read::<f32>(&gpu, &world.fertility[world.current]));
+    world.params.depletion = 0.0;
+    world.set_comparison(&gpu, true);
+    advance(&gpu, &mut world, 80);
+    let reference = world.reference.as_ref().unwrap();
+    assert_eq!(
+        read::<[f32; 4]>(&gpu, &world.fields[world.current]),
+        read::<[f32; 4]>(&gpu, &reference.fields[reference.current])
+    );
+}
+
+#[test]
+fn fertility_settings_reject_unsafe_values() {
+    for value in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+        let mut params = Params::preset(0).0;
+        params.depletion = value;
+        assert!(params.validate().is_err());
+    }
+    for value in [0.0, 4.9, 120.1, f32::NAN, f32::INFINITY] {
+        let mut params = Params::preset(0).0;
+        params.recovery = value;
+        assert!(params.validate().is_err());
+    }
 }
 
 #[test]
@@ -464,5 +604,59 @@ fn render_comparison_preview() {
         readback.read(&gpu).unwrap(),
     )
     .unwrap();
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}
+
+#[test]
+#[ignore = "renders a two-minute fertility experiment and timelapse frames to target/fertility-preview"]
+fn render_fertility_cycle_preview() {
+    let _guard = crate::gpu::test_lock();
+    use crate::capture::{self, Readback};
+    use crate::post::Post;
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [640, 360], 42);
+    world.load_preset(&gpu, 5, 42);
+    world.set_comparison(&gpu, true);
+    let size = [1280, 720];
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let post = Post::new(&gpu, size, format);
+    let (texture, target) = gpu.texture_2d(
+        "fertility preview",
+        size,
+        format,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let readback = Readback::new(&gpu, size, format);
+    for n in 0..=600 {
+        if n > 0 {
+            advance(&gpu, &mut world, 12);
+        }
+        let frame = Frame {
+            gpu: &gpu,
+            time: n as f32 / 5.0,
+            dt: 1.0 / 60.0,
+            frame: n as u64 * 12,
+            view: ViewXform::fit(world.size, size, &Camera::default()),
+            target_size: size,
+            pointer: None,
+        };
+        for (layer, name) in [(Layer::Together, "living"), (Layer::Fertility, "fertility")] {
+            world.params.layer = layer;
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            world.render(&frame, &mut encoder, post.scene_view());
+            post.run(&gpu, &mut encoder, &world.post, frame.time, &target);
+            readback.copy_from(&mut encoder, &texture);
+            gpu.queue.submit([encoder.finish()]);
+            let path = format!("target/fertility-preview/{name}/{n:04}.png");
+            capture::save_png(std::path::Path::new(&path), size, readback.read(&gpu).unwrap()).unwrap();
+        }
+        if n % 50 == 0 {
+            let soil = read::<f32>(&gpu, &world.fertility[world.current]);
+            let field = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+            let coverage = field.iter().filter(|f| f[1] > 0.1).count() as f32 / field.len() as f32;
+            let mean = soil.iter().sum::<f32>() / soil.len() as f32;
+            println!("frame {}: occupied {coverage:.3}, mean fertility {mean:.3}", n * 12);
+        }
+    }
     assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
 }

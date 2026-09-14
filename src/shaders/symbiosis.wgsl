@@ -8,6 +8,7 @@ struct Sim {
     motion: vec4<f32>, // sensor distance, sensor angle, turn angle, speed
     trail: vec4<f32>, // retention, deposit, wander, diffusion (per sub-step)
     ecology: vec4<f32>, // relationship, habitat variation, diffusion scale, reserved
+    fertility: vec4<f32>, // depletion * coupling, recovery / frame, 1 / steps, reserved
     pointer: vec2<f32>, radius: f32, pointer_mode: u32,
 };
 struct Agent { pos: vec2<f32>, heading: f32, state: u32 };
@@ -16,6 +17,8 @@ struct Agent { pos: vec2<f32>, heading: f32, state: u32 };
 @group(0) @binding(2) var<storage, read_write> dst: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> agents: array<Agent>;
 @group(0) @binding(4) var<storage, read_write> deposits: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read> soil: array<f32>;
+@group(0) @binding(6) var<storage, read_write> next_soil: array<f32>;
 
 fn cell(p: vec2<i32>) -> vec4<f32> { return src[wrap_index(p, sim.size)]; }
 fn sample_field(p: vec2<f32>) -> vec4<f32> {
@@ -68,6 +71,7 @@ fn cs_agents(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn cs_field(@builtin(global_invocation_id) gid: vec3<u32>) {
     if any(gid.xy >= sim.size) { return; }
     let p = vec2<i32>(gid.xy);
+    let i = gid.y * sim.size.x + gid.x;
     let c = cell(p);
     let cardinal = cell(p + vec2<i32>(1, 0)) + cell(p + vec2<i32>(-1, 0))
                  + cell(p + vec2<i32>(0, 1)) + cell(p + vec2<i32>(0, -1));
@@ -77,6 +81,14 @@ fn cs_field(@builtin(global_invocation_id) gid: vec3<u32>) {
     let support = sim.chemistry.z * c.z / (1.0 + c.z);
     let feed = sim.chemistry.x;
     var kill = sim.chemistry.y - 0.004 * support + 0.006 * sim.ecology.y * c.w;
+    // A slower state records concentrated traffic, independently of trail decay
+    // and the chemical timestep. Rested ground approaches full fertility.
+    let exhaustion = sim.fertility.x * (1.0 - soil[i]);
+    kill += 0.012 * exhaustion;
+    let wear = 0.009 * sim.fertility.x * smoothstep(0.6, 3.0, c.z);
+    let rate = sim.fertility.y + wear;
+    let equilibrium = sim.fertility.y / rate;
+    next_soil[i] = clamp(equilibrium + (soil[i] - equilibrium) * exp(-rate * sim.fertility.z), 0.0, 1.0);
     // Trails reduce local loss and catalyse the existing growth front.
     var reaction = c.x * c.y * c.y;
     if sim.ecology.x < 0.5 {
@@ -90,11 +102,10 @@ fn cs_field(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Only busy routes germinate; a diffuse background of stray agents
         // must not seed the entire habitat into a solid carpet.
         let route = max(support - 0.5, 0.0) * 2.0;
-        reaction += 0.018 * route * route * c.x;
+        reaction += 0.018 * route * route * c.x * (1.0 - 0.9 * exhaustion);
     }
     let du = lap.x * sim.ecology.z - reaction + feed * (1.0 - c.x);
     let dv = lap.y * 0.5 * sim.ecology.z + reaction - (feed + kill) * c.y;
-    let i = gid.y * sim.size.x + gid.x;
     let deposit = f32(atomicLoad(&deposits[i])) * sim.trail.y;
     var next = vec4<f32>(clamp(c.xy + vec2<f32>(du, dv) * sim.chemistry.w, vec2<f32>(0.0), vec2<f32>(1.0)),
                         clamp((c.z + lap.z * sim.trail.w) * sim.trail.x + deposit, 0.0, 32.0), c.w);

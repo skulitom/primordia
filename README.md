@@ -14,7 +14,7 @@
   </picture>
 </p>
 
-Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems plus **Symbiosis**, an experiment that couples agents and chemistry, **41 presets** and a *Mutate* button for exploring new settings. A cinematic HDR pipeline is shared by all five worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
+Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems plus **Symbiosis**, an experiment that couples agents and chemistry, **42 presets** and a *Mutate* button for exploring new settings. A cinematic HDR pipeline is shared by all five worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
 
 - [The five worlds](#the-five-worlds)
 - [Features](#features)
@@ -81,26 +81,38 @@ The presets explore different growth scales, steering and chemical regimes:
 | Coral Maze | Weave | Fine, branching mazes mixed with cellular patches |
 | Spore Tide | Graze | Broken fronts curl into travelling waves and spirals |
 | Root Atlas | Weave | Large, persistent routes become corridors of chemical growth |
+| Fallow Gardens | Weave | Busy routes exhaust the ground; rested patches slowly regain fertility |
 
-**Habitat & growth** controls the pattern scale and a seamless fertility landscape generated from the seed. Choose scattered islands, clustered colonies, living threads or broken wave fronts, then **Restart this seed** to apply the seeding layout. **Mutate** explores these layouts, scale, geography and agent behaviour across all five preset families. **Trail light**, under Look, balances the visible network against the chemistry.
+**Habitat & growth** controls the pattern scale and a seamless fertility landscape generated from the seed. Choose scattered islands, clustered colonies, living threads or broken wave fronts, then **Restart this seed** to apply the seeding layout. **Mutate** explores these layouts, scale, geography, agent behaviour and fertility cycles across all six preset families. **Trail light**, under Look, balances the visible network against the chemistry.
 
 ![All five Symbiosis presets after 3600 frames: seed 42 in the top row, seed 314159 below](docs/images/symbiosis-presets.png)
 
-Switch the **View** between Together, Chemistry and Agent trails to inspect the interaction. Changes to the relationship and coupling take effect immediately; the existing habitat carries its history forward. Left-drag seeds chemistry; right-drag clears chemistry and trails. The library keeps the relationship, habitat, seed, settings, palette and view. Earlier recipes retain their original cultivation behaviour, uniform habitat and seeding settings.
+Switch the **View** between Together, Chemistry, Agent trails and Fertility to inspect the interaction. Changes to the relationship and coupling take effect immediately; the existing habitat carries its history forward. Left-drag seeds chemistry; right-drag clears chemistry and trails. The library keeps the relationship, habitat, seed, settings, palette and view. Earlier recipes retain their original cultivation behaviour, uniform habitat and seeding settings.
 
-Enable **Compare with coupling off** to restart two habitats from the same seed. The left uses your coupling strength; the right holds coupling at zero. All other settings, brush strokes, pan and zoom are shared. **Restart comparison** repeats the experiment from that seed with your current settings; turning comparison off keeps the left habitat running. The mode is saved with your recipe, and earlier saves still open in the single-world view. Press **H / Tab** to give both panes more room. Comparison runs two simulations, so it uses more GPU time and memory.
+Enable **Compare habitats** to restart two habitats from the same seed. The left uses your settings; choose **Coupling off** or **Fertility cycle off** for the right-hand reference. The latter keeps agent–chemistry coupling intact and removes only depletion and its effects. All other settings, brush strokes, pan and zoom are shared. Changing the reference or choosing **Restart comparison** repeats the experiment from that seed with your current settings; turning comparison off keeps the left habitat running. The mode and reference are saved with your recipe; earlier comparison saves retain their coupling-off reference. Press **H / Tab** to give both panes more room. Comparison runs two simulations, so it uses more GPU time and memory.
 
 ![Living Reef, seed 42 after 720 frames: coupling 0.70 on the left, coupling off on the right](docs/images/symbiosis-comparison.png)
+
+**Fertility cycle** gives the ground a slower memory. Concentrated traffic depletes local reserves, increasing chemical loss and making new growth harder to germinate. When traffic moves away, fertility gradually returns. **Depletion strength** controls the effect; zero bypasses it. **Recovery time (s)** is the time to recover about 63% of missing fertility on rested ground at 60 simulation frames per second. It follows simulation frames, pauses with the world, and is independent of chemistry steps and growth scale. Coupling at zero also removes depletion and its effects.
+
+The **Fertility** view uses rust for exhausted ground and teal for fertile ground, with faint colony outlines. Clearing chemistry leaves this history intact; restarting restores full reserves. Saved recipes retain the cycle settings but restart the habitat, just like other library saves. The five earlier presets and older recipes keep depletion off; **Fallow Gardens** starts with it enabled and selects the fertility-off reference for comparison.
+
+![Fallow Gardens, seed 42 after 6000 frames: fertility cycle enabled on the left and disabled on the right](docs/images/fallow-gardens-comparison.png)
+
+The same moment in the fertility view shows depleted routes on the left; the reference keeps full reserves. In this seed-42 experiment, the cycle leaves larger open regions between routes while the reference develops a denser mesh. Both habitats remain active through 7200 frames (two minutes at 60 frames/s).
+
+![Fallow Gardens fertility reserves at the same moment: rust marks exhausted ground, teal marks fertile ground](docs/images/fallow-gardens-fertility.png)
 
 ```bash
 cargo run --release -- --world symbiosis --preset "Living Reef"
 primordia render --world symbiosis --preset "Wandering Veins" --seed 42 --frames 720 --out symbiosis.png
+cargo run --release -- --world symbiosis --preset "Fallow Gardens" --seed 42
 ```
 
 ## Features
 
 - **Real-time GPU simulation** in WGSL compute shaders (see [Performance](#performance) for measurements of the four original worlds).
-- **41 presets** and **Mutate** (`M`) for exploring new parameter sets.
+- **42 presets** and **Mutate** (`M`) for exploring new parameter sets.
 - **Interactive.** Paint, feed, attract, repel and erase with the mouse. Zoom into any detail, and pan across the seamless toroidal world.
 - **Cinematic look.** HDR bloom (the Jimenez 13-tap chain with level falloff), AgX, ACES or Reinhard tonemapping, perceptual OKLab palettes, vignette, film grain and dithering.
 - **Live control panel** (egui) exposing every parameter of every world.
@@ -221,7 +233,8 @@ Under the hood, per world:
 - **Symbiosis**
   - Agents sense chemical growth alongside their own trails. Depending on the relationship, trail deposits nourish existing growth, increase consumption, or germinate new growth along busy routes.
   - Fixed integer-frequency harmonics create a periodic fertility landscape from the seed. Growth scale and initial seeding provide additional variation.
-  - The optional comparison habitat has separate GPU state, the same seed and settings, and zero coupling.
+  - A separate pair of scalar buffers retains local fertility. Busy trails deplete it; exponential recovery restores rested ground. The update runs per simulation frame, split across chemical sub-steps, and is unaffected by the chemical timestep. This adds eight bytes per cell.
+  - The optional comparison habitat has separate GPU state and the same seed and settings, with either coupling or the fertility cycle disabled.
   - Both views share the camera and brush, with matching world scale in each half of the image.
 
 One lesson learned along the way: on some GPU/driver combinations, WGSL's signed integer `%` is wrong for negative operands, and wrapping with float division is off by one at some sizes. Both show up as seams on a torus. The prelude's `wrap_i` corrects for both, and `primordia selftest` checks it against the CPU on your hardware.
@@ -251,7 +264,7 @@ cargo build --release --locked
 cargo run --release --locked -- selftest
 ```
 
-The tests need a supported GPU, but no window. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, and control-panel layout. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons.
+The tests need a supported GPU, but no window. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, fertility depletion and recovery, and control-panel layout. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons. `cargo test --locked render_fertility_cycle_preview -- --ignored --nocapture` records a two-minute, same-seed experiment as living and fertility-view timelapse frames in `target/fertility-preview`.
 
 ## Inspiration and references
 
