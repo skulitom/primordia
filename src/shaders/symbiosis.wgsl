@@ -1,4 +1,5 @@
-// A shared habitat: x = nutrient U, y = activator V, z = slime trail.
+// A shared habitat: x = nutrient U, y = activator V, z = slime trail,
+// w = fixed periodic geography. The geography is independent of coupling.
 // Agents read yesterday's habitat; integer deposits are resolved in a separate
 // pass. Every chemical/trail sub-step then reads a complete, immutable field.
 struct Sim {
@@ -6,6 +7,7 @@ struct Sim {
     chemistry: vec4<f32>, // feed, kill, coupling, dt
     motion: vec4<f32>, // sensor distance, sensor angle, turn angle, speed
     trail: vec4<f32>, // retention, deposit, wander, diffusion (per sub-step)
+    ecology: vec4<f32>, // relationship, habitat variation, diffusion scale, reserved
     pointer: vec2<f32>, radius: f32, pointer_mode: u32,
 };
 struct Agent { pos: vec2<f32>, heading: f32, state: u32 };
@@ -27,6 +29,12 @@ fn sense(p: vec2<f32>, a: f32) -> f32 {
     let trail = f.z / (0.35 + f.z);
     // Prefer the growing margin to either empty ground or a saturated centre.
     let margin = exp(-100.0 * (f.y - 0.14) * (f.y - 0.14));
+    if sim.ecology.x > 0.5 && sim.ecology.x < 1.5 {
+        // Grazers pursue food and avoid their recently exhausted routes.
+        // At zero coupling they revert to independent trail-following agents.
+        return trail * (1.0 - sim.chemistry.z * 1.5)
+             + sim.chemistry.z * 3.0 * f.y / (0.12 + f.y);
+    }
     return trail + sim.chemistry.z * 2.5 * margin;
 }
 
@@ -68,15 +76,28 @@ fn cs_field(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lap = cardinal * 0.2 + diagonal * 0.05 - c;
     let support = sim.chemistry.z * c.z / (1.0 + c.z);
     let feed = sim.chemistry.x;
-    let kill = sim.chemistry.y - 0.004 * support;
+    var kill = sim.chemistry.y - 0.004 * support + 0.006 * sim.ecology.y * c.w;
     // Trails reduce local loss and catalyse the existing growth front.
-    let reaction = c.x * c.y * c.y + 0.0005 * support * c.x * clamp(c.y * 8.0, 0.0, 1.0);
-    let du = lap.x - reaction + feed * (1.0 - c.x);
-    let dv = lap.y * 0.5 + reaction - (feed + kill) * c.y;
+    var reaction = c.x * c.y * c.y;
+    if sim.ecology.x < 0.5 {
+        reaction += 0.0005 * support * c.x * clamp(c.y * 8.0, 0.0, 1.0);
+    } else if sim.ecology.x < 1.5 {
+        // Consumption concentrates where traffic gathers; a uniform trickle
+        // of agents must not raise the whole habitat's loss rate into extinction.
+        kill += 0.004 * support + 0.012 * support * support;
+    } else {
+        // Concentrated traffic can germinate new growth on bare ground.
+        // Only busy routes germinate; a diffuse background of stray agents
+        // must not seed the entire habitat into a solid carpet.
+        let route = max(support - 0.5, 0.0) * 2.0;
+        reaction += 0.018 * route * route * c.x;
+    }
+    let du = lap.x * sim.ecology.z - reaction + feed * (1.0 - c.x);
+    let dv = lap.y * 0.5 * sim.ecology.z + reaction - (feed + kill) * c.y;
     let i = gid.y * sim.size.x + gid.x;
     let deposit = f32(atomicLoad(&deposits[i])) * sim.trail.y;
     var next = vec4<f32>(clamp(c.xy + vec2<f32>(du, dv) * sim.chemistry.w, vec2<f32>(0.0), vec2<f32>(1.0)),
-                        clamp((c.z + lap.z * sim.trail.w) * sim.trail.x + deposit, 0.0, 32.0), abs(dv));
+                        clamp((c.z + lap.z * sim.trail.w) * sim.trail.x + deposit, 0.0, 32.0), c.w);
     if sim.pointer_mode != 0u {
         let d = length(torus_delta(vec2<f32>(gid.xy), sim.pointer, vec2<f32>(sim.size)));
         let brush = (1.0 - smoothstep(sim.radius * 0.5, sim.radius, d)) * 0.3;
@@ -84,7 +105,7 @@ fn cs_field(@builtin(global_invocation_id) gid: vec3<u32>) {
             next.x = mix(next.x, 0.5, brush);
             next.y = mix(next.y, 0.28, brush);
         } else {
-            next = mix(next, vec4<f32>(1.0, 0.0, 0.0, 0.0), brush);
+            next = mix(next, vec4<f32>(1.0, 0.0, 0.0, c.w), brush);
         }
     }
     dst[i] = next;

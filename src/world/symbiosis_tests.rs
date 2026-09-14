@@ -54,7 +54,8 @@ fn gpu_feedback_works_in_both_directions_and_zero_decouples() {
     // Odd sub-step counts also exercise alternating frame-start bind groups.
     world.params.steps = 7;
     let count = world.count;
-    for coupling in [0.0, 1.0] {
+    for (relationship, coupling) in Relationship::ALL.into_iter().flat_map(|r| [0.0, 1.0].map(|c| (r, c))) {
+        world.params.relationship = relationship;
         world.params.coupling = coupling;
         world.count = count;
         world.reset(&gpu, 42);
@@ -101,10 +102,12 @@ fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
     let _guard = crate::gpu::test_lock();
     let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
     let mut world = Symbiosis::new(&gpu, [160, 120], 42);
-    for (index, name) in PRESETS.iter().enumerate() {
-        world.load_preset(&gpu, index, 42);
+    let mut coverage = Vec::new();
+    for (index, name, seed) in PRESETS.iter().enumerate().flat_map(|(i, name)| [42, 314159].map(|seed| (i, name, seed)))
+    {
+        world.load_preset(&gpu, index, seed);
         world.params.coupling = 1.0;
-        advance(&gpu, &mut world, 1800);
+        advance(&gpu, &mut world, 3600);
         let field = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
         for f in &field {
             assert!(f.iter().all(|v| v.is_finite()), "{name}: {f:?}");
@@ -113,7 +116,8 @@ fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
         }
         let occupied = field.iter().filter(|f| f[1] > 0.1).count() as f32 / field.len() as f32;
         let trail: f32 = field.iter().map(|f| f[2]).sum::<f32>() / field.len() as f32;
-        println!("{name}: occupied {occupied:.3}, mean trail {trail:.3}");
+        println!("{name}, seed {seed}: occupied {occupied:.3}, mean trail {trail:.3}");
+        coverage.push(occupied);
         assert!((0.01..0.95).contains(&occupied), "{name} should retain growth and open ground");
         assert!(trail > 0.01, "{name} should retain agent trails");
         for agent in read::<Agent>(&gpu, &world.agents) {
@@ -122,6 +126,43 @@ fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
             assert!(agent.heading.is_finite());
         }
     }
+    let min = coverage.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = coverage.iter().copied().fold(0.0, f32::max);
+    assert!(max - min > 0.3, "presets must retain distinct growth densities after a minute");
+}
+
+#[test]
+fn relationships_change_growth_in_opposite_directions_and_weave_germinates_bare_routes() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    world.params.steps = 1;
+    world.params.scale = 1.0;
+    world.params.terrain = 0.0;
+    world.count = 0;
+    let mut growth = Vec::new();
+    for relationship in Relationship::ALL {
+        world.params.relationship = relationship;
+        for activator in [0.0, 0.2] {
+            for coupling in [0.0, 1.0] {
+                world.params.coupling = coupling;
+                let cells = vec![[0.8_f32, activator, 8.0, 0.0]; 96 * 80];
+                for buffer in &world.fields {
+                    gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&cells));
+                }
+                advance(&gpu, &mut world, 1);
+                growth.push(read::<[f32; 4]>(&gpu, &world.fields[world.current])[0][1]);
+            }
+        }
+    }
+    assert!(growth[3] > growth[2], "cultivators nourish existing growth");
+    assert!(growth[7] < growth[6], "grazers consume existing growth");
+    assert_eq!(growth[0], 0.0);
+    assert_eq!(growth[1], 0.0);
+    assert_eq!(growth[4], 0.0);
+    assert_eq!(growth[5], 0.0);
+    assert_eq!(growth[8], 0.0);
+    assert!(growth[9] > 0.001, "weavers germinate new growth along busy routes");
 }
 
 #[test]
@@ -201,16 +242,51 @@ fn gpu_brush_wraps_at_the_edges_and_display_layers_leave_simulation_unchanged() 
 fn render_symbiosis_previews() {
     let _guard = crate::gpu::test_lock();
     let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
-    for name in PRESETS {
+    let mut images = Vec::new();
+    for (name, seed) in PRESETS.iter().flat_map(|name| [42, 314159].map(|seed| (name, seed))) {
         let mut job = crate::headless::RenderJob::new("symbiosis");
         job.preset = Some((*name).to_owned());
-        job.seed = 42;
+        job.seed = seed;
         job.size = [1280, 800];
-        job.frames = 720;
-        job.max_fps = 240.0;
-        job.out = Some(format!("target/symbiosis-preview/{}.png", name.to_lowercase().replace(' ', "-")).into());
+        job.frames = 3600;
+        job.max_fps = 0.0;
+        job.out = Some(format!("target/symbiosis-preview/{seed}/{}.png", name.to_lowercase().replace(' ', "-")).into());
         crate::headless::render_with(&gpu, &job).unwrap();
+        images.push((if seed == 42 { "42" } else { "314159" }, job.out.unwrap()));
     }
+    // Keep each seed in a row, with presets in their menu order.
+    images.sort_by_key(|(seed, path)| {
+        let index =
+            PRESETS.iter().position(|name| path.file_stem().unwrap() == crate::headless::slug(name).as_str()).unwrap();
+        (*seed != "42", index)
+    });
+    crate::headless::contact_sheet(&images, std::path::Path::new("target/symbiosis-preview/presets.png"), 5).unwrap();
+}
+
+#[test]
+fn mutations_explore_relationships_geography_and_seeding_with_valid_recipes() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    let mut relationships = std::collections::BTreeSet::new();
+    let mut seedings = std::collections::BTreeSet::new();
+    let mut scales = Vec::new();
+    for seed in 0..32 {
+        world.mutate(&gpu, seed);
+        world.params.validate().unwrap();
+        relationships.insert(world.params.relationship as u32);
+        seedings.insert(world.params.seeding as u32);
+        scales.push(world.params.scale);
+        let recipe = world.settings().unwrap();
+        let decoded = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+        world.restore_settings(&gpu, &decoded, seed).unwrap();
+        assert_eq!(serde_json::to_value(world.settings().unwrap()).unwrap(), serde_json::to_value(recipe).unwrap());
+    }
+    assert_eq!(relationships.len(), Relationship::ALL.len());
+    assert_eq!(seedings.len(), Seeding::ALL.len());
+    let span = scales.iter().copied().fold(0.0, f32::max) - scales.iter().copied().fold(f32::INFINITY, f32::min);
+    assert!(span > 0.8, "mutation should explore visibly different growth scales");
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
 }
 
 #[test]
@@ -270,12 +346,21 @@ fn comparison_replays_the_seed_stays_independent_and_restores_saved_settings() {
     assert!(world.params.compare);
     assert_eq!(world.reference.as_ref().unwrap().seed, 91);
 
-    // A recipe written before comparison existed must still load unchanged.
+    // Recipes written before comparison and ecological controls keep their
+    // original relationship, seeding, scale and uniform habitat.
     let mut old_recipe = serde_json::to_value(recipe).unwrap();
     old_recipe["params"].as_object_mut().unwrap().remove("compare");
+    for field in ["relationship", "seeding", "terrain", "scale", "trail_light"] {
+        old_recipe["params"].as_object_mut().unwrap().remove(field);
+    }
     let legacy: WorldSettings = serde_json::from_value(old_recipe).unwrap();
     world.restore_settings(&gpu, &legacy, 42).unwrap();
     assert!(!world.params.compare && world.reference.is_none());
+    assert_eq!(world.params.relationship, Relationship::Cultivate);
+    assert_eq!(world.params.seeding, Seeding::Islands);
+    assert_eq!(world.params.terrain, 0.0);
+    assert_eq!(world.params.scale, 1.0);
+    assert_eq!(world.params.trail_light, 1.0);
     assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
 }
 

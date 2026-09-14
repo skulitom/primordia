@@ -19,7 +19,61 @@ use crate::rng::Rng;
 #[path = "symbiosis_tests.rs"]
 mod tests;
 
-const PRESETS: &[&str] = &["Living Reef", "Wandering Veins", "Coral Maze"];
+const PRESETS: &[&str] = &["Living Reef", "Wandering Veins", "Coral Maze", "Spore Tide", "Root Atlas"];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Relationship {
+    #[default]
+    Cultivate,
+    Graze,
+    Weave,
+}
+
+impl Relationship {
+    const ALL: [Self; 3] = [Self::Cultivate, Self::Graze, Self::Weave];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cultivate => "Cultivate",
+            Self::Graze => "Graze",
+            Self::Weave => "Weave",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Cultivate => "Agents tend growth margins; their trails nourish colonies.",
+            Self::Graze => "Agents seek growth and consume it, leaving space to recover.",
+            Self::Weave => "Agents follow growth; busy trails germinate new living threads.",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Seeding {
+    #[default]
+    Islands,
+    Archipelago,
+    Threads,
+    Fronts,
+}
+
+impl Seeding {
+    const ALL: [Self; 4] = [Self::Islands, Self::Archipelago, Self::Threads, Self::Fronts];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Islands => "Scattered islands",
+            Self::Archipelago => "Clustered colonies",
+            Self::Threads => "Living threads",
+            Self::Fronts => "Broken wave fronts",
+        }
+    }
+}
+
+fn one() -> f32 {
+    1.0
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Layer {
@@ -56,44 +110,106 @@ pub struct Params {
     /// Older saved recipes open in the original single-world view.
     #[serde(default)]
     pub compare: bool,
+    #[serde(default)]
+    pub relationship: Relationship,
+    #[serde(default)]
+    pub seeding: Seeding,
+    /// Fixed, periodic fertility differences generated from the recipe's seed.
+    #[serde(default)]
+    pub terrain: f32,
+    #[serde(default = "one")]
+    pub scale: f32,
+    #[serde(default = "one")]
+    pub trail_light: f32,
 }
 
 impl Params {
     fn preset(index: usize) -> (Self, usize) {
         let mut p = Self {
             coupling: 0.7,
-            feed: 0.0367,
-            kill: 0.0649,
-            steps: 8,
+            feed: 0.0545,
+            kill: 0.063,
+            steps: 12,
             sensor_distance: 12.0,
             sensor_angle: 0.65,
             turn_angle: 0.4,
             speed: 1.4,
-            retention: 0.94,
+            retention: 0.92,
             wander: 0.08,
             brightness: 1.25,
             layer: Layer::Together,
             compare: false,
+            relationship: Relationship::Cultivate,
+            seeding: Seeding::Archipelago,
+            terrain: 0.8,
+            scale: 1.35,
+            trail_light: 0.55,
         };
         let palette = match index {
             1 => {
-                p.feed = 0.026;
-                p.kill = 0.059;
-                p.steps = 10;
-                p.sensor_distance = 20.0;
-                p.speed = 1.8;
-                p.retention = 0.97;
-                p.coupling = 0.55;
+                p.relationship = Relationship::Graze;
+                p.feed = 0.014;
+                p.kill = 0.05;
+                p.steps = 16;
+                p.sensor_distance = 8.0;
+                p.speed = 1.7;
+                p.retention = 0.95;
+                p.coupling = 0.65;
+                p.scale = 1.0;
+                p.terrain = 0.3;
+                p.seeding = Seeding::Islands;
+                p.trail_light = 0.35;
                 2 // Aurora
             }
             2 => {
-                p.feed = 0.034;
+                p.relationship = Relationship::Weave;
+                p.feed = 0.042;
                 p.kill = 0.062;
-                p.sensor_distance = 9.0;
-                p.speed = 1.0;
-                p.retention = 0.92;
+                p.sensor_distance = 14.0;
+                p.speed = 1.25;
+                p.retention = 0.95;
                 p.coupling = 0.85;
+                p.scale = 0.85;
+                p.terrain = 0.5;
+                p.seeding = Seeding::Threads;
+                p.trail_light = 0.3;
                 8 // Coral
+            }
+            3 => {
+                p.relationship = Relationship::Graze;
+                p.feed = 0.01;
+                p.kill = 0.045;
+                p.steps = 20;
+                p.sensor_distance = 5.0;
+                p.sensor_angle = 1.2;
+                p.turn_angle = 0.8;
+                p.speed = 2.3;
+                p.retention = 0.88;
+                p.wander = 0.18;
+                p.coupling = 0.5;
+                p.scale = 0.8;
+                p.terrain = 0.12;
+                p.seeding = Seeding::Fronts;
+                p.trail_light = 0.25;
+                1 // Ember
+            }
+            4 => {
+                p.relationship = Relationship::Weave;
+                p.feed = 0.03;
+                p.kill = 0.064;
+                p.steps = 10;
+                p.sensor_distance = 28.0;
+                p.sensor_angle = 0.4;
+                p.turn_angle = 0.2;
+                p.speed = 0.8;
+                p.retention = 0.98;
+                p.wander = 0.025;
+                p.coupling = 0.95;
+                p.scale = 1.5;
+                p.terrain = 1.0;
+                p.seeding = Seeding::Archipelago;
+                p.trail_light = 0.7;
+                5 // Moss
             }
             _ => 0, // Bioluminescence
         };
@@ -114,6 +230,9 @@ impl Params {
             (self.retention, 0.8, 0.99),
             (self.wander, 0.0, 0.5),
             (self.brightness, 0.2, 4.0),
+            (self.terrain, 0.0, 1.0),
+            (self.scale, 0.6, 2.0),
+            (self.trail_light, 0.0, 2.0),
         ] {
             ensure!((lo..=hi).contains(&value), "Invalid Symbiosis setting");
         }
@@ -139,6 +258,7 @@ struct SimUniform {
     chemistry: [f32; 4],
     motion: [f32; 4],
     trail: [f32; 4],
+    ecology: [f32; 4],
     pointer: [f32; 2],
     radius: f32,
     pointer_mode: u32,
@@ -151,6 +271,7 @@ struct DrawUniform {
     size: [u32; 2],
     layer: u32,
     brightness: f32,
+    ecology: [f32; 4],
 }
 
 pub struct Symbiosis {
@@ -308,7 +429,13 @@ impl Symbiosis {
         view.scale[0] *= region[1];
         frame.gpu.write(
             &self.draw_uniform,
-            &DrawUniform { view, size: self.size, layer: self.params.layer as u32, brightness: self.params.brightness },
+            &DrawUniform {
+                view,
+                size: self.size,
+                layer: self.params.layer as u32,
+                brightness: self.params.brightness,
+                ecology: [self.params.relationship as u32 as f32, self.params.trail_light, 0.0, 0.0],
+            },
         );
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("symbiosis view"),
@@ -361,12 +488,39 @@ impl World for Symbiosis {
         let mut rng = Rng::new(seed);
         let [w, h] = self.size;
         let mut field = vec![[1.0_f32, 0.0, 0.0, 0.0]; (w * h) as usize];
+        // A separate stream makes geography reproducible without perturbing
+        // the legacy island/agent streams. Integer harmonics tile exactly.
+        let mut land = Rng::new(seed ^ 0x6861_6269_7461_7421);
+        let phases: [f32; 4] = std::array::from_fn(|_| land.range(0.0, TAU));
+        let frequency = [land.below(3) + 1, land.below(3) + 1];
+        for y in 0..h {
+            for x in 0..w {
+                let u = TAU * x as f32 / w as f32;
+                let v = TAU * y as f32 / h as f32;
+                field[(y * w + x) as usize][3] = 0.5
+                    * (u * frequency[0] as f32 + phases[0] + (v + phases[1]).sin()).sin()
+                    + 0.3 * (v * frequency[1] as f32 + phases[2]).cos()
+                    + 0.2 * (u * 2.0 - v * 3.0 + phases[3]).sin();
+            }
+        }
+        let colonies: Vec<[f32; 2]> =
+            (0..land.below(5) + 3).map(|_| [land.range(0.0, w as f32), land.range(0.0, h as f32)]).collect();
         // Sparse, irregular islands. Write wrapped disks rather than measuring
         // every cell against every island; reset stays cheap on large outputs.
-        for _ in 0..(w * h / 2400).max(5) {
-            let cx = rng.below(w) as i32;
-            let cy = rng.below(h) as i32;
-            let radius = rng.range(4.0, 10.0);
+        let islands =
+            if self.params.seeding == Seeding::Fronts { (w * h / 12000).max(3) } else { (w * h / 2400).max(5) };
+        for _ in 0..islands {
+            let (cx, cy) = if self.params.seeding == Seeding::Archipelago {
+                let c = rng.pick(&colonies);
+                let spread = w.min(h) as f32 * 0.09;
+                ((c[0] + rng.normal() * spread) as i32, (c[1] + rng.normal() * spread) as i32)
+            } else {
+                (rng.below(w) as i32, rng.below(h) as i32)
+            };
+            let radius = rng.range(4.0, 10.0)
+                * self.params.scale
+                * if self.params.seeding == Seeding::Fronts { 2.5 } else { 1.0 };
+            let angle = if self.params.seeding == Seeding::Fronts { rng.range(0.0, TAU) } else { 0.0 };
             let r = radius.ceil() as i32;
             for dy in -r..=r {
                 for dx in -r..=r {
@@ -375,7 +529,34 @@ impl World for Symbiosis {
                     }
                     let x = (cx + dx).rem_euclid(w as i32) as u32;
                     let y = (cy + dy).rem_euclid(h as i32) as u32;
-                    field[(y * w + x) as usize] = [0.5, rng.range(0.22, 0.3), 0.0, 0.0];
+                    let cell = &mut field[(y * w + x) as usize];
+                    if self.params.seeding == Seeding::Fronts {
+                        let along = dx as f32 * angle.cos() + dy as f32 * angle.sin();
+                        // A broken arc with a depleted interior launches a
+                        // front instead of collapsing into a circular spot.
+                        if along < -radius * 0.3 {
+                            continue;
+                        }
+                        cell[0] = 0.15;
+                        cell[1] = if (dx * dx + dy * dy) as f32 > (radius - 3.0).powi(2) { 0.32 } else { 0.0 };
+                    } else {
+                        cell[0] = 0.5;
+                        cell[1] = rng.range(0.22, 0.3);
+                    }
+                }
+            }
+        }
+        if self.params.seeding == Seeding::Threads {
+            for y in 0..h {
+                for x in 0..w {
+                    let u = TAU * x as f32 / w as f32;
+                    let v = TAU * y as f32 / h as f32;
+                    let thread = (u * 3.0 + phases[0] + (v * 2.0 + phases[1]).sin() * 1.8).sin();
+                    if thread.abs() < 0.16 {
+                        let cell = &mut field[(y * w + x) as usize];
+                        cell[0] = 0.45;
+                        cell[1] = rng.range(0.24, 0.32);
+                    }
                 }
             }
         }
@@ -406,15 +587,23 @@ impl World for Symbiosis {
 
     fn mutate(&mut self, gpu: &Gpu, seed: u64) {
         let mut rng = Rng::new(seed);
-        let (mut p, _) = Params::preset(rng.below(PRESETS.len() as u32) as usize);
+        self.preset = rng.below(PRESETS.len() as u32) as usize;
+        let (mut p, palette) = Params::preset(self.preset);
         p.coupling = rng.range(0.25, 1.0);
-        p.sensor_distance *= rng.range(0.7, 1.4);
-        p.speed *= rng.range(0.8, 1.3);
-        p.sensor_angle = rng.range(0.4, 1.0);
-        p.retention = rng.range(0.9, 0.98);
-        p.kill += rng.range(-0.0006, 0.0006);
+        p.sensor_distance = (p.sensor_distance * rng.range(0.55, 1.5)).clamp(2.0, 40.0);
+        p.speed = (p.speed * rng.range(0.7, 1.35)).clamp(0.2, 3.0);
+        p.sensor_angle = (p.sensor_angle * rng.range(0.7, 1.3)).clamp(0.1, 1.6);
+        p.retention = (p.retention + rng.range(-0.025, 0.015)).clamp(0.8, 0.99);
+        p.scale = rng.range(0.65, 1.9);
+        p.terrain = rng.range(0.1, 1.0);
+        p.wander = rng.range(0.015, 0.25);
+        p.seeding = *rng.pick(&Seeding::ALL);
+        // Keep each chemistry family near a viable regime while exploring
+        // scale, geography, seeding and agents much more broadly.
+        p.kill = (p.kill + rng.range(-0.001, 0.001)).clamp(0.03, 0.08);
         p.compare = self.params.compare;
         self.params = p;
+        self.lut.set(gpu, palette);
         self.reset(gpu, seed);
     }
 
@@ -454,9 +643,10 @@ impl World for Symbiosis {
                 size: self.size,
                 count: self.count,
                 steps: p.steps,
-                chemistry: [p.feed, p.kill, p.coupling, 0.8],
+                chemistry: [p.feed, p.kill, p.coupling, 0.8 / (p.scale * p.scale).max(1.0)],
                 motion: [p.sensor_distance, p.sensor_angle, p.turn_angle, p.speed],
                 trail: [p.retention.powf(1.0 / p.steps as f32), 0.08 / p.steps as f32, p.wander, 0.28 / p.steps as f32],
+                ecology: [p.relationship as u32 as f32, p.terrain, p.scale * p.scale, 0.0],
                 pointer: [
                     pointer.pos[0].rem_euclid(1.0) * self.size[0] as f32,
                     pointer.pos[1].rem_euclid(1.0) * self.size[1] as f32,
@@ -518,13 +708,19 @@ impl World for Symbiosis {
 
     fn ui(&mut self, gpu: &Gpu, ui: &mut egui::Ui) {
         use crate::ui::Slider;
-        ui.add(Slider::new(&mut self.params.coupling, 0.0..=1.0).text("Coupling strength"))
-            .on_hover_text("Chemistry guides agents; their trails encourage chemical growth. Zero lets both systems run independently.");
+        crate::ui::dropdown(ui, "Relationship", self.params.relationship.name(), |ui| {
+            for relationship in Relationship::ALL {
+                ui.selectable_value(&mut self.params.relationship, relationship, relationship.name());
+            }
+        });
+        ui.add(Slider::new(&mut self.params.coupling, 0.0..=1.0).text("Coupling strength")).on_hover_text(
+            "Controls both directions of the selected relationship. Zero lets chemistry and agents run independently.",
+        );
         ui.label(
             egui::RichText::new(if self.params.coupling == 0.0 {
                 "Uncoupled · both systems keep running"
             } else {
-                "Chemistry guides agents · trails feed growth"
+                self.params.relationship.hint()
             })
             .small()
             .color(crate::ui::ACCENT),
@@ -568,6 +764,23 @@ impl World for Symbiosis {
         ui.add(Slider::new(&mut self.params.speed, 0.2..=3.0).text("Agent speed"));
         ui.add(Slider::new(&mut self.params.retention, 0.8..=0.99).text("Trail memory"));
         ui.add(Slider::new(&mut self.params.steps, 1..=20).text("Chemistry steps / frame"));
+        ui.collapsing("Habitat & growth", |ui| {
+            ui.add(Slider::new(&mut self.params.scale, 0.6..=2.0).text("Growth scale"));
+            ui.add(Slider::new(&mut self.params.terrain, 0.0..=1.0).text("Habitat variation"))
+                .on_hover_text("Fertile and sparse regions follow a seamless landscape unique to this seed.");
+            crate::ui::dropdown(ui, "Seeding (on restart)", self.params.seeding.name(), |ui| {
+                for seeding in Seeding::ALL {
+                    ui.selectable_value(&mut self.params.seeding, seeding, seeding.name());
+                }
+            });
+            if ui
+                .button("Restart this seed")
+                .on_hover_text("Apply seeding changes while keeping this seed and settings.")
+                .clicked()
+            {
+                self.reset(gpu, self.seed);
+            }
+        });
         ui.collapsing("Chemistry & steering", |ui| {
             ui.add(Slider::new(&mut self.params.feed, 0.01..=0.08).text("Feed"));
             ui.add(Slider::new(&mut self.params.kill, 0.03..=0.08).text("Kill"));
@@ -578,6 +791,7 @@ impl World for Symbiosis {
         ui.collapsing("Look", |ui| {
             self.lut.ui(gpu, ui);
             ui.add(Slider::new(&mut self.params.brightness, 0.2..=4.0).text("Brightness"));
+            ui.add(Slider::new(&mut self.params.trail_light, 0.0..=2.0).text("Trail light"));
         });
     }
 

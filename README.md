@@ -14,7 +14,7 @@
   </picture>
 </p>
 
-Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems plus **Symbiosis**, an experiment that couples agents and chemistry, **39 presets** and a *Mutate* button for exploring new settings. A cinematic HDR pipeline is shared by all five worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
+Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems plus **Symbiosis**, an experiment that couples agents and chemistry, **41 presets** and a *Mutate* button for exploring new settings. A cinematic HDR pipeline is shared by all five worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
 
 - [The five worlds](#the-five-worlds)
 - [Features](#features)
@@ -70,9 +70,23 @@ Two virtual chemicals, U and V, react (`U + 2V → 3V`) and diffuse. Depending o
 
 ![Symbiosis: pale agent networks crossing turquoise chemical colonies](docs/images/symbiosis.png)
 
-A coupled-world experiment: Physarum-style agents follow both their own trails and the margins of Gray-Scott chemical growth. Their trails reduce local chemical loss and help growth spread. Both directions respond to one **Coupling strength** slider; at zero, the two simulations keep running independently. This uses a dedicated shared habitat, with a bounded grid to keep larger displays responsive.
+A coupled-world experiment with three **Relationships**. **Cultivate** agents tend growth margins and nourish colonies. **Graze** agents pursue and consume growth, leaving depleted routes behind them. **Weave** agents germinate new growth along their busiest trails. Both directions respond to one **Coupling strength** slider; at zero, chemistry and agents keep running independently. This uses a dedicated shared habitat, with a bounded grid to keep larger displays responsive.
 
-Choose **Living Reef**, **Wandering Veins** or **Coral Maze**, then switch the **View** between Together, Chemistry and Agent trails to inspect the interaction. Changes to coupling take effect immediately; the existing habitat carries its history forward. To compare runs from the same starting point, save a recipe and load it before each experiment. Left-drag seeds chemistry; right-drag clears chemistry and trails. Seeds, parameters, palette and view mode all work with the saved library.
+The presets explore different growth scales, steering and chemical regimes:
+
+| Preset | Relationship | Character |
+|---|---|---|
+| Living Reef | Cultivate | Broad colonies, folded margins and fine supporting trails |
+| Wandering Veins | Graze | Small moving crescents pursued by roaming agents |
+| Coral Maze | Weave | Fine, branching mazes mixed with cellular patches |
+| Spore Tide | Graze | Broken fronts curl into travelling waves and spirals |
+| Root Atlas | Weave | Large, persistent routes become corridors of chemical growth |
+
+**Habitat & growth** controls the pattern scale and a seamless fertility landscape generated from the seed. Choose scattered islands, clustered colonies, living threads or broken wave fronts, then **Restart this seed** to apply the seeding layout. **Mutate** explores these layouts, scale, geography and agent behaviour across all five preset families. **Trail light**, under Look, balances the visible network against the chemistry.
+
+![All five Symbiosis presets after 3600 frames: seed 42 in the top row, seed 314159 below](docs/images/symbiosis-presets.png)
+
+Switch the **View** between Together, Chemistry and Agent trails to inspect the interaction. Changes to the relationship and coupling take effect immediately; the existing habitat carries its history forward. Left-drag seeds chemistry; right-drag clears chemistry and trails. The library keeps the relationship, habitat, seed, settings, palette and view. Earlier recipes retain their original cultivation behaviour, uniform habitat and seeding settings.
 
 Enable **Compare with coupling off** to restart two habitats from the same seed. The left uses your coupling strength; the right holds coupling at zero. All other settings, brush strokes, pan and zoom are shared. **Restart comparison** repeats the experiment from that seed with your current settings; turning comparison off keeps the left habitat running. The mode is saved with your recipe, and earlier saves still open in the single-world view. Press **H / Tab** to give both panes more room. Comparison runs two simulations, so it uses more GPU time and memory.
 
@@ -86,7 +100,7 @@ primordia render --world symbiosis --preset "Wandering Veins" --seed 42 --frames
 ## Features
 
 - **Real-time GPU simulation** in WGSL compute shaders (see [Performance](#performance) for measurements of the four original worlds).
-- **39 presets** and **Mutate** (`M`) for exploring new parameter sets.
+- **41 presets** and **Mutate** (`M`) for exploring new parameter sets.
 - **Interactive.** Paint, feed, attract, repel and erase with the mouse. Zoom into any detail, and pan across the seamless toroidal world.
 - **Cinematic look.** HDR bloom (the Jimenez 13-tap chain with level falloff), AgX, ACES or Reinhard tonemapping, perceptual OKLab palettes, vignette, film grain and dithering.
 - **Live control panel** (egui) exposing every parameter of every world.
@@ -205,7 +219,8 @@ Under the hood, per world:
   - Auto-contrast comes from a GPU histogram.
   - Five lighting materials are available for the height field.
 - **Symbiosis**
-  - Agents sense chemical growth alongside their own trails; trail deposits feed back into the chemistry's local loss rate.
+  - Agents sense chemical growth alongside their own trails. Depending on the relationship, trail deposits nourish existing growth, increase consumption, or germinate new growth along busy routes.
+  - Fixed integer-frequency harmonics create a periodic fertility landscape from the seed. Growth scale and initial seeding provide additional variation.
   - The optional comparison habitat has separate GPU state, the same seed and settings, and zero coupling.
   - Both views share the camera and brush, with matching world scale in each half of the image.
 

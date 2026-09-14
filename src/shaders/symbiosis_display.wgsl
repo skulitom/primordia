@@ -1,6 +1,7 @@
 struct Draw {
     view: ViewXform,
     size: vec2<u32>, layer: u32, brightness: f32,
+    ecology: vec4<f32>, // relationship, trail light, reserved
 };
 @group(0) @binding(0) var<uniform> draw: Draw;
 @group(0) @binding(1) var<storage, read> field: array<vec4<f32>>;
@@ -28,7 +29,8 @@ fn fs_display(in: FullscreenOut) -> @location(0) vec4<f32> {
     let light = 0.4 + 0.6 * max(dot(normal, normalize(vec3<f32>(-0.5, -0.6, 1.0))), 0.0);
     let rim = clamp(length(vec2<f32>(dx, dy)) * 5.0, 0.0, 1.0);
     let chemistry = palette_lookup(lut, samp, 0.08 + 0.64 * v) * (0.12 + 1.2 * v) * light;
-    let network_colour = mix(palette_lookup(lut, samp, 0.92), vec3<f32>(0.95, 0.55, 0.12), 0.45);
+    let network_colour = mix(palette_lookup(lut, samp, 0.92), vec3<f32>(0.95, 0.55, 0.12), 0.45)
+                       * draw.ecology.y;
     var colour = chemistry + network_colour * trail * 0.65
                + palette_lookup(lut, samp, 0.72) * rim * 0.3;
     if draw.layer == 1u { colour = chemistry + palette_lookup(lut, samp, 0.72) * rim * 0.3; }

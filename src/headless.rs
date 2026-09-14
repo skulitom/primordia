@@ -381,7 +381,7 @@ pub fn gallery(job: &GalleryJob) -> Result<()> {
 
 /// Tiles gallery images (quarter size) into one overview image. Each world
 /// starts a new row; rows hold at most `cols` images.
-fn contact_sheet(images: &[(&str, PathBuf)], out: &Path, cols: usize) -> Result<()> {
+pub(crate) fn contact_sheet(images: &[(&str, PathBuf)], out: &Path, cols: usize) -> Result<()> {
     const GAP: u32 = 8;
     const BACKGROUND: image::Rgba<u8> = image::Rgba([11, 13, 18, 255]);
 
