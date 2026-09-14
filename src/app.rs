@@ -1,13 +1,13 @@
 //! Interactive window: winit event loop, wgpu surface, egui control panel.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -18,12 +18,12 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::capture::{self, Readback};
 use crate::gpu::Gpu;
 use crate::headless::{self, Encode};
+use crate::library::{Library, SavedWorld};
 use crate::post::{Post, PostSettings};
 use crate::rng;
-use crate::world::{self, Camera, Frame, Pointer, ViewXform, World, WORLDS};
+use crate::ui::{self as theme, ACCENT, Inspector, WARN};
+use crate::world::{self, Camera, Frame, Pointer, ViewXform, WORLDS, World};
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(94, 234, 212);
-const WARN: egui::Color32 = egui::Color32::from_rgb(255, 90, 90);
 /// Default window size in logical pixels (shrunk to fit small screens).
 const DEFAULT_WINDOW: [u32; 2] = [1600, 900];
 /// Seconds of fade-out / fade-in around each tour transition.
@@ -132,6 +132,10 @@ enum Action {
     Mutate,
     Screenshot,
     ToggleRecording,
+    SaveWorld,
+    LoadWorld(usize),
+    RenameWorld(usize, String),
+    DeleteWorld(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,7 +163,11 @@ impl Shortcut {
     fn repeats(self) -> bool {
         matches!(
             self,
-            Shortcut::Step | Shortcut::PrevPreset | Shortcut::NextPreset | Shortcut::BrushSmaller | Shortcut::BrushBigger
+            Shortcut::Step
+                | Shortcut::PrevPreset
+                | Shortcut::NextPreset
+                | Shortcut::BrushSmaller
+                | Shortcut::BrushBigger
         )
     }
 }
@@ -255,6 +263,13 @@ struct State {
     sim_scale: f32,
     /// Parameters no longer match the named preset (after Mutate).
     modified: bool,
+    seed: u64,
+    world_output_size: [u32; 2],
+    saved_name: Option<String>,
+    library: Library,
+    library_name: String,
+    library_edit: Option<(usize, String)>,
+    library_delete: Option<usize>,
 
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -263,6 +278,7 @@ struct State {
 
     input: Input,
     show_panel: bool,
+    inspector: Inspector,
     paused: bool,
     single_step: bool,
     /// Brush radius in logical points, so it looks the same at any DPI.
@@ -370,13 +386,7 @@ impl State {
         let look = world.post_settings();
 
         let egui_ctx = egui::Context::default();
-        let mut visuals = egui::Visuals::dark();
-        visuals.selection.bg_fill = egui::Color32::from_rgb(22, 120, 110);
-        visuals.hyperlink_color = ACCENT;
-        // Pin the theme: following the OS into light mode would put dark text on
-        // our dark translucent panel.
-        egui_ctx.set_theme(egui::Theme::Dark);
-        egui_ctx.set_visuals_of(egui::Theme::Dark, visuals);
+        theme::configure(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -388,14 +398,7 @@ impl State {
         let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, format, None, 1, false);
         let output_dir = std::path::absolute(&opts.screenshot_dir).unwrap_or_else(|_| opts.screenshot_dir.clone());
 
-        log::info!(
-            "opened {} at {}x{} (world domain {}x{})",
-            world.name(),
-            w,
-            h,
-            world.size()[0],
-            world.size()[1]
-        );
+        log::info!("opened {} at {}x{} (world domain {}x{})", world.name(), w, h, world.size()[0], world.size()[1]);
         let now = Instant::now();
         let stall = crate::stall::Stall::from_env(&gpu);
         let mut state = Self {
@@ -412,12 +415,20 @@ impl State {
             camera: Camera::default(),
             sim_scale: opts.sim_scale,
             modified: false,
+            seed,
+            world_output_size: sim_size,
+            saved_name: None,
+            library: Library::open(crate::library::default_directory()),
+            library_name: String::new(),
+            library_edit: None,
+            library_delete: None,
             egui_ctx,
             egui_state,
             egui_renderer,
             popup_was_open: false,
             input: Input::default(),
             show_panel: !opts.hide_ui,
+            inspector: Inspector::default(),
             paused: false,
             single_step: false,
             brush_pts: 30.0,
@@ -471,6 +482,7 @@ impl State {
     }
 
     fn preset_label(&self) -> String {
+        if let Some(name) = &self.saved_name { return name.clone(); }
         if self.modified { format!("{} (mutated)", self.preset_name()) } else { self.preset_name().to_string() }
     }
 
@@ -526,7 +538,8 @@ impl State {
                         let view = self.view();
                         self.camera.center[0] -= (new[0] - old[0]) / w.max(1) as f32 * view.scale[0];
                         self.camera.center[1] -= (new[1] - old[1]) / h.max(1) as f32 * view.scale[1];
-                        self.camera.center = [self.camera.center[0].rem_euclid(1.0), self.camera.center[1].rem_euclid(1.0)];
+                        self.camera.center =
+                            [self.camera.center[0].rem_euclid(1.0), self.camera.center[1].rem_euclid(1.0)];
                     }
                 }
                 self.input.cursor = Some(new);
@@ -554,7 +567,9 @@ impl State {
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !response.consumed && !self.egui_ctx.wants_keyboard_input() =>
+                if event.state == ElementState::Pressed
+                    && !response.consumed
+                    && !self.egui_ctx.wants_keyboard_input() =>
             {
                 self.on_key(event_loop, &event)?;
             }
@@ -629,12 +644,12 @@ impl State {
     }
 
     fn zoom_at(&mut self, cursor_uv: [f32; 2], factor: f32) {
-        let anchor = self.view().apply(cursor_uv);
+        let anchor = self.world.map_position(self.view(), cursor_uv);
         self.camera.zoom = (self.camera.zoom * factor).clamp(0.5, 64.0);
-        let after = self.view();
+        let after = self.world.map_position(self.view(), cursor_uv);
         self.camera.center = [
-            (anchor[0] - (cursor_uv[0] - 0.5) * after.scale[0]).rem_euclid(1.0),
-            (anchor[1] - (cursor_uv[1] - 0.5) * after.scale[1]).rem_euclid(1.0),
+            (self.camera.center[0] + anchor[0] - after[0]).rem_euclid(1.0),
+            (self.camera.center[1] + anchor[1] - after[1]).rem_euclid(1.0),
         ];
     }
 
@@ -695,6 +710,9 @@ impl State {
                         self.look = self.world.post_settings();
                         self.camera = Camera::default();
                         self.modified = false;
+                        self.seed = seed;
+                        self.world_output_size = size;
+                        self.saved_name = None;
                         self.toast(format!("{} — {}", WORLDS[i].name, WORLDS[i].tagline));
                     }
                 }
@@ -706,11 +724,16 @@ impl State {
                 }
                 self.look = self.world.post_settings();
                 self.modified = false;
+                self.seed = seed;
+                self.saved_name = None;
                 self.toast(self.preset_name().to_string());
             }
             Action::Reset => {
                 if let Some(err) = self.catch_oom(|s| s.world.reset(&s.gpu, seed)) {
                     self.report_oom(&err);
+                } else {
+                    self.seed = seed;
+                    self.saved_name = None;
                 }
             }
             Action::Mutate => {
@@ -720,9 +743,37 @@ impl State {
                 }
                 self.look = self.world.post_settings();
                 self.modified = true;
+                self.seed = seed;
+                self.saved_name = None;
                 self.toast("Mutated".to_string());
             }
             Action::Screenshot => self.pending_screenshot = true,
+            Action::SaveWorld => {
+                let result = self.save_world();
+                match result {
+                    Ok(()) => {
+                        self.library_edit = None;
+                        self.library_delete = None;
+                        self.toast(format!("Saved {} to your library", self.library_name.trim()));
+                    }
+                    Err(e) => self.toast_for(format!("Could not save world: {e:#}"), 6.0),
+                }
+            }
+            Action::LoadWorld(index) => {
+                if let Err(e) = self.load_world(index) { self.toast_for(format!("Could not load world: {e:#}"), 6.0); }
+            }
+            Action::RenameWorld(index, name) => {
+                match self.library.rename(index, &name) {
+                    Ok(()) => { self.library_edit = None; self.library_delete = None; self.toast("Save renamed".into()); }
+                    Err(e) => self.toast_for(format!("Could not rename save: {e:#}"), 6.0),
+                }
+            }
+            Action::DeleteWorld(index) => {
+                match self.library.delete(index) {
+                    Ok(()) => { self.library_edit = None; self.library_delete = None; self.toast("Save removed".into()); }
+                    Err(e) => self.toast_for(format!("Could not remove save: {e:#}"), 6.0),
+                }
+            }
             Action::ToggleRecording => {
                 // A manual choice overrides a pending --record startup request.
                 self.record_start_in = None;
@@ -734,6 +785,37 @@ impl State {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Store a recipe without resetting or stepping the running simulation.
+    fn save_world(&mut self) -> Result<()> {
+        let saved = SavedWorld {
+            version: 1, name: self.library_name.clone(), seed: self.seed,
+            output_size: self.world_output_size, preset: self.world.preset(), modified: self.modified,
+            settings: self.world.settings()?, look: self.look, camera: self.camera,
+        };
+        self.library.save(saved)
+    }
+
+    fn load_world(&mut self, index: usize) -> Result<()> {
+        let saved = self.library.entries.get(index).context("Save no longer exists")?.saved.clone();
+        let (index, world) = saved.instantiate(&self.gpu)?;
+        self.world = world;
+        self.world_index = index;
+        self.world_output_size = saved.output_size;
+        self.seed = saved.seed;
+        self.look = saved.look;
+        self.camera = saved.camera;
+        self.modified = saved.modified;
+        self.saved_name = Some(saved.name.clone());
+        self.library_name = saved.name.clone();
+        self.tour_enabled = false;
+        self.time = 0.0;
+        self.frame = 0;
+        self.paused = false;
+        self.single_step = false;
+        self.toast(format!("Loaded {} · restarted from its saved seed", saved.name));
         Ok(())
     }
 
@@ -770,7 +852,7 @@ impl State {
         let cells_per_px = view.scale[0] * self.world.size()[0] as f32 / tw.max(1) as f32;
         let radius_px = self.brush_pts * self.egui_ctx.pixels_per_point();
         Some(Pointer {
-            pos: view.apply(uv),
+            pos: self.world.map_position(view, uv),
             primary: self.input.left,
             secondary: self.input.right,
             radius: radius_px * cells_per_px,
@@ -922,7 +1004,8 @@ impl State {
         let mut encoder =
             self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
-            let frame = Frame { gpu: &self.gpu, time: self.time, dt, frame: self.frame, view, target_size: target, pointer };
+            let frame =
+                Frame { gpu: &self.gpu, time: self.time, dt, frame: self.frame, view, target_size: target, pointer };
             if !self.paused || self.single_step {
                 self.world.step(&frame, &mut encoder);
                 self.frame += 1;
@@ -953,8 +1036,10 @@ impl State {
 
         // --- egui on top ------------------------------------------------------
         let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: target, pixels_per_point: full_output.pixels_per_point };
-        let extra = self.egui_renderer.update_buffers(&self.gpu.device, &self.gpu.queue, &mut encoder, &paint_jobs, &screen);
+        let screen =
+            egui_wgpu::ScreenDescriptor { size_in_pixels: target, pixels_per_point: full_output.pixels_per_point };
+        let extra =
+            self.egui_renderer.update_buffers(&self.gpu.device, &self.gpu.queue, &mut encoder, &paint_jobs, &screen);
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
@@ -1038,7 +1123,8 @@ impl State {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         );
         let readback = Readback::new(&self.gpu, size, format);
-        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
+        let mut encoder =
+            self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("screenshot") });
         // Reuses this frame's bloom and settings; only the composite is redone.
         self.post.composite(&mut encoder, &view);
         readback.copy_from(&mut encoder, &texture);
@@ -1122,140 +1208,427 @@ impl State {
         self.toast_for(message, 5.0);
     }
 
-    fn draw_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        let preset_label = self.preset_label();
-        if self.show_panel {
-            let frame = egui::Frame::side_top_panel(&ctx.style())
-                .fill(egui::Color32::from_rgba_unmultiplied(10, 12, 18, 225))
-                .inner_margin(egui::Margin::same(12));
-            egui::SidePanel::left("controls").resizable(false).exact_width(310.0).frame(frame).show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.label(egui::RichText::new("PRIMORDIA").size(24.0).strong().color(ACCENT));
-                    ui.label(egui::RichText::new("artificial life on the GPU").weak().italics());
-                    ui.label(
-                        egui::RichText::new(format!("{:.0} fps · {}", self.fps, self.gpu_name)).small().weak(),
-                    );
-                    ui.separator();
+    fn draw_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let compact = ui.available_height() < 680.0 || ui.available_width() < 310.0;
+        let short = ui.available_height() < 520.0;
 
+        // Reserve capture controls before laying out the scrolling inspector.
+        egui::TopBottomPanel::bottom("capture controls")
+            .frame(egui::Frame::new().fill(theme::PANEL))
+            .show_separator_line(false)
+            .show_inside(ui, |ui| {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                let width = (ui.available_width() - 8.0) / 2.0;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized([width, 34.0], egui::Button::new("Save image"))
+                        .on_hover_text(format!("Save a PNG without the UI (F12)\n{}", self.output_dir.display()))
+                        .clicked()
+                    {
+                        actions.push(Action::Screenshot);
+                    }
+                    let recording = self.recorder.is_some();
+                    let text = egui::RichText::new(if recording { "Stop recording" } else { "Record video" })
+                        .color(if recording { WARN } else { theme::TEXT });
+                    if ui
+                        .add_sized([width, 34.0], egui::Button::new(text))
+                        .on_hover_text("Start / stop an MP4 recording (V)")
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleRecording);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    theme::status_dot(ui, ACCENT);
+                    ui.label(egui::RichText::new(format!("{:.0} fps", self.fps)).small().color(ACCENT))
+                        .on_hover_text(self.gpu_name.as_str());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new("PNG / MP4 · clean capture").small().weak())
+                            .on_hover_text(format!("Saved to {}", self.output_dir.display()));
+                    });
+                });
+            });
+
+        if short {
+            // At the minimum window height, let the whole workspace scroll so
+            // every control remains reachable above the fixed capture bar.
+            egui::ScrollArea::vertical().id_salt("compact workspace").auto_shrink([false, false]).show(ui, |ui| {
+                self.draw_panel_content(ui, actions, compact, false);
+            });
+        } else {
+            self.draw_panel_content(ui, actions, compact, true);
+        }
+    }
+
+    fn draw_panel_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<Action>,
+        compact: bool,
+        scroll_inspector: bool,
+    ) {
+        ui.horizontal(|ui| {
+            theme::mark(ui);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(egui::RichText::new("Primordia").size(23.0).strong());
+                ui.label(egui::RichText::new("ARTIFICIAL LIFE LAB").size(10.0).color(theme::MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_sized([28.0, 28.0], egui::Button::new("‹").frame(false))
+                    .on_hover_text("Collapse the control panel (H / Tab)")
+                    .clicked()
+                {
+                    self.show_panel = false;
+                }
+            });
+        });
+        ui.add_space(if compact { 4.0 } else { 12.0 });
+
+        theme::eyebrow(ui, "EXPLORE A WORLD");
+        if compact {
+            egui::ComboBox::from_id_salt("world picker")
+                .width(ui.available_width())
+                .selected_text(self.world.name())
+                .show_ui(ui, |ui| {
                     for (i, entry) in WORLDS.iter().enumerate() {
-                        let selected = i == self.world_index;
-                        let text = egui::RichText::new(format!("{}  {}", i + 1, entry.name)).size(15.0);
-                        if ui.selectable_label(selected, text).on_hover_text(entry.tagline).clicked() && !selected {
+                        if ui
+                            .selectable_label(i == self.world_index, format!("{}   {}", i + 1, entry.name))
+                            .on_hover_text(entry.tagline)
+                            .clicked()
+                            && i != self.world_index
+                        {
                             actions.push(Action::SwitchWorld(i));
                         }
                     }
-                    ui.label(egui::RichText::new(WORLDS[self.world_index].tagline).weak().italics());
-                    ui.label(egui::RichText::new(self.world.controls_hint()).small().color(ACCENT));
-                    ui.separator();
-
-                    let presets = self.world.presets();
-                    let current = self.world.preset();
-                    let n = presets.len();
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(n > 1, egui::Button::new("◀")).on_hover_text("Previous preset ( , )").clicked() {
-                            actions.push(Action::LoadPreset((current + n - 1) % n));
+                });
+        } else {
+            let width = (ui.available_width() - 8.0) / 2.0;
+            for row in (0..WORLDS.len()).step_by(2) {
+                let width = if row + 1 == WORLDS.len() { ui.available_width() } else { width };
+                ui.horizontal(|ui| {
+                    for (i, entry) in WORLDS.iter().enumerate().skip(row).take(2) {
+                        let detail = match entry.id {
+                            "physarum" => "Slime-mould networks",
+                            "particle-life" => "Interacting species",
+                            "lenia" => "Soft cellular organisms",
+                            "reaction-diffusion" => "Living chemistry",
+                            "symbiosis" => "Agents + chemistry · coupled worlds",
+                            _ => "Artificial life",
+                        };
+                        if theme::world_card(ui, width, entry.name, detail, i == self.world_index)
+                            .on_hover_text(format!("{}\n\nSwitch world: {}", entry.tagline, i + 1))
+                            .clicked()
+                            && i != self.world_index
+                        {
+                            actions.push(Action::SwitchWorld(i));
                         }
-                        egui::ComboBox::from_id_salt("preset").selected_text(preset_label.as_str()).width(200.0).show_ui(
-                            ui,
-                            |ui| {
-                                for (i, name) in presets.iter().enumerate() {
-                                    if ui.selectable_label(i == current, *name).clicked() {
-                                        actions.push(Action::LoadPreset(i));
-                                    }
-                                }
-                            },
-                        );
-                        if ui.add_enabled(n > 1, egui::Button::new("▶")).on_hover_text("Next preset ( . )").clicked() {
-                            actions.push(Action::LoadPreset((current + 1) % n));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Reset").on_hover_text("Restart from a new seed (R)").clicked() {
-                            actions.push(Action::Reset);
-                        }
-                        if ui.button("Mutate").on_hover_text("Random new parameters (M)").clicked() {
-                            actions.push(Action::Mutate);
-                        }
-                        let label = if self.paused { "Play" } else { "Pause" };
-                        if ui.button(label).on_hover_text("Space").clicked() {
-                            self.paused = !self.paused;
-                        }
-                        if ui.button("Step").on_hover_text("Advance one frame (N)").clicked() {
-                            self.paused = true;
-                            self.single_step = true;
-                        }
-                    });
-                    let stats = self.world.stats();
-                    if !stats.is_empty() {
-                        ui.label(egui::RichText::new(stats).monospace().small());
                     }
-                    ui.separator();
+                });
+            }
+        }
+        ui.add_space(4.0);
 
-                    egui::CollapsingHeader::new("Simulation").default_open(true).show(ui, |ui| {
-                        self.world.ui(&self.gpu, ui);
-                    });
-                    egui::CollapsingHeader::new("Look").show(ui, |ui| {
-                        self.look.ui(ui);
-                        if ui.button("Restore preset look").clicked() {
-                            self.look = self.world.post_settings();
+        let presets = self.world.presets();
+        let current = self.world.preset();
+        let n = presets.len();
+        ui.horizontal(|ui| {
+            theme::eyebrow(ui, "PRESET");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(format!("{:02} / {n:02}", (current + 1).min(n))).monospace().weak());
+                if self.modified {
+                    ui.label(egui::RichText::new("MUTATED").size(10.0).color(ACCENT));
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let picker_width = ui.available_width() - 80.0;
+            if ui
+                .add_enabled(n > 1, egui::Button::new("‹").min_size(egui::vec2(32.0, 30.0)))
+                .on_hover_text("Previous preset ( , )")
+                .clicked()
+            {
+                actions.push(Action::LoadPreset((current + n - 1) % n));
+            }
+            egui::ComboBox::from_id_salt("preset")
+                .selected_text(self.preset_name())
+                .width(picker_width)
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    ui.set_min_width(picker_width);
+                    for (i, name) in presets.iter().enumerate() {
+                        if ui.selectable_label(i == current, *name).clicked() {
+                            actions.push(Action::LoadPreset(i));
                         }
-                    });
-                    egui::CollapsingHeader::new("Brush & camera").show(ui, |ui| {
-                        ui.label(egui::RichText::new(self.world.controls_hint()).weak());
-                        ui.add(egui::Slider::new(&mut self.brush_pts, 2.0..=400.0).logarithmic(true).text("Brush radius"));
-                        ui.add(egui::Slider::new(&mut self.camera.zoom, 0.5..=64.0).logarithmic(true).text("Zoom"));
-                        if ui.button("Reset view (0)").clicked() {
-                            self.camera = Camera::default();
-                        }
-                    });
-                    egui::CollapsingHeader::new("Tour").show(ui, |ui| {
-                        ui.label(egui::RichText::new("Screensaver: fade through every preset of every world.").weak());
-                        if ui.checkbox(&mut self.tour_enabled, "Tour mode (T)").changed() {
-                            self.tour_clock = TOUR_FADE;
-                        }
-                        ui.add(egui::Slider::new(&mut self.tour_secs, TOUR_RANGE).logarithmic(true).text("Seconds / preset"));
-                        if self.tour_enabled {
-                            let left = (self.tour_secs - self.tour_clock).max(0.0);
-                            ui.label(egui::RichText::new(format!("next in {left:.0}s")).small().weak());
-                        }
-                    });
-                    egui::CollapsingHeader::new("Keys").show(ui, |ui| {
-                        egui::Grid::new("keys").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
-                            for (k, v) in [
-                                ("1-4", "switch world"),
-                                (", / .", "previous / next preset"),
-                                ("R / M", "reset / mutate"),
-                                ("Space / N", "pause / single step"),
-                                ("Wheel", "zoom at cursor"),
-                                ("Middle drag", "pan"),
-                                ("[ / ]", "brush size"),
-                                ("H / Tab", "hide panel"),
-                                ("F / F11", "fullscreen"),
-                                ("S / F12", "screenshot"),
-                                ("V", "record video (MP4)"),
-                                ("T", "tour mode"),
-                                ("0 / Home", "reset view"),
-                                ("Esc", "leave fullscreen · Esc Esc quits"),
-                            ] {
-                                ui.label(egui::RichText::new(k).monospace().color(ACCENT));
-                                ui.label(v);
-                                ui.end_row();
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
+                    }
+                });
+            if ui
+                .add_enabled(n > 1, egui::Button::new("›").min_size(egui::vec2(32.0, 30.0)))
+                .on_hover_text("Next preset ( . )")
+                .clicked()
+            {
+                actions.push(Action::LoadPreset((current + 1) % n));
+            }
+        });
+
+        ui.add_space(2.0);
+        let width = ui.available_width();
+        ui.horizontal(|ui| {
+            let label = if self.paused { "Resume" } else { "Pause" };
+            let text = egui::RichText::new(label).strong().color(if self.paused { theme::PANEL } else { ACCENT });
+            let button = egui::Button::new(text).fill(if self.paused { ACCENT } else { theme::SELECTED });
+            if ui
+                .add_sized([width - 88.0, 34.0], button)
+                .on_hover_text("Pause / resume the simulation (Space)")
+                .clicked()
+            {
+                self.paused = !self.paused;
+            }
+            if ui
+                .add_sized([80.0, 34.0], egui::Button::new("Step ›"))
+                .on_hover_text("Pause and advance one frame (N)")
+                .clicked()
+            {
+                self.paused = true;
+                self.single_step = true;
+            }
+        });
+        let action_widths = theme::button_widths(ui, ["Reset", "Mutate", "Save settings"]);
+        ui.horizontal(|ui| {
+            if ui
+                .add_sized([action_widths[0], 30.0], egui::Button::new("Reset"))
+                .on_hover_text("Restart with a new seed, keeping these parameters (R)")
+                .clicked()
+            {
+                actions.push(Action::Reset);
+            }
+            if ui
+                .add_sized([action_widths[1], 30.0], egui::Button::new(egui::RichText::new("Mutate").color(ACCENT)))
+                .on_hover_text("Discover a new set of parameters (M)")
+                .clicked()
+            {
+                actions.push(Action::Mutate);
+            }
+            if ui.add_sized([action_widths[2], 30.0], egui::Button::new("Save settings"))
+                .on_hover_text("Name and keep this world in your saved library").clicked() {
+                self.inspector = Inspector::Library;
+                if self.library_name.is_empty() { self.library_name = self.preset_label(); }
+            }
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        theme::inspector_tabs(ui, &mut self.inspector);
+        ui.add_space(4.0);
+        if scroll_inspector {
+            egui::ScrollArea::vertical()
+                .id_salt(("inspector", self.inspector, self.world_index))
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.draw_inspector(ui, actions));
+        } else {
+            self.draw_inspector(ui, actions);
+        }
+    }
+
+    fn draw_inspector(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // Leave breathing room between controls and the scroll rail.
+        ui.set_width(ui.available_width() - 6.0);
+        match self.inspector {
+            Inspector::World => {
+                theme::section(ui, "World parameters", WORLDS[self.world_index].tagline);
+                ui.label(egui::RichText::new(self.world.stats()).small().color(theme::MUTED));
+                ui.add_space(4.0);
+                ui.push_id(self.world.id(), |ui| self.world.ui(&self.gpu, ui));
+            }
+            Inspector::Look => {
+                theme::section(ui, "Shape the light", "Finish the image with bloom, colour and film effects.");
+                self.look.ui(ui);
+                ui.add_space(8.0);
+                if ui
+                    .button("Restore preset appearance")
+                    .on_hover_text("Reset these effects to the active preset's defaults")
+                    .clicked()
+                {
+                    self.look = self.world.post_settings();
+                }
+                ui.label(
+                    egui::RichText::new("World-specific colours and materials are in the World tab.").small().weak(),
+                );
+            }
+            Inspector::Tools => self.draw_tools(ui),
+            Inspector::Library => self.draw_library(ui, actions),
+        }
+        ui.add_space(12.0);
+    }
+
+    fn draw_library(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        theme::section(ui, "Saved worlds", "Keep a discovery. Return to it whenever you like.");
+        ui.add(egui::TextEdit::singleline(&mut self.library_name).hint_text("Name this world…").char_limit(100).desired_width(f32::INFINITY));
+        if ui.add_enabled_ui(!self.library_name.trim().is_empty(), |ui| {
+            ui.add_sized([ui.available_width(), 32.0], egui::Button::new(egui::RichText::new("Save current world").color(ACCENT)).fill(theme::SELECTED))
+        }).inner.clicked() {
+            actions.push(Action::SaveWorld);
+        }
+        ui.label(egui::RichText::new(format!("Seed {}", self.seed)).monospace().small().weak());
+        ui.label(egui::RichText::new("Saves the seed, world settings, appearance and view. Loading restarts the simulation; it does not resume this exact frame.").small().weak());
+        ui.add_space(4.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            theme::eyebrow(ui, &format!("YOUR LIBRARY · {}", self.library.entries.len()));
+            if ui.small_button("Refresh").clicked() {
+                self.library.refresh(); self.library_edit = None; self.library_delete = None;
+            }
+        });
+        if self.library.entries.is_empty() {
+            ui.label("Your favourite worlds will appear here.");
+        }
+        for (index, entry) in self.library.entries.iter().enumerate() {
+            ui.push_id(&entry.path, |ui| {
+                egui::Frame::new().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .inner_margin(12).corner_radius(8).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(egui::RichText::new(&entry.saved.name).strong().color(ACCENT));
+                    let world_index = world::find(entry.saved.settings.world_id()).unwrap_or(0);
+                    ui.label(egui::RichText::new(WORLDS[world_index].name).small().weak())
+                        .on_hover_text(format!("Seed {}", entry.saved.seed));
                     ui.horizontal(|ui| {
-                        if ui.button("Screenshot (F12)").clicked() {
-                            actions.push(Action::Screenshot);
+                        if ui.add_sized([64.0, 30.0], egui::Button::new(egui::RichText::new("Load").color(ACCENT)).fill(theme::SELECTED)).clicked() {
+                            actions.push(Action::LoadWorld(index));
                         }
-                        let label = if self.recorder.is_some() { "Stop recording (V)" } else { "Record video (V)" };
-                        if ui.button(label).clicked() {
-                            actions.push(Action::ToggleRecording);
-                        }
+                        if ui.add(egui::Button::new("Rename").frame(false)).clicked() { self.library_edit = Some((index, entry.saved.name.clone())); self.library_delete = None; }
+                        if ui.add(egui::Button::new(egui::RichText::new("Delete").color(theme::MUTED)).frame(false)).clicked() { self.library_delete = Some(index); self.library_edit = None; }
                     });
-                    ui.label(egui::RichText::new(format!("Saved to {}", self.output_dir.display())).small().weak());
+                    if let Some((editing, name)) = &mut self.library_edit {
+                        if *editing == index {
+                            ui.add(egui::TextEdit::singleline(name).char_limit(100).desired_width(f32::INFINITY));
+                            let mut cancel = false;
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Keep name")).clicked() { actions.push(Action::RenameWorld(index, name.clone())); }
+                                cancel = ui.button("Cancel").clicked();
+                            });
+                            if cancel { self.library_edit = None; }
+                        }
+                    }
+                    if self.library_delete == Some(index) {
+                        ui.label("Remove this save from your library?");
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("Remove save").color(WARN)).clicked() { actions.push(Action::DeleteWorld(index)); }
+                            if ui.button("Cancel").clicked() { self.library_delete = None; }
+                        });
+                    }
                 });
             });
+        }
+        for warning in &self.library.warnings { ui.colored_label(WARN, warning); }
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("Library folder\n{}", self.library.directory.display())).small().weak());
+    }
+
+    fn draw_tools(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Interact & explore", self.world.controls_hint());
+        ui.add(crate::ui::Slider::new(&mut self.brush_pts, 2.0..=400.0).logarithmic(true).text("Brush radius"));
+        ui.add(crate::ui::Slider::new(&mut self.camera.zoom, 0.5..=64.0).logarithmic(true).suffix("×").text("Zoom"));
+        ui.horizontal(|ui| {
+            if ui.button("Reset view").on_hover_text("Centre the camera and reset zoom (0 / Home)").clicked() {
+                self.camera = Camera::default();
+            }
+            let label = if self.window.fullscreen().is_some() { "Leave fullscreen" } else { "Fullscreen" };
+            if ui.button(label).on_hover_text("Toggle fullscreen (F / F11)").clicked() {
+                self.toggle_fullscreen();
+            }
+        });
+        ui.label(egui::RichText::new("Scroll to zoom · Middle-drag to pan").small().weak());
+        ui.add_space(8.0);
+        ui.separator();
+        theme::section(ui, "Take a tour", "Fade through every preset of every world.");
+        if ui.checkbox(&mut self.tour_enabled, "Enable tour").on_hover_text("Toggle tour mode (T)").changed() {
+            self.tour_clock = TOUR_FADE;
+        }
+        ui.add(crate::ui::Slider::new(&mut self.tour_secs, TOUR_RANGE).logarithmic(true).text("Seconds / preset"));
+        if self.tour_enabled {
+            let left = (self.tour_secs - self.tour_clock).max(0.0);
+            ui.add(
+                egui::ProgressBar::new((self.tour_clock / self.tour_secs).clamp(0.0, 1.0))
+                    .fill(theme::SELECTED)
+                    .text(format!("Next preset in {left:.0}s")),
+            );
+        }
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Keyboard shortcuts").show(ui, |ui| {
+            egui::Grid::new("keys").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("1–5", "Switch world"),
+                    (", / .", "Previous / next preset"),
+                    ("R / M", "Reset / mutate"),
+                    ("Space / N", "Pause / single step"),
+                    ("[ / ]", "Brush size"),
+                    ("H / Tab", "Hide / show controls"),
+                    ("F / F11", "Fullscreen"),
+                    ("S / F12", "Save image"),
+                    ("V", "Record video"),
+                    ("T", "Tour mode"),
+                    ("0 / Home", "Reset view"),
+                    ("Esc", "Leave fullscreen"),
+                    ("Esc Esc", "Quit"),
+                ] {
+                    ui.label(egui::RichText::new(k).monospace().color(ACCENT));
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
+        });
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("Capture folder\n{}", self.output_dir.display())).small().weak());
+    }
+
+    fn draw_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let preset_label = self.preset_label();
+        if self.show_panel {
+            theme::control_panel(ctx).show(ctx, |ui| self.draw_panel(ui, actions));
+
+            // The identity follows the panel edge, leaving the artwork centre clear.
+            if ctx.available_rect().width() > 480.0 && self.world.comparison_labels().is_none() {
+                egui::Area::new(egui::Id::new("world identity"))
+                    .fixed_pos(ctx.available_rect().min + egui::vec2(24.0, 24.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        theme::overlay().show(ui, |ui| {
+                            ui.set_width(236.0);
+                            theme::eyebrow(ui, &self.world.name().to_uppercase());
+                            ui.label(egui::RichText::new(preset_label.as_str()).size(19.0).color(theme::TEXT));
+                        });
+                    });
+            }
+        } else {
+            egui::Area::new(egui::Id::new("show controls"))
+                .fixed_pos(egui::pos2(16.0, 16.0))
+                .show(ctx, |ui| {
+                    if ui.add_sized([112.0, 32.0], egui::Button::new(egui::RichText::new("›  Controls").color(ACCENT))
+                        .fill(theme::PANEL.gamma_multiply(0.94)).corner_radius(8))
+                        .on_hover_text("Open the control panel (H / Tab)").clicked() {
+                        self.show_panel = true;
+                    }
+                });
+        }
+
+        if let Some(labels) = self.world.comparison_labels() {
+            let screen = ctx.screen_rect();
+            let midpoint = screen.center().x;
+            for (i, label) in labels.iter().enumerate() {
+                let left = if i == 0 { ctx.available_rect().left() } else { midpoint };
+                let right = if i == 0 { midpoint } else { screen.right() };
+                if right - left < 156.0 { continue; }
+                egui::Area::new(egui::Id::new(("comparison label", i)))
+                    .fixed_pos(egui::pos2(left + 16.0, 68.0))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        theme::overlay().show(ui, |ui| {
+                            theme::eyebrow(ui, label);
+                        });
+                    });
+            }
         }
 
         // Status badges (top right): recording and paused.
@@ -1265,14 +1638,17 @@ impl State {
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
                 .interactable(false)
                 .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    theme::overlay().show(ui, |ui| {
+                        ui.set_min_width(118.0);
                         if let Some(secs) = recording {
-                            ui.label(
-                                egui::RichText::new(format!("● REC {:02}:{:02}", secs / 60, secs % 60))
-                                    .monospace()
-                                    .color(WARN)
-                                    .strong(),
-                            );
+                            ui.horizontal(|ui| {
+                                theme::status_dot(ui, WARN);
+                                ui.label(
+                                    egui::RichText::new(format!("REC {:02}:{:02}", secs / 60, secs % 60))
+                                        .monospace()
+                                        .color(WARN),
+                                );
+                            });
                         }
                         if self.paused {
                             ui.label(egui::RichText::new("PAUSED").monospace().strong());
@@ -1290,7 +1666,8 @@ impl State {
                     .interactable(false)
                     .show(ctx, |ui| {
                         ui.set_opacity(alpha);
-                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        theme::overlay().show(ui, |ui| {
+                            ui.set_max_width((ctx.screen_rect().width() - 60.0).max(200.0));
                             ui.label(egui::RichText::new(toast.text.as_str()).size(15.0));
                         });
                     });

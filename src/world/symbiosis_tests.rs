@@ -1,0 +1,383 @@
+use super::*;
+use crate::world::Camera;
+
+fn read<T: Pod>(gpu: &Gpu, source: &wgpu::Buffer) -> Vec<T> {
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("symbiosis test readback"),
+        size: source.size(),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(source, 0, &buffer, 0, source.size());
+    gpu.queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+    gpu.wait_idle();
+    rx.recv().unwrap().unwrap();
+    let values = bytemuck::cast_slice(&buffer.slice(..).get_mapped_range()).to_vec();
+    buffer.unmap();
+    values
+}
+
+fn advance(gpu: &Gpu, world: &mut Symbiosis, frames: u32) {
+    for n in 0..frames {
+        let frame = Frame {
+            gpu,
+            time: n as f32 / 60.0,
+            dt: 1.0 / 60.0,
+            frame: n as u64,
+            view: ViewXform::fit(world.size, world.size, &Camera::default()),
+            target_size: world.size,
+            pointer: None,
+        };
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        world.step(&frame, &mut encoder);
+        gpu.queue.submit([encoder.finish()]);
+        if n % 32 == 31 {
+            gpu.wait_idle();
+        }
+    }
+    gpu.wait_idle();
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}
+
+fn chemicals(field: &[[f32; 4]]) -> Vec<[f32; 2]> {
+    field.iter().map(|f| [f[0], f[1]]).collect()
+}
+
+#[test]
+fn gpu_feedback_works_in_both_directions_and_zero_decouples() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    // Odd sub-step counts also exercise alternating frame-start bind groups.
+    world.params.steps = 7;
+    let count = world.count;
+    for coupling in [0.0, 1.0] {
+        world.params.coupling = coupling;
+        world.count = count;
+        world.reset(&gpu, 42);
+        advance(&gpu, &mut world, 40);
+        let original = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+        let original_agents = read::<u8>(&gpu, &world.agents);
+
+        world.reset(&gpu, 42);
+        advance(&gpu, &mut world, 40);
+        assert_eq!(original, read::<[f32; 4]>(&gpu, &world.fields[world.current]), "reset must reproduce the habitat");
+        assert_eq!(original_agents, read::<u8>(&gpu, &world.agents), "reset must reproduce the agents");
+
+        // Remove the agents, retaining identical chemical seeds and parameters.
+        world.reset(&gpu, 42);
+        world.count = 0;
+        advance(&gpu, &mut world, 40);
+        let no_agents = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+        if coupling == 0.0 {
+            assert_eq!(chemicals(&original), chemicals(&no_agents));
+        } else {
+            let delta: f32 = original.iter().zip(&no_agents).map(|(a, b)| (a[1] - b[1]).abs()).sum();
+            assert!(delta > 0.1, "agent trails must change the chemistry: {delta}");
+        }
+
+        // Remove the chemical seeds, retaining identical agents.
+        world.count = count;
+        world.reset(&gpu, 42);
+        let empty = vec![[1.0_f32, 0.0, 0.0, 0.0]; (world.size[0] * world.size[1]) as usize];
+        for buffer in &world.fields {
+            gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&empty));
+        }
+        advance(&gpu, &mut world, 40);
+        let no_chemistry = read::<u8>(&gpu, &world.agents);
+        if coupling == 0.0 {
+            assert_eq!(original_agents, no_chemistry);
+        } else {
+            assert_ne!(original_agents, no_chemistry, "chemistry must steer the agents");
+        }
+    }
+}
+
+#[test]
+fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [160, 120], 42);
+    for (index, name) in PRESETS.iter().enumerate() {
+        world.load_preset(&gpu, index, 42);
+        world.params.coupling = 1.0;
+        advance(&gpu, &mut world, 1800);
+        let field = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+        for f in &field {
+            assert!(f.iter().all(|v| v.is_finite()), "{name}: {f:?}");
+            assert!((0.0..=1.0).contains(&f[0]) && (0.0..=1.0).contains(&f[1]), "{name}: {f:?}");
+            assert!((0.0..=32.0).contains(&f[2]), "{name}: {f:?}");
+        }
+        let occupied = field.iter().filter(|f| f[1] > 0.1).count() as f32 / field.len() as f32;
+        let trail: f32 = field.iter().map(|f| f[2]).sum::<f32>() / field.len() as f32;
+        println!("{name}: occupied {occupied:.3}, mean trail {trail:.3}");
+        assert!((0.01..0.95).contains(&occupied), "{name} should retain growth and open ground");
+        assert!(trail > 0.01, "{name} should retain agent trails");
+        for agent in read::<Agent>(&gpu, &world.agents) {
+            assert!((0.0..world.size[0] as f32).contains(&agent.pos[0]));
+            assert!((0.0..world.size[1] as f32).contains(&agent.pos[1]));
+            assert!(agent.heading.is_finite());
+        }
+    }
+}
+
+#[test]
+fn gpu_brush_wraps_at_the_edges_and_display_layers_leave_simulation_unchanged() {
+    let _guard = crate::gpu::test_lock();
+    use crate::capture::{self, Readback};
+    use crate::post::Post;
+    use crate::world::Pointer;
+
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    let blank = vec![[1.0_f32, 0.0, 0.0, 0.0]; 96 * 80];
+    for buffer in &world.fields {
+        gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&blank));
+    }
+    let mut frame = Frame {
+        gpu: &gpu,
+        time: 0.0,
+        dt: 1.0 / 60.0,
+        frame: 0,
+        view: ViewXform::fit(world.size, world.size, &Camera::default()),
+        target_size: world.size,
+        pointer: Some(Pointer { pos: [-0.005, 1.005], primary: true, secondary: false, radius: 8.0 }),
+    };
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    world.step(&frame, &mut encoder);
+    gpu.queue.submit([encoder.finish()]);
+    let painted = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+    let corners = [0, 95, 96 * 79, 96 * 80 - 1];
+    assert!(corners.iter().all(|&i| painted[i][1] > 0.1), "brush must paint across both wrapped edges");
+    assert!(painted[96 * 40 + 48][1] < 0.001, "brush must stay local");
+    frame.pointer = frame.pointer.map(|p| Pointer { primary: false, secondary: true, ..p });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    world.step(&frame, &mut encoder);
+    gpu.queue.submit([encoder.finish()]);
+    let erased = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+    assert!(corners.iter().all(|&i| erased[i][1] < painted[i][1] * 0.5));
+
+    world.reset(&gpu, 42);
+    advance(&gpu, &mut world, 120);
+    let before = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+    let size = [384, 320];
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let post = Post::new(&gpu, size, format);
+    let (texture, target) = gpu.texture_2d(
+        "symbiosis layer test",
+        size,
+        format,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let readback = Readback::new(&gpu, size, format);
+    let mut views = Vec::new();
+    frame.pointer = None;
+    frame.target_size = size;
+    frame.view = ViewXform::fit(world.size, size, &Camera { zoom: 0.5, ..Camera::default() });
+    for layer in [Layer::Together, Layer::Chemistry, Layer::Trails] {
+        world.params.layer = layer;
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        world.render(&frame, &mut encoder, post.scene_view());
+        post.run(&gpu, &mut encoder, &world.post, 0.0, &target);
+        readback.copy_from(&mut encoder, &texture);
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = readback.read(&gpu).unwrap();
+        let path = format!("target/symbiosis-preview/layer-{}.png", layer as u32);
+        capture::save_png(std::path::Path::new(&path), size, pixels.clone()).unwrap();
+        views.push(pixels);
+    }
+    assert_ne!(views[0], views[1]);
+    assert_ne!(views[0], views[2]);
+    assert_ne!(views[1], views[2]);
+    assert_eq!(before, read::<[f32; 4]>(&gpu, &world.fields[world.current]));
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}
+
+#[test]
+#[ignore = "renders the Symbiosis presets to target/symbiosis-preview"]
+fn render_symbiosis_previews() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    for name in PRESETS {
+        let mut job = crate::headless::RenderJob::new("symbiosis");
+        job.preset = Some((*name).to_owned());
+        job.seed = 42;
+        job.size = [1280, 800];
+        job.frames = 720;
+        job.max_fps = 240.0;
+        job.out = Some(format!("target/symbiosis-preview/{}.png", name.to_lowercase().replace(' ', "-")).into());
+        crate::headless::render_with(&gpu, &job).unwrap();
+    }
+}
+
+#[test]
+fn comparison_replays_the_seed_stays_independent_and_restores_saved_settings() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    let initial = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+    advance(&gpu, &mut world, 25);
+    world.set_comparison(&gpu, true);
+    assert_eq!(initial, read::<[f32; 4]>(&gpu, &world.fields[world.current]), "enabling starts from the seed");
+    let reference = world.reference.as_ref().unwrap();
+    assert!(reference.reference.is_none());
+    assert_eq!(initial, read::<[f32; 4]>(&gpu, &reference.fields[reference.current]));
+    assert_eq!(read::<u8>(&gpu, &world.agents), read::<u8>(&gpu, &reference.agents));
+
+    world.params.steps = 7;
+    world.params.speed = 2.1;
+    world.params.coupling = 0.0;
+    advance(&gpu, &mut world, 75);
+    let reference = world.reference.as_ref().unwrap();
+    assert_eq!(reference.params.speed, world.params.speed);
+    assert_eq!(
+        read::<[f32; 4]>(&gpu, &world.fields[world.current]),
+        read::<[f32; 4]>(&gpu, &reference.fields[reference.current]),
+        "both sides must match when coupling is zero"
+    );
+
+    world.params.coupling = 0.9;
+    world.reset(&gpu, world.seed);
+    let recipe = world.settings().unwrap();
+    advance(&gpu, &mut world, 75);
+    let coupled = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
+    let reference = world.reference.as_ref().unwrap();
+    let uncoupled = read::<[f32; 4]>(&gpu, &reference.fields[reference.current]);
+    assert_ne!(coupled, uncoupled, "feedback should produce a different habitat");
+    assert_eq!(reference.params.coupling, 0.0);
+    world.set_comparison(&gpu, false);
+    assert!(world.reference.is_none());
+    assert_eq!(
+        coupled,
+        read::<[f32; 4]>(&gpu, &world.fields[world.current]),
+        "leaving comparison keeps the current state"
+    );
+
+    let decoded: WorldSettings = serde_json::from_str(&serde_json::to_string(&recipe).unwrap()).unwrap();
+    world.restore_settings(&gpu, &decoded, 42).unwrap();
+    advance(&gpu, &mut world, 75);
+    assert_eq!(coupled, read::<[f32; 4]>(&gpu, &world.fields[world.current]));
+    let reference = world.reference.as_ref().unwrap();
+    assert_eq!(uncoupled, read::<[f32; 4]>(&gpu, &reference.fields[reference.current]));
+
+    world.load_preset(&gpu, 1, 73);
+    assert!(world.params.compare);
+    assert_eq!(world.reference.as_ref().unwrap().seed, 73);
+    world.mutate(&gpu, 91);
+    assert!(world.params.compare);
+    assert_eq!(world.reference.as_ref().unwrap().seed, 91);
+
+    // A recipe written before comparison existed must still load unchanged.
+    let mut old_recipe = serde_json::to_value(recipe).unwrap();
+    old_recipe["params"].as_object_mut().unwrap().remove("compare");
+    let legacy: WorldSettings = serde_json::from_value(old_recipe).unwrap();
+    world.restore_settings(&gpu, &legacy, 42).unwrap();
+    assert!(!world.params.compare && world.reference.is_none());
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}
+
+#[test]
+fn comparison_maps_brushes_and_zoom_to_the_same_place_in_both_panes() {
+    let _guard = crate::gpu::test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [96, 80], 42);
+    world.set_comparison(&gpu, true);
+    for target in [[1280, 800], [801, 600], [320, 900]] {
+        let camera = Camera { center: [-0.2, 1.3], zoom: 2.4 };
+        let view = ViewXform::fit(world.size, target, &camera);
+        for left in [[0.125, 0.3], [0.25, 0.5], [0.375, 0.7]] {
+            let right = [left[0] + 0.5, left[1]];
+            let a = world.map_position(view, left);
+            let b = world.map_position(view, right);
+            assert_eq!(a, b, "corresponding points must paint the same cells");
+            // Match the cropped viewport used by draw_region.
+            let pane = ViewXform {
+                scale: [view.scale[0] * 0.5, view.scale[1]],
+                offset: [view.offset[0] + view.scale[0] * 0.25, view.offset[1]],
+            };
+            let rendered = pane.apply([left[0] * 2.0, left[1]]);
+            assert!(a.iter().zip(rendered).all(|(a, b)| (a - b).abs() < 1e-6));
+            for uv in [left, right] {
+                let anchor = world.map_position(view, uv);
+                let mut zoomed = Camera { zoom: camera.zoom * 1.5, ..camera };
+                let after = world.map_position(ViewXform::fit(world.size, target, &zoomed), uv);
+                zoomed.center = [zoomed.center[0] + anchor[0] - after[0], zoomed.center[1] + anchor[1] - after[1]];
+                let actual = world.map_position(ViewXform::fit(world.size, target, &zoomed), uv);
+                assert!(anchor.iter().zip(actual).all(|(a, b)| (a - b).abs() < 1e-6), "zoom must stay anchored");
+            }
+        }
+    }
+    // The mapped brush is sent to both simulations, including while uncoupled.
+    world.params.coupling = 0.0;
+    let view = ViewXform::fit(world.size, [1280, 800], &Camera::default());
+    let frame = Frame {
+        gpu: &gpu,
+        time: 0.0,
+        dt: 1.0 / 60.0,
+        frame: 0,
+        view,
+        target_size: [1280, 800],
+        pointer: Some(crate::world::Pointer {
+            pos: world.map_position(view, [0.7, 0.4]),
+            primary: true,
+            secondary: false,
+            radius: 7.0,
+        }),
+    };
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    world.step(&frame, &mut encoder);
+    gpu.queue.submit([encoder.finish()]);
+    let reference = world.reference.as_ref().unwrap();
+    assert_eq!(
+        read::<[f32; 4]>(&gpu, &world.fields[world.current]),
+        read::<[f32; 4]>(&gpu, &reference.fields[reference.current])
+    );
+    world.set_comparison(&gpu, false);
+    assert_eq!(world.map_position(view, [0.7, 0.4]), view.apply([0.7, 0.4]));
+}
+
+#[test]
+#[ignore = "renders paired habitats to target/symbiosis-preview/comparison.png"]
+fn render_comparison_preview() {
+    let _guard = crate::gpu::test_lock();
+    use crate::capture::{self, Readback};
+    use crate::post::Post;
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let mut world = Symbiosis::new(&gpu, [640, 400], 42);
+    world.set_comparison(&gpu, true);
+    advance(&gpu, &mut world, 720);
+    let size = [1280, 800];
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let post = Post::new(&gpu, size, format);
+    let (texture, view) = gpu.texture_2d(
+        "comparison preview",
+        size,
+        format,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let frame = Frame {
+        gpu: &gpu,
+        time: 12.0,
+        dt: 1.0 / 60.0,
+        frame: 720,
+        view: ViewXform::fit(world.size, size, &Camera::default()),
+        target_size: size,
+        pointer: None,
+    };
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    world.render(&frame, &mut encoder, post.scene_view());
+    post.run(&gpu, &mut encoder, &world.post, 12.0, &view);
+    let readback = Readback::new(&gpu, size, format);
+    readback.copy_from(&mut encoder, &texture);
+    gpu.queue.submit([encoder.finish()]);
+    capture::save_png(
+        std::path::Path::new("target/symbiosis-preview/comparison.png"),
+        size,
+        readback.read(&gpu).unwrap(),
+    )
+    .unwrap();
+    assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+}

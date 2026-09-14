@@ -9,7 +9,7 @@ use crate::gpu::{self, layout, Gpu, SCENE_FORMAT};
 /// Weight of each coarser bloom level relative to the next finer one.
 const BLOOM_FALLOFF: f32 = 0.65;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tonemap {
     Agx,
     Aces,
@@ -41,7 +41,7 @@ impl Tonemap {
 
 /// User-facing "look" controls. Worlds suggest a starting point per preset via
 /// [`crate::world::World::post_settings`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PostSettings {
     pub exposure: f32,
     /// Additive bloom strength (0 disables the bloom passes).
@@ -70,13 +70,13 @@ impl Default for PostSettings {
 
 impl PostSettings {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.add(egui::Slider::new(&mut self.exposure, 0.05..=8.0).logarithmic(true).text("Exposure"));
-        ui.add(egui::Slider::new(&mut self.bloom, 0.0..=3.0).text("Bloom"));
-        ui.add(egui::Slider::new(&mut self.bloom_threshold, 0.0..=4.0).text("Bloom threshold"));
-        ui.add(egui::Slider::new(&mut self.vignette, 0.0..=1.0).text("Vignette"));
-        ui.add(egui::Slider::new(&mut self.saturation, 0.0..=2.0).text("Saturation"));
-        ui.add(egui::Slider::new(&mut self.grain, 0.0..=1.0).text("Film grain"));
-        egui::ComboBox::from_label("Tonemap").selected_text(self.tonemap.name()).show_ui(ui, |ui| {
+        ui.add(crate::ui::Slider::new(&mut self.exposure, 0.05..=8.0).logarithmic(true).text("Exposure"));
+        ui.add(crate::ui::Slider::new(&mut self.bloom, 0.0..=3.0).text("Bloom"));
+        ui.add(crate::ui::Slider::new(&mut self.bloom_threshold, 0.0..=4.0).text("Bloom threshold"));
+        ui.add(crate::ui::Slider::new(&mut self.vignette, 0.0..=1.0).text("Vignette"));
+        ui.add(crate::ui::Slider::new(&mut self.saturation, 0.0..=2.0).text("Saturation"));
+        ui.add(crate::ui::Slider::new(&mut self.grain, 0.0..=1.0).text("Film grain"));
+        crate::ui::dropdown(ui, "Tonemap", self.tonemap.name(), |ui| {
             for t in Tonemap::ALL {
                 ui.selectable_value(&mut self.tonemap, t, t.name());
             }

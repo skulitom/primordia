@@ -111,7 +111,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Seeding {
     Sparse,
     Blobs,
@@ -153,7 +153,7 @@ impl Seeding {
 }
 
 /// How the field is lit (`Draw.material` in the shader).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Material {
     Lacquer,
     Nacre,
@@ -194,7 +194,7 @@ impl Material {
 
 // --- parameters and presets --------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Params {
     pub feed: f32,
     pub kill: f32,
@@ -690,7 +690,7 @@ impl Params {
             );
         } else {
             ui.add(
-                egui::Slider::new(&mut self.feed, FEED_RANGE)
+                crate::ui::Slider::new(&mut self.feed, FEED_RANGE)
                     .text("Feed F")
                     .fixed_decimals(4),
             );
@@ -699,7 +699,7 @@ impl Params {
             let (lo, hi) = kill_band(self.feed);
             self.kill = self.kill.clamp(kc + lo, kc + hi);
             ui.add(
-                egui::Slider::new(&mut self.kill, (kc + lo)..=(kc + hi))
+                crate::ui::Slider::new(&mut self.kill, (kc + lo)..=(kc + hi))
                     .text("Kill k")
                     .fixed_decimals(4),
             );
@@ -709,27 +709,25 @@ impl Params {
                     .small(),
             );
         }
-        ui.add(egui::Slider::new(&mut self.scale, 0.5..=1.6).text("Pattern scale"));
-        ui.add(egui::Slider::new(&mut self.ratio, 1.6..=2.6).text("Diffusion ratio U/V"));
-        ui.add(egui::Slider::new(&mut self.dt, 0.2..=1.0).text("Time step"));
-        ui.add(egui::Slider::new(&mut self.steps_per_frame, 1..=64).text("Steps / frame"));
+        ui.add(crate::ui::Slider::new(&mut self.scale, 0.5..=1.6).text("Pattern scale"));
+        ui.add(crate::ui::Slider::new(&mut self.ratio, 1.6..=2.6).text("Diffusion ratio U/V"));
+        ui.add(crate::ui::Slider::new(&mut self.dt, 0.2..=1.0).text("Time step"));
+        ui.add(crate::ui::Slider::new(&mut self.steps_per_frame, 1..=64).text("Steps / frame"));
         ui.add(
-            egui::Slider::new(&mut self.drift, 0.0..=0.004)
+            crate::ui::Slider::new(&mut self.drift, 0.0..=0.004)
                 .text("Drift (k weather)")
                 .fixed_decimals(4),
         );
-        ui.add(egui::Slider::new(&mut self.drift_speed, 0.0..=4.0).text("Drift speed"));
-        ui.add(egui::Slider::new(&mut self.scale_var, 0.0..=0.6).text("Size variation"));
+        ui.add(crate::ui::Slider::new(&mut self.drift_speed, 0.0..=4.0).text("Drift speed"));
+        ui.add(crate::ui::Slider::new(&mut self.scale_var, 0.0..=0.6).text("Size variation"));
         ui.add(
-            egui::Slider::new(&mut self.ground, 0.0..=0.008)
+            crate::ui::Slider::new(&mut self.ground, 0.0..=0.008)
                 .text("Lagoons (kill bias)")
                 .fixed_decimals(4),
         );
-        ui.add(egui::Slider::new(&mut self.aniso, 0.0..=0.3).text("Ridge flow"));
-        ui.add(egui::Slider::new(&mut self.rain, 0.0..=1.0).text("Rain (drops / frame)"));
-        egui::ComboBox::from_label("Seeding (on reset)")
-            .selected_text(self.seeding.name())
-            .show_ui(ui, |ui| {
+        ui.add(crate::ui::Slider::new(&mut self.aniso, 0.0..=0.3).text("Ridge flow"));
+        ui.add(crate::ui::Slider::new(&mut self.rain, 0.0..=1.0).text("Rain (drops / frame)"));
+        crate::ui::dropdown(ui, "Seeding (on reset)", self.seeding.name(), |ui| {
                 for s in Seeding::ALL {
                     ui.selectable_value(&mut self.seeding, s, s.name());
                 }
@@ -737,30 +735,28 @@ impl Params {
     }
 
     fn look_ui(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_label("Material")
-            .selected_text(self.material.name())
-            .show_ui(ui, |ui| {
+        crate::ui::dropdown(ui, "Material", self.material.name(), |ui| {
                 for m in Material::ALL {
                     ui.selectable_value(&mut self.material, m, m.name());
                 }
             });
         ui.checkbox(&mut self.invert, "Invert (holes become bodies)");
-        ui.add(egui::Slider::new(&mut self.pal_lo, 0.0..=1.0).text("Palette start"));
-        ui.add(egui::Slider::new(&mut self.pal_hi, 0.0..=1.0).text("Palette end"));
-        ui.add(egui::Slider::new(&mut self.contrast_lo, 0.0..=0.9).text("Edge low"));
-        ui.add(egui::Slider::new(&mut self.contrast_hi, 0.1..=1.0).text("Edge high"));
+        ui.add(crate::ui::Slider::new(&mut self.pal_lo, 0.0..=1.0).text("Palette start"));
+        ui.add(crate::ui::Slider::new(&mut self.pal_hi, 0.0..=1.0).text("Palette end"));
+        ui.add(crate::ui::Slider::new(&mut self.contrast_lo, 0.0..=0.9).text("Edge low"));
+        ui.add(crate::ui::Slider::new(&mut self.contrast_hi, 0.1..=1.0).text("Edge high"));
         self.contrast_hi = self.contrast_hi.max(self.contrast_lo + 0.05);
-        ui.add(egui::Slider::new(&mut self.relief, 0.0..=1.5).text("Relief"));
-        ui.add(egui::Slider::new(&mut self.shadow, 0.0..=1.0).text("Shadow"));
-        ui.add(egui::Slider::new(&mut self.gloss, 0.0..=2.0).text("Gloss"));
-        ui.add(egui::Slider::new(&mut self.glow, 0.0..=2.0).text("Inner glow"));
-        ui.add(egui::Slider::new(&mut self.halo, 0.0..=1.5).text("Halo"));
-        ui.add(egui::Slider::new(&mut self.aura_tint, 0.0..=1.0).text("Halo hue"));
-        ui.add(egui::Slider::new(&mut self.iridescence, 0.0..=1.5).text("Iridescence"));
-        ui.add(egui::Slider::new(&mut self.reflect, 0.0..=1.0).text("Film reflection (nacre)"));
-        ui.add(egui::Slider::new(&mut self.clarity, 0.0..=1.5).text("Clarity (local contrast)"));
-        ui.add(egui::Slider::new(&mut self.activity, 0.0..=2.0).text("Growth glow"));
-        ui.add(egui::Slider::new(&mut self.brightness, 0.2..=3.0).text("Brightness"));
+        ui.add(crate::ui::Slider::new(&mut self.relief, 0.0..=1.5).text("Relief"));
+        ui.add(crate::ui::Slider::new(&mut self.shadow, 0.0..=1.0).text("Shadow"));
+        ui.add(crate::ui::Slider::new(&mut self.gloss, 0.0..=2.0).text("Gloss"));
+        ui.add(crate::ui::Slider::new(&mut self.glow, 0.0..=2.0).text("Inner glow"));
+        ui.add(crate::ui::Slider::new(&mut self.halo, 0.0..=1.5).text("Halo"));
+        ui.add(crate::ui::Slider::new(&mut self.aura_tint, 0.0..=1.0).text("Halo hue"));
+        ui.add(crate::ui::Slider::new(&mut self.iridescence, 0.0..=1.5).text("Iridescence"));
+        ui.add(crate::ui::Slider::new(&mut self.reflect, 0.0..=1.0).text("Film reflection (nacre)"));
+        ui.add(crate::ui::Slider::new(&mut self.clarity, 0.0..=1.5).text("Clarity (local contrast)"));
+        ui.add(crate::ui::Slider::new(&mut self.activity, 0.0..=2.0).text("Growth glow"));
+        ui.add(crate::ui::Slider::new(&mut self.brightness, 0.2..=3.0).text("Brightness"));
     }
 }
 
@@ -886,12 +882,26 @@ pub struct ReactionDiffusion {
     snap_window: bool,
 }
 
-pub fn create(gpu: &Gpu, output_size: [u32; 2], seed: u64) -> Box<dyn World> {
-    let size = [
+
+fn domain_size(output_size: [u32; 2]) -> [u32; 2] {
+    [
         ((output_size[0] as f32 * DOMAIN_SCALE) as u32).max(64),
         ((output_size[1] as f32 * DOMAIN_SCALE) as u32).max(64),
-    ];
-    Box::new(ReactionDiffusion::new(gpu, size, seed))
+    ]
+}
+
+pub fn validate_output_size(gpu: &Gpu, output_size: [u32; 2]) -> anyhow::Result<()> {
+    let size = domain_size(output_size);
+    let limits = gpu.device.limits();
+    let bytes = (u64::from(size[0]) * u64::from(size[1])).saturating_mul(8);
+    anyhow::ensure!(size.iter().all(|&n| n <= limits.max_texture_dimension_2d)
+        && bytes <= u64::from(limits.max_storage_buffer_binding_size) && bytes <= limits.max_buffer_size,
+        "Reaction-diffusion dimensions exceed this GPU's texture or buffer limits");
+    Ok(())
+}
+
+pub fn create(gpu: &Gpu, output_size: [u32; 2], seed: u64) -> Box<dyn World> {
+    Box::new(ReactionDiffusion::new(gpu, domain_size(output_size), seed))
 }
 
 impl ReactionDiffusion {
@@ -1312,6 +1322,29 @@ fn front(
 }
 
 impl World for ReactionDiffusion {
+    fn settings(&self) -> anyhow::Result<crate::library::WorldSettings> {
+        Ok(crate::library::WorldSettings::ReactionDiffusion {
+            params: self.params, palette: palette::PALETTES[self.lut.index()].name.to_owned(), post: self.post,
+        })
+    }
+
+    fn restore_settings(&mut self, gpu: &Gpu, settings: &crate::library::WorldSettings, seed: u64) -> anyhow::Result<()> {
+        let crate::library::WorldSettings::ReactionDiffusion { params, palette: name, post } = settings else { anyhow::bail!("Wrong world settings"); };
+        let index = palette::find(name).ok_or_else(|| anyhow::anyhow!("Unknown palette: {name}"))?;
+        anyhow::ensure!((1..=128).contains(&params.steps_per_frame), "Invalid step count");
+        // Scale also controls CPU seed-stamp radii; reject extreme values
+        // before they can overflow integer disk bounds during reset.
+        anyhow::ensure!((0.1..=4.0).contains(&params.scale)
+            && (0.1..=10.0).contains(&params.ratio) && (0.01..=1.0).contains(&params.dt)
+            && (0.0..=0.2).contains(&params.feed) && (0.0..=0.2).contains(&params.kill),
+            "Invalid reaction-diffusion rates or scale");
+        self.params = *params;
+        self.post = *post;
+        self.lut.set(gpu, index);
+        self.reset(gpu, seed);
+        Ok(())
+    }
+
     fn id(&self) -> &'static str {
         "reaction-diffusion"
     }

@@ -4,11 +4,13 @@ mod app;
 mod capture;
 mod gpu;
 mod headless;
+mod library;
 mod palette;
 mod post;
 mod rng;
 mod selftest;
 mod stall;
+mod ui;
 mod world;
 
 use std::path::PathBuf;
@@ -20,7 +22,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "primordia",
     version,
-    about = "GPU artificial-life laboratory: slime moulds, particle life, Lenia and reaction-diffusion",
+    about = "GPU artificial-life laboratory: slime moulds, particle life, Lenia, reaction-diffusion and Symbiosis",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -44,7 +46,7 @@ enum Command {
 
 #[derive(Args)]
 struct RunArgs {
-    /// World to open: physarum, particle-life, lenia, reaction-diffusion (or 1-4)
+    /// World to open: physarum, particle-life, lenia, reaction-diffusion, symbiosis (or 1-5)
     #[arg(short, long, default_value = "physarum")]
     world: String,
     /// Preset name or 1-based index

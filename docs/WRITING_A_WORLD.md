@@ -55,10 +55,23 @@ is a complete, full-featured reference that uses every convention below.
 6. **Interaction.** `frame.pointer` (interactive only) gives the brush position in
    world uv, the button state and the radius in domain cells. Document the buttons in
    `controls_hint()`.
-7. **UI.** `ui()` is drawn inside the "Simulation" section of the side panel. Every
+7. **UI.** `ui()` is drawn inside the **World** tab of the side panel. Use the shared
+   `crate::ui::Slider`, `crate::ui::dropdown` and `crate::palette::combo` controls to keep labels readable
+   at narrow panel widths. Every
    slider range must be safe: nothing the user can do should produce NaN, a black
    screen that never recovers, or a crash. Settings that reallocate (e.g. agent counts)
    should apply on reset or behind an explicit button.
+8. **Saved settings.** Derive serde serialization for parameters, add a variant to
+   `library::WorldSettings`, and implement `settings()` / `restore_settings()`.
+   Include all editable state and use stable palette names. Validate allocation
+   sizes, indices and parameter ranges before rebuilding GPU state, then reseed
+   with the supplied seed. Recipes restart a simulation; they do not contain its
+   evolving GPU buffers. Use serde defaults when adding optional fields to keep
+   existing saves readable. The library tests exercise every registered preset.
+
+For a custom viewport such as Symbiosis's comparison panes, override
+`map_position()` to match the display transform, so painting and cursor-anchored
+zoom stay aligned. `comparison_labels()` can supply labels for the app overlay.
 
 ## Gotchas
 
@@ -89,3 +102,8 @@ cargo run -- gallery -w my-world --out-dir renders/gallery                  # ev
 
 Headless renders print frames per second, which makes a quick performance check
 (try `--width 1920 --height 1080`).
+
+Run `cargo test --locked -- --include-ignored` for the GPU tests and visual
+previews, then inspect the PNGs under `target/`. Acquire `gpu::test_lock()` before
+creating a GPU in a test, and hold the guard until the GPU is dropped. This keeps
+concurrent tests from racing through native driver initialization.

@@ -184,12 +184,9 @@ impl PaletteLut {
 /// Palette combo box with gradient previews. Returns true when the selection changed.
 pub fn combo(ui: &mut egui::Ui, id_salt: &str, index: &mut usize) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Palette");
-        egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(PALETTES[(*index).min(PALETTES.len() - 1)].name)
-            .width(140.0)
-            .show_ui(ui, |ui| {
+    ui.push_id(id_salt, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        crate::ui::dropdown(ui, "Palette", PALETTES[(*index).min(PALETTES.len() - 1)].name, |ui| {
                 for (i, p) in PALETTES.iter().enumerate() {
                     ui.horizontal(|ui| {
                         swatch(ui, p, egui::vec2(44.0, 12.0));
@@ -199,8 +196,8 @@ pub fn combo(ui: &mut egui::Ui, id_salt: &str, index: &mut usize) -> bool {
                         }
                     });
                 }
-            });
-        swatch(ui, &PALETTES[(*index).min(PALETTES.len() - 1)], egui::vec2(56.0, 14.0));
+        });
+        swatch(ui, &PALETTES[(*index).min(PALETTES.len() - 1)], egui::vec2(ui.available_width(), 5.0));
     });
     changed
 }
@@ -209,7 +206,7 @@ pub fn combo(ui: &mut egui::Ui, id_salt: &str, index: &mut usize) -> bool {
 pub fn swatch(ui: &mut egui::Ui, palette: &Palette, size: egui::Vec2) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    const STEPS: usize = 32;
+    const STEPS: usize = 128;
     for k in 0..STEPS {
         let t0 = k as f32 / STEPS as f32;
         let t1 = (k + 1) as f32 / STEPS as f32;

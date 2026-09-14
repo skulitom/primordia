@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "name": "Test reef",
+  "seed": 18446744073709551615,
+  "output_size": [
+    1920,
+    1008
+  ],
+  "preset": 0,
+  "modified": true,
+  "settings": {
+    "world": "reaction-diffusion",
+    "params": {
+      "feed": 0.04899999871850014,
+      "kill": 0.06080000102519989,
+      "scale": 0.9087008833885193,
+      "ratio": 2.0,
+      "dt": 1.0,
+      "steps_per_frame": 24,
+      "drift": 0.0008999999845400453,
+      "drift_speed": 1.2721678018569946,
+      "scale_var": 0.08144626021385193,
+      "rain": 0.0,
+      "ground": 0.0,
+      "aniso": 0.23413173854351044,
+      "pal_lo": 0.0,
+      "pal_hi": 0.44999998807907104,
+      "contrast_lo": 0.3938160538673401,
+      "contrast_hi": 0.615257978439331,
+      "relief": 1.0095317363739014,
+      "gloss": 1.0976470708847046,
+      "glow": 0.6000000238418579,
+      "halo": 0.10000000149011612,
+      "aura_tint": 0.4000000059604645,
+      "iridescence": 0.3499999940395355,
+      "reflect": 0.4000000059604645,
+      "clarity": 0.0,
+      "activity": 0.30000001192092896,
+      "shadow": 0.6000000238418579,
+      "brightness": 1.0,
+      "seeding": "Blobs",
+      "material": "Nacre",
+      "atlas": false,
+      "invert": false
+    },
+    "palette": "Aurora",
+    "post": {
+      "exposure": 1.0,
+      "bloom": 0.5,
+      "bloom_threshold": 0.8999999761581421,
+      "vignette": 0.4000000059604645,
+      "saturation": 1.0800000429153442,
+      "grain": 0.0,
+      "tonemap": "Agx"
+    }
+  },
+  "look": {
+    "exposure": 1.0,
+    "bloom": 0.5,
+    "bloom_threshold": 0.8999999761581421,
+    "vignette": 0.4000000059604645,
+    "saturation": 1.0800000429153442,
+    "grain": 0.0,
+    "tonemap": "Agx"
+  },
+  "camera": {
+    "center": [
+      0.41863349080085754,
+      0.9446889758110046
+    ],
+    "zoom": 0.574999988079071
+  }
+}

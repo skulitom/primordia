@@ -161,7 +161,7 @@ const SCHEMES: &[Scheme] = &[
 // table ever loses an entry the presets rely on.
 const _: () = assert!(JEWELS < SCHEMES.len());
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Colors {
     /// One of the hand-picked sets in `SCHEMES`.
     Scheme(usize),
@@ -171,7 +171,7 @@ pub enum Colors {
 
 // --- spawning and random matrices ----------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Spawn {
     Uniform,
     Clusters,
@@ -520,7 +520,7 @@ fn preset_names() -> &'static [&'static str] {
 
 // --- parameters ----------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Params {
     pub kinds: usize,
     /// `matrix[i][j]`: how strongly species i is attracted to species j.
@@ -1274,6 +1274,21 @@ impl ParticleLife {
 }
 
 impl World for ParticleLife {
+    fn settings(&self) -> anyhow::Result<crate::library::WorldSettings> {
+        Ok(crate::library::WorldSettings::ParticleLife { params: Box::new(self.params), ground: self.ground, post: self.look })
+    }
+
+    fn restore_settings(&mut self, gpu: &Gpu, settings: &crate::library::WorldSettings, seed: u64) -> anyhow::Result<()> {
+        let crate::library::WorldSettings::ParticleLife { params, ground, post } = settings else { anyhow::bail!("Wrong world settings"); };
+        anyhow::ensure!((2..=MAX_KINDS).contains(&params.kinds) && (1..=128).contains(&params.substeps), "Invalid particle settings");
+        anyhow::ensure!(params.color_shift < MAX_KINDS, "Invalid colour rotation");
+        self.params = **params;
+        self.ground = *ground;
+        self.look = *post;
+        self.reset(gpu, seed);
+        Ok(())
+    }
+
     fn id(&self) -> &'static str {
         "particle-life"
     }
@@ -1422,7 +1437,7 @@ impl World for ParticleLife {
         let restart;
         {
             let Self { params: p, rng, ground, .. } = self;
-            ui.add(egui::Slider::new(&mut p.kinds, 2..=MAX_KINDS).text("Species"));
+            ui.add(crate::ui::Slider::new(&mut p.kinds, 2..=MAX_KINDS).text("Species"));
             ui.label(
                 egui::RichText::new("Attraction matrix: each row feels the columns. Drag a cell, right-click to zero.")
                     .weak()
@@ -1452,18 +1467,18 @@ impl World for ParticleLife {
                     }
                 }
             });
-            ui.add(egui::Slider::new(&mut p.r_max, MIN_RADIUS..=MAX_RADIUS).text("Interaction radius"));
-            ui.add(egui::Slider::new(&mut p.beta, 0.1..=0.6).text("Repulsion core β"));
-            ui.add(egui::Slider::new(&mut p.force, 1.0..=40.0).logarithmic(true).text("Force"));
-            ui.add(egui::Slider::new(&mut p.half_life, 0.005..=0.5).logarithmic(true).text("Friction half-life (s)"));
-            ui.add(egui::Slider::new(&mut p.dt, 0.002..=0.03).text("Time step"));
-            ui.add(egui::Slider::new(&mut p.substeps, 1..=MAX_SUBSTEPS).text("Steps / frame"));
-            ui.add(egui::Slider::new(&mut p.pointer_strength, 5.0..=300.0).logarithmic(true).text("Brush strength"));
+            ui.add(crate::ui::Slider::new(&mut p.r_max, MIN_RADIUS..=MAX_RADIUS).text("Interaction radius"));
+            ui.add(crate::ui::Slider::new(&mut p.beta, 0.1..=0.6).text("Repulsion core β"));
+            ui.add(crate::ui::Slider::new(&mut p.force, 1.0..=40.0).logarithmic(true).text("Force"));
+            ui.add(crate::ui::Slider::new(&mut p.half_life, 0.005..=0.5).logarithmic(true).text("Friction half-life (s)"));
+            ui.add(crate::ui::Slider::new(&mut p.dt, 0.002..=0.03).text("Time step"));
+            ui.add(crate::ui::Slider::new(&mut p.substeps, 1..=MAX_SUBSTEPS).text("Steps / frame"));
+            ui.add(crate::ui::Slider::new(&mut p.pointer_strength, 5.0..=300.0).logarithmic(true).text("Brush strength"));
             egui::CollapsingHeader::new("Species balance").show(ui, |ui| {
                 for (s, w) in p.weights.iter_mut().enumerate().take(p.kinds) {
                     ui.horizontal(|ui| {
                         species_dot(ui, dots[s], 14.0);
-                        ui.add(egui::Slider::new(w, 0.05..=1.0).text(format!("species {}", s + 1)));
+                        ui.add(crate::ui::Slider::new(w, 0.05..=1.0).text(format!("species {}", s + 1)));
                     });
                 }
             });
@@ -1472,7 +1487,7 @@ impl World for ParticleLife {
                     ui.horizontal(|ui| {
                         species_dot(ui, dots[s], 14.0);
                         ui.add(
-                            egui::Slider::new(size, MIN_SPECIES_SIZE..=MAX_SPECIES_SIZE)
+                            crate::ui::Slider::new(size, MIN_SPECIES_SIZE..=MAX_SPECIES_SIZE)
                                 .logarithmic(true)
                                 .text(format!("species {}", s + 1)),
                         );
@@ -1482,9 +1497,9 @@ impl World for ParticleLife {
 
             ui.separator();
             ui.label(egui::RichText::new("Population (applies on restart)").strong());
-            ui.add(egui::Slider::new(&mut p.count, MIN_COUNT..=MAX_COUNT).logarithmic(true).text("Particles"));
-            ui.add(egui::Slider::new(&mut p.density, MIN_DENSITY..=MAX_DENSITY).logarithmic(true).text("Density"));
-            egui::ComboBox::from_label("Spawn").selected_text(p.spawn.name()).show_ui(ui, |ui| {
+            ui.add(crate::ui::Slider::new(&mut p.count, MIN_COUNT..=MAX_COUNT).logarithmic(true).text("Particles"));
+            ui.add(crate::ui::Slider::new(&mut p.density, MIN_DENSITY..=MAX_DENSITY).logarithmic(true).text("Density"));
+            crate::ui::dropdown(ui, "Spawn", p.spawn.name(), |ui| {
                 for s in Spawn::ALL {
                     ui.selectable_value(&mut p.spawn, s, s.name());
                 }
@@ -1500,7 +1515,7 @@ impl World for ParticleLife {
             };
             let before = choice;
             let selected = SCHEMES.get(choice).map_or("Palette gradient", |s| s.name);
-            egui::ComboBox::from_label("Colours").selected_text(selected).show_ui(ui, |ui| {
+            crate::ui::dropdown(ui, "Colours", selected, |ui| {
                 for (i, scheme) in SCHEMES.iter().enumerate() {
                     ui.horizontal(|ui| {
                         scheme_swatch(ui, &scheme.colors);
@@ -1518,10 +1533,10 @@ impl World for ParticleLife {
             }
             if let Colors::Gradient { palette: index, lo, hi } = &mut p.colors {
                 palette::combo(ui, "pl palette", index);
-                ui.add(egui::Slider::new(lo, 0.0..=1.0).text("Gradient from"));
-                ui.add(egui::Slider::new(hi, 0.0..=1.0).text("Gradient to"));
+                ui.add(crate::ui::Slider::new(lo, 0.0..=1.0).text("Gradient from"));
+                ui.add(crate::ui::Slider::new(hi, 0.0..=1.0).text("Gradient to"));
             }
-            ui.add(egui::Slider::new(&mut p.color_shift, 0..=MAX_KINDS - 1).text("Colour rotation"));
+            ui.add(crate::ui::Slider::new(&mut p.color_shift, 0..=MAX_KINDS - 1).text("Colour rotation"));
             ui.horizontal(|ui| {
                 let mut rgb = [(*ground >> 16) as u8, (*ground >> 8) as u8, *ground as u8];
                 if ui.color_edit_button_srgb(&mut rgb).changed() {
@@ -1529,14 +1544,14 @@ impl World for ParticleLife {
                 }
                 ui.label("Ground");
             });
-            ui.add(egui::Slider::new(&mut p.size, 0.5..=5.0).text("Particle size"));
-            ui.add(egui::Slider::new(&mut p.glow, 0.1..=4.0).logarithmic(true).text("Brightness"));
-            ui.add(egui::Slider::new(&mut p.speed_glow, 0.0..=3.0).text("Speed glow"));
-            ui.add(egui::Slider::new(&mut p.trail, 0.0..=0.98).text("Trail length"));
-            ui.add(egui::Slider::new(&mut p.trail_gain, 0.0..=4.0).text("Trail brightness"));
-            ui.add(egui::Slider::new(&mut p.trail_scale, 1.0..=5.0).text("Glow radius"));
-            ui.add(egui::Slider::new(&mut p.knee, 0.2..=8.0).logarithmic(true).text("Highlight roll-off"));
-            ui.add(egui::Slider::new(&mut p.relief, 0.0..=1.0).text("Relief shading"));
+            ui.add(crate::ui::Slider::new(&mut p.size, 0.5..=5.0).text("Particle size"));
+            ui.add(crate::ui::Slider::new(&mut p.glow, 0.1..=4.0).logarithmic(true).text("Brightness"));
+            ui.add(crate::ui::Slider::new(&mut p.speed_glow, 0.0..=3.0).text("Speed glow"));
+            ui.add(crate::ui::Slider::new(&mut p.trail, 0.0..=0.98).text("Trail length"));
+            ui.add(crate::ui::Slider::new(&mut p.trail_gain, 0.0..=4.0).text("Trail brightness"));
+            ui.add(crate::ui::Slider::new(&mut p.trail_scale, 1.0..=5.0).text("Glow radius"));
+            ui.add(crate::ui::Slider::new(&mut p.knee, 0.2..=8.0).logarithmic(true).text("Highlight roll-off"));
+            ui.add(crate::ui::Slider::new(&mut p.relief, 0.0..=1.0).text("Relief shading"));
         }
         if restart {
             self.reset(gpu, self.seed);

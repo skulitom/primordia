@@ -12,6 +12,15 @@ pub const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 /// Format of the HDR scene texture every world renders into.
 pub const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Hold this before creating an instance and until its GPU is dropped. The
+/// Windows Vulkan loader can crash during concurrent instance creation/drop
+/// across otherwise independent tests. CPU-only tests can still run in parallel.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Shared GPU handles. Cloning is cheap: every wgpu handle is reference counted.
 #[derive(Clone)]
 pub struct Gpu {

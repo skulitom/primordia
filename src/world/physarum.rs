@@ -72,7 +72,7 @@ fn wgsl_format(format: wgpu::TextureFormat) -> &'static str {
 }
 
 /// How agents are laid out when the simulation (re)starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Layout {
     Scatter,
     DiskOut,
@@ -118,7 +118,7 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColorMode {
     /// Total density mapped through the palette.
     Palette,
@@ -136,7 +136,7 @@ impl ColorMode {
 }
 
 /// Behaviour of one species. Angles are in degrees, distances in cells.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Species {
     /// Angle between the centre sensor and each side sensor.
     pub sensor_angle: f32,
@@ -328,20 +328,17 @@ impl Lut {
     /// Palette picker with gradient previews.
     fn ui(&mut self, gpu: &Gpu, ui: &mut egui::Ui) {
         let mut index = self.index;
-        ui.horizontal(|ui| {
-            ui.label("Palette");
-            egui::ComboBox::from_id_salt("physarum palette").selected_text(self.palette().name).width(140.0).show_ui(
-                ui,
-                |ui| {
+        ui.push_id("physarum palette", |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            crate::ui::dropdown(ui, "Palette", self.palette().name, |ui| {
                     for i in 0..palette_count() {
                         ui.horizontal(|ui| {
                             palette::swatch(ui, palette_at(i), egui::vec2(44.0, 12.0));
                             ui.selectable_value(&mut index, i, palette_at(i).name);
                         });
                     }
-                },
-            );
-            palette::swatch(ui, self.palette(), egui::vec2(56.0, 14.0));
+                });
+            palette::swatch(ui, palette_at(index), egui::vec2(ui.available_width(), 5.0));
         });
         self.set(gpu, index);
     }
@@ -350,7 +347,7 @@ impl Lut {
 // --- parameters -------------------------------------------------------------------
 
 /// Parameters that can change while the simulation runs.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Params {
     pub species: [Species; MAX_SPECIES],
     /// Row `s`: weight species `s` gives each species' trail (negative repels).
@@ -408,7 +405,7 @@ pub struct Params {
 
 /// Settings that need a reseed (and possibly a reallocation). The UI edits a
 /// pending copy that applies on Apply or reset, never mid-frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Population {
     pub agents: u32,
     pub species: usize,
@@ -1409,6 +1406,24 @@ impl Physarum {
 }
 
 impl World for Physarum {
+    fn settings(&self) -> anyhow::Result<crate::library::WorldSettings> {
+        Ok(crate::library::WorldSettings::Physarum {
+            params: self.params, population: self.pending, palette: self.lut.palette().name.to_owned(), post: self.post,
+        })
+    }
+
+    fn restore_settings(&mut self, gpu: &Gpu, settings: &crate::library::WorldSettings, seed: u64) -> anyhow::Result<()> {
+        let crate::library::WorldSettings::Physarum { params, population, palette: name, post } = settings else { anyhow::bail!("Wrong world settings"); };
+        let index = (0..palette_count()).find(|&i| palette_at(i).name == name).ok_or_else(|| anyhow::anyhow!("Unknown palette: {name}"))?;
+        anyhow::ensure!((1..=128).contains(&params.steps_per_frame), "Invalid step count");
+        self.params = *params;
+        self.pending = *population;
+        self.post = *post;
+        self.lut.set(gpu, index);
+        self.reset(gpu, seed);
+        Ok(())
+    }
+
     fn id(&self) -> &'static str {
         "physarum"
     }
@@ -1654,18 +1669,18 @@ impl World for Physarum {
         ui.label(egui::RichText::new("Population").strong());
         let max_millions = self.max_agents as f32 / 1e6;
         let mut millions = self.pending.agents as f32 / 1e6;
-        let slider = egui::Slider::new(&mut millions, 0.01..=max_millions).logarithmic(true).text("Agents (M)");
+        let slider = crate::ui::Slider::new(&mut millions, 0.01..=max_millions).logarithmic(true).text("Agents (M)");
         if ui.add(slider.fixed_decimals(2)).changed() {
             self.pending.agents = ((millions * 1e6) as u32).clamp(MIN_AGENTS, self.max_agents);
         }
-        ui.add(egui::Slider::new(&mut self.pending.species, 1..=MAX_SPECIES).text("Species"));
-        egui::ComboBox::from_label("Layout").selected_text(self.pending.layout.name()).show_ui(ui, |ui| {
+        ui.add(crate::ui::Slider::new(&mut self.pending.species, 1..=MAX_SPECIES).text("Species"));
+        crate::ui::dropdown(ui, "Layout", self.pending.layout.name(), |ui| {
             for l in Layout::ALL {
                 ui.selectable_value(&mut self.pending.layout, l, l.name());
             }
         });
-        ui.add(egui::Slider::new(&mut self.pending.spawn_radius, 0.05..=1.0).text("Spawn radius"));
-        ui.add(egui::Slider::new(&mut self.pending.clusters, 1..=24).text("Rings / clusters"));
+        ui.add(crate::ui::Slider::new(&mut self.pending.spawn_radius, 0.05..=1.0).text("Spawn radius"));
+        ui.add(crate::ui::Slider::new(&mut self.pending.clusters, 1..=24).text("Rings / clusters"));
         let dirty = self.pending != self.population;
         let mut apply = false;
         ui.horizontal(|ui| {
@@ -1681,18 +1696,18 @@ impl World for Physarum {
         // --- global trail parameters ------------------------------------------------
         ui.separator();
         let p = &mut self.params;
-        ui.add(egui::Slider::new(&mut p.decay, 0.5..=0.995).text("Trail persistence"));
-        ui.add(egui::Slider::new(&mut p.diffusion, 0.0..=1.0).text("Diffusion"));
-        ui.add(egui::Slider::new(&mut p.crowding, 0.0..=8.0).text("Crowding limit (0 = off)"));
-        ui.add(egui::Slider::new(&mut p.saturation, 0.0..=20.0).text("Sensing saturation (0 = off)"));
-        ui.add(egui::Slider::new(&mut p.renewal, 0.0..=0.02).text("Renewal / step"));
-        ui.add(egui::Slider::new(&mut p.steps_per_frame, 1..=MAX_STEPS).text("Steps / frame"));
-        ui.add(egui::Slider::new(&mut p.terrain, 0.0..=3.0).text("Terrain"))
+        ui.add(crate::ui::Slider::new(&mut p.decay, 0.5..=0.995).text("Trail persistence"));
+        ui.add(crate::ui::Slider::new(&mut p.diffusion, 0.0..=1.0).text("Diffusion"));
+        ui.add(crate::ui::Slider::new(&mut p.crowding, 0.0..=8.0).text("Crowding limit (0 = off)"));
+        ui.add(crate::ui::Slider::new(&mut p.saturation, 0.0..=20.0).text("Sensing saturation (0 = off)"));
+        ui.add(crate::ui::Slider::new(&mut p.renewal, 0.0..=0.02).text("Renewal / step"));
+        ui.add(crate::ui::Slider::new(&mut p.steps_per_frame, 1..=MAX_STEPS).text("Steps / frame"));
+        ui.add(crate::ui::Slider::new(&mut p.terrain, 0.0..=3.0).text("Terrain"))
             .on_hover_text("How much the trail's decay varies over the torus: dense regions and quiet voids");
-        ui.add(egui::Slider::new(&mut p.terrain_scale, 0.15..=1.5).text("Terrain scale"));
-        ui.add(egui::Slider::new(&mut p.terrain_drift, 0.0..=0.2).text("Terrain drift"));
-        ui.add(egui::Slider::new(&mut p.swirl, -3.0..=3.0).suffix("°").text("Swirl / step"));
-        ui.add(egui::Slider::new(&mut p.gravity, 0.0..=30.0).text("Core pull"))
+        ui.add(crate::ui::Slider::new(&mut p.terrain_scale, 0.15..=1.5).text("Terrain scale"));
+        ui.add(crate::ui::Slider::new(&mut p.terrain_drift, 0.0..=0.2).text("Terrain drift"));
+        ui.add(crate::ui::Slider::new(&mut p.swirl, -3.0..=3.0).suffix("°").text("Swirl / step"));
+        ui.add(crate::ui::Slider::new(&mut p.gravity, 0.0..=30.0).text("Core pull"))
             .on_hover_text("Attraction of every species to the centre");
         ui.horizontal(|ui| {
             ui.label("Centre");
@@ -1715,19 +1730,19 @@ impl World for Physarum {
                         ui.label("Colour");
                         ui.color_edit_button_srgb(&mut sp.color);
                     });
-                    ui.add(egui::Slider::new(&mut sp.sensor_angle, 2.0..=150.0).suffix("°").text("Sensor angle"));
-                    ui.add(egui::Slider::new(&mut sp.sensor_distance, 1.0..=64.0).text("Sensor distance"));
-                    ui.add(egui::Slider::new(&mut sp.turn_angle, 1.0..=150.0).suffix("°").text("Turn angle"));
-                    ui.add(egui::Slider::new(&mut sp.speed, 0.1..=4.0).text("Speed"));
-                    ui.add(egui::Slider::new(&mut sp.deposit, 0.05..=5.0).logarithmic(true).text("Deposit"));
-                    ui.add(egui::Slider::new(&mut sp.wander, 0.0..=45.0).suffix("°").text("Wander"));
-                    ui.add(egui::Slider::new(&mut sp.curl, -10.0..=10.0).suffix("°").text("Curl"));
-                    ui.add(egui::Slider::new(&mut sp.spread, 0.0..=2.0).text("Size variety"));
+                    ui.add(crate::ui::Slider::new(&mut sp.sensor_angle, 2.0..=150.0).suffix("°").text("Sensor angle"));
+                    ui.add(crate::ui::Slider::new(&mut sp.sensor_distance, 1.0..=64.0).text("Sensor distance"));
+                    ui.add(crate::ui::Slider::new(&mut sp.turn_angle, 1.0..=150.0).suffix("°").text("Turn angle"));
+                    ui.add(crate::ui::Slider::new(&mut sp.speed, 0.1..=4.0).text("Speed"));
+                    ui.add(crate::ui::Slider::new(&mut sp.deposit, 0.05..=5.0).logarithmic(true).text("Deposit"));
+                    ui.add(crate::ui::Slider::new(&mut sp.wander, 0.0..=45.0).suffix("°").text("Wander"));
+                    ui.add(crate::ui::Slider::new(&mut sp.curl, -10.0..=10.0).suffix("°").text("Curl"));
+                    ui.add(crate::ui::Slider::new(&mut sp.spread, 0.0..=2.0).text("Size variety"));
                     if k > 1 {
                         ui.label(egui::RichText::new("Attraction to trails (negative repels)").weak());
                         for (j, w) in interact[s].iter_mut().enumerate().take(k) {
                             let label = if j == s { "own".to_string() } else { format!("species {}", j + 1) };
-                            ui.add(egui::Slider::new(w, -1.5..=1.5).text(label));
+                            ui.add(crate::ui::Slider::new(w, -1.5..=1.5).text(label));
                         }
                     }
                 });
@@ -1736,7 +1751,7 @@ impl World for Physarum {
         // --- colour ---------------------------------------------------------------------
         ui.separator();
         let mode = &mut self.params.color_mode;
-        egui::ComboBox::from_label("Colouring").selected_text(mode.name()).show_ui(ui, |ui| {
+        crate::ui::dropdown(ui, "Colouring", mode.name(), |ui| {
             for m in [ColorMode::Palette, ColorMode::Species] {
                 ui.selectable_value(mode, m, m.name());
             }
@@ -1746,18 +1761,18 @@ impl World for Physarum {
             self.colors_from_palette(self.population.species);
         }
         let p = &mut self.params;
-        ui.add(egui::Slider::new(&mut p.exposure, 0.005..=0.5).logarithmic(true).text("Density gain"));
-        ui.add(egui::Slider::new(&mut p.traffic_weight, 0.0..=3.0).text("Path weight"));
-        ui.add(egui::Slider::new(&mut p.trail_weight, 0.0..=1.0).text("Haze weight"));
-        ui.add(egui::Slider::new(&mut p.traffic_persistence, 0.5..=0.99).text("Path persistence"));
-        ui.add(egui::Slider::new(&mut p.traffic_blur, 0.0..=1.0).text("Path softness"));
-        ui.add(egui::Slider::new(&mut p.brightness, 0.1..=3.0).text("Brightness"));
-        ui.add(egui::Slider::new(&mut p.filigree, 1.0..=6.0).text("Filigree (decades)"));
-        ui.add(egui::Slider::new(&mut p.glow, 0.0..=4.0).text("Vein glow"));
-        ui.add(egui::Slider::new(&mut p.palette_span, 1.0..=2.0).text("Palette span"))
+        ui.add(crate::ui::Slider::new(&mut p.exposure, 0.005..=0.5).logarithmic(true).text("Density gain"));
+        ui.add(crate::ui::Slider::new(&mut p.traffic_weight, 0.0..=3.0).text("Path weight"));
+        ui.add(crate::ui::Slider::new(&mut p.trail_weight, 0.0..=1.0).text("Haze weight"));
+        ui.add(crate::ui::Slider::new(&mut p.traffic_persistence, 0.5..=0.99).text("Path persistence"));
+        ui.add(crate::ui::Slider::new(&mut p.traffic_blur, 0.0..=1.0).text("Path softness"));
+        ui.add(crate::ui::Slider::new(&mut p.brightness, 0.1..=3.0).text("Brightness"));
+        ui.add(crate::ui::Slider::new(&mut p.filigree, 1.0..=6.0).text("Filigree (decades)"));
+        ui.add(crate::ui::Slider::new(&mut p.glow, 0.0..=4.0).text("Vein glow"));
+        ui.add(crate::ui::Slider::new(&mut p.palette_span, 1.0..=2.0).text("Palette span"))
             .on_hover_text("Tone that reaches the palette's top colour: higher keeps it for the densest cores");
-        ui.add(egui::Slider::new(&mut p.smoothing, 0.0..=1.0).text("Smoothing"));
-        ui.add(egui::Slider::new(&mut p.ground, 0.0..=0.9).text("Dark ground"))
+        ui.add(crate::ui::Slider::new(&mut p.smoothing, 0.0..=1.0).text("Smoothing"));
+        ui.add(crate::ui::Slider::new(&mut p.ground, 0.0..=0.9).text("Dark ground"))
             .on_hover_text("Fraction of the frame kept dark by raising the black point automatically (0 = off)");
     }
 

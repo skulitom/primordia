@@ -75,7 +75,7 @@ const MAX_BROOD: usize = 16;
 // --- parameters ---------------------------------------------------------------
 
 /// One kernel: reads `source`, drives the growth of `target`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Kernel {
     pub source: usize,
     pub target: usize,
@@ -147,7 +147,7 @@ fn neutral(source: usize, target: usize, radius: f32, sigma: f32, h: f32) -> Ker
     k(source, target, radius, &[1.0], sigma * NEUTRAL_MU, sigma, h)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Seeding {
     /// Dozens of kernel-sized discs of random noise (Lenia's classic soup).
     Patches,
@@ -190,6 +190,23 @@ pub struct Template {
 /// published with Bert Chan's Lenia (MIT licence). Random soups at these
 /// parameters almost never find it: they die out or boil into labyrinths.
 const ORBIUM: Template = Template { side: 20, radius: 13.0, cells: &ORBIUM_CELLS };
+
+// Store a stable template name rather than a pointer or hundreds of fixed cells.
+mod template_id {
+    use super::{Template, ORBIUM};
+    use serde::{Deserialize, Serialize};
+
+    pub fn serialize<S: serde::Serializer>(template: &Option<&Template>, serializer: S) -> Result<S::Ok, S::Error> {
+        template.map(|_| "Orbium").serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<&'static Template>, D::Error> {
+        match Option::<String>::deserialize(deserializer)?.as_deref() {
+            None => Ok(None),
+            Some("Orbium") => Ok(Some(&ORBIUM)),
+            Some(name) => Err(serde::de::Error::custom(format!("Unknown creature template: {name}"))),
+        }
+    }
+}
 
 #[rustfmt::skip]
 const ORBIUM_CELLS: [f32; 400] = [
@@ -250,12 +267,13 @@ fn for_each_rotated(plane: &[f32], side: usize, scale: f32, angle: f32, mut put:
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Params {
     /// Channels in use (1..=3).
     pub channels: usize,
     pub kernels: Vec<Kernel>,
     /// Known creature the nursery hatches from, instead of random patches.
+    #[serde(with = "template_id")]
     pub template: Option<&'static Template>,
     /// Channels (bit mask) the template is raised as, each at the radius of
     /// that channel's own kernel. Other channels (colony species living beside
@@ -2214,6 +2232,26 @@ impl Lenia {
 }
 
 impl World for Lenia {
+    fn settings(&self) -> anyhow::Result<crate::library::WorldSettings> {
+        Ok(crate::library::WorldSettings::Lenia {
+            params: self.params.clone(), palettes: std::array::from_fn(|i| PALETTES[self.luts[i].index()].name.to_owned()), post: self.look,
+        })
+    }
+
+    fn restore_settings(&mut self, gpu: &Gpu, settings: &crate::library::WorldSettings, seed: u64) -> anyhow::Result<()> {
+        let crate::library::WorldSettings::Lenia { params, palettes, post } = settings else { anyhow::bail!("Wrong world settings"); };
+        anyhow::ensure!((1..=CHANNELS).contains(&params.channels) && !params.kernels.is_empty() && params.kernels.len() <= MAX_KERNELS, "Invalid Lenia kernels");
+        // Disabled channels retain their kernels; build_plan folds those onto
+        // the last active channel. Such recipes must still round-trip.
+        anyhow::ensure!((1..=128).contains(&params.steps_per_frame) && params.kernels.iter().all(|k| k.source < CHANNELS && k.target < CHANNELS), "Invalid Lenia channels or step count");
+        for name in palettes { anyhow::ensure!(palette::find(name).is_some(), "Unknown palette: {name}"); }
+        self.params = params.clone();
+        self.look = *post;
+        self.set_palettes(gpu, [&palettes[0], &palettes[1], &palettes[2]]);
+        self.reset(gpu, seed);
+        Ok(())
+    }
+
     fn id(&self) -> &'static str {
         "lenia"
     }
@@ -2589,22 +2627,22 @@ impl World for Lenia {
         let r_max = self.pipes.r_max as f32;
         let Self { params: p, luts, .. } = self;
 
-        ui.add(egui::Slider::new(&mut p.time_res, 1.0..=30.0).text("Time resolution T"));
-        ui.add(egui::Slider::new(&mut p.steps_per_frame, 1..=8).text("Steps / frame"));
-        ui.add(egui::Slider::new(&mut p.scale, 0.5..=2.0).text("Kernel scale"));
+        ui.add(crate::ui::Slider::new(&mut p.time_res, 1.0..=30.0).text("Time resolution T"));
+        ui.add(crate::ui::Slider::new(&mut p.steps_per_frame, 1..=8).text("Steps / frame"));
+        ui.add(crate::ui::Slider::new(&mut p.scale, 0.5..=2.0).text("Kernel scale"));
         // Kernels of switched-off channels fold onto the last active one
         // while simulating (see `build_plan`); their own settings are kept.
-        ui.add(egui::Slider::new(&mut p.channels, 1..=CHANNELS).text("Channels"));
-        egui::ComboBox::from_label("Seeding (on reset)").selected_text(p.seeding.name()).show_ui(ui, |ui| {
+        ui.add(crate::ui::Slider::new(&mut p.channels, 1..=CHANNELS).text("Channels"));
+        crate::ui::dropdown(ui, "Seeding (on reset)", p.seeding.name(), |ui| {
             for s in Seeding::ALL {
                 ui.selectable_value(&mut p.seeding, s, s.name());
             }
         });
         ui.checkbox(&mut p.revive, "Revive / respawn life");
-        ui.add(egui::Slider::new(&mut p.respawn, 0.0..=1.0).text("Respawn below (share of seeded mass)"));
-        ui.add(egui::Slider::new(&mut p.cell_px, 1.5..=4.0).text("Cell size in pixels (on reset)"));
+        ui.add(crate::ui::Slider::new(&mut p.respawn, 0.0..=1.0).text("Respawn below (share of seeded mass)"));
+        ui.add(crate::ui::Slider::new(&mut p.cell_px, 1.5..=4.0).text("Cell size in pixels (on reset)"));
         for c in 0..p.active_channels() {
-            ui.add(egui::Slider::new(&mut p.quench[c], 0.0..=0.3).text(format!("Explosion quench, channel {}", c + 1)));
+            ui.add(crate::ui::Slider::new(&mut p.quench[c], 0.0..=0.3).text(format!("Explosion quench, channel {}", c + 1)));
         }
 
         ui.separator();
@@ -2614,7 +2652,7 @@ impl World for Lenia {
         let mut remove = None;
         for (i, kernel) in p.kernels.iter_mut().enumerate() {
             let title = format!(
-                "K{}  {}→{}  R {:.0}  μ {:.3}  σ {:.3}",
+                "K{}  {} > {}  R {:.0}  μ {:.3}  σ {:.3}",
                 i + 1,
                 kernel.source + 1,
                 kernel.target + 1,
@@ -2629,18 +2667,18 @@ impl World for Lenia {
                         channel_picker(ui, ("lenia dst", i), "To", &mut kernel.target, channels);
                     });
                 }
-                ui.add(egui::Slider::new(&mut kernel.radius, 3.0..=r_max).text("Radius R"));
-                ui.add(egui::Slider::new(&mut kernel.mu, 0.01..=0.6).text("Growth centre μ").fixed_decimals(3));
+                ui.add(crate::ui::Slider::new(&mut kernel.radius, 3.0..=r_max).text("Radius R"));
+                ui.add(crate::ui::Slider::new(&mut kernel.mu, 0.01..=0.6).text("Growth centre μ").fixed_decimals(3));
                 ui.add(
-                    egui::Slider::new(&mut kernel.sigma, 0.002..=0.25)
+                    crate::ui::Slider::new(&mut kernel.sigma, 0.002..=0.25)
                         .logarithmic(true)
                         .text("Growth width σ")
                         .fixed_decimals(4),
                 );
-                ui.add(egui::Slider::new(&mut kernel.h, 0.05..=1.0).text("Weight h"));
-                ui.add(egui::Slider::new(&mut kernel.rings, 1..=3).text("Rings"));
+                ui.add(crate::ui::Slider::new(&mut kernel.h, 0.05..=1.0).text("Weight h"));
+                ui.add(crate::ui::Slider::new(&mut kernel.rings, 1..=3).text("Rings"));
                 for (j, b) in kernel.b.iter_mut().enumerate().take(kernel.rings) {
-                    ui.add(egui::Slider::new(b, 0.0..=1.0).text(format!("Ring {} peak", j + 1)));
+                    ui.add(crate::ui::Slider::new(b, 0.0..=1.0).text(format!("Ring {} peak", j + 1)));
                 }
                 if count > 1 && ui.small_button("Remove kernel").clicked() {
                     remove = Some(i);
@@ -2663,29 +2701,29 @@ impl World for Lenia {
             if palette::combo(ui, &format!("lenia palette {c}"), &mut index) {
                 lut.set(gpu, index);
             }
-            ui.add(egui::Slider::new(&mut p.level[c], 0.0..=2.0).text("Brightness"));
-            ui.add(egui::Slider::new(&mut p.rim[c], 0.0..=2.0).text("Membrane rim"));
-            ui.add(egui::Slider::new(&mut p.hue[c], 0.0..=0.6).text("Body palette start"));
-            ui.add(egui::Slider::new(&mut p.core[c], 0.3..=0.98).text("Nuclei glow above"));
-            ui.add(egui::Slider::new(&mut p.glow[c], 0.0..=4.0).text("Nucleus glow"));
+            ui.add(crate::ui::Slider::new(&mut p.level[c], 0.0..=2.0).text("Brightness"));
+            ui.add(crate::ui::Slider::new(&mut p.rim[c], 0.0..=2.0).text("Membrane rim"));
+            ui.add(crate::ui::Slider::new(&mut p.hue[c], 0.0..=0.6).text("Body palette start"));
+            ui.add(crate::ui::Slider::new(&mut p.core[c], 0.3..=0.98).text("Nuclei glow above"));
+            ui.add(crate::ui::Slider::new(&mut p.glow[c], 0.0..=4.0).text("Nucleus glow"));
             if p.seeding == Seeding::Nursery && channels > 1 {
-                ui.add(egui::Slider::new(&mut p.abundance[c], 0.0..=8.0).text("Abundance (on reset)"));
+                ui.add(crate::ui::Slider::new(&mut p.abundance[c], 0.0..=8.0).text("Abundance (on reset)"));
             }
         }
-        ui.add(egui::Slider::new(&mut p.gain, 0.5..=3.0).text("Palette gain"));
-        ui.add(egui::Slider::new(&mut p.halo, 0.0..=2.0).text("Growth halo"));
-        ui.add(egui::Slider::new(&mut p.trail, 0.0..=3.0).text("Wakes"));
-        ui.add(egui::Slider::new(&mut p.persistence, 0.8..=0.99).text("Wake persistence"));
-        ui.add(egui::Slider::new(&mut p.tint, 0.0..=1.0).text("Halo and wake tint"));
-        ui.add(egui::Slider::new(&mut p.relief, 0.0..=1.0).text("Relief lighting"));
-        ui.add(egui::Slider::new(&mut p.mix_power, 1.0..=4.0).text("Colour mixing (blend … dominant)"));
-        ui.add(egui::Slider::new(&mut p.sharp, 0.0..=1.0).text("Sharpness (soft … crisp)"));
+        ui.add(crate::ui::Slider::new(&mut p.gain, 0.5..=3.0).text("Palette gain"));
+        ui.add(crate::ui::Slider::new(&mut p.halo, 0.0..=2.0).text("Growth halo"));
+        ui.add(crate::ui::Slider::new(&mut p.trail, 0.0..=3.0).text("Wakes"));
+        ui.add(crate::ui::Slider::new(&mut p.persistence, 0.8..=0.99).text("Wake persistence"));
+        ui.add(crate::ui::Slider::new(&mut p.tint, 0.0..=1.0).text("Halo and wake tint"));
+        ui.add(crate::ui::Slider::new(&mut p.relief, 0.0..=1.0).text("Relief lighting"));
+        ui.add(crate::ui::Slider::new(&mut p.mix_power, 1.0..=4.0).text("Colour mixing (blend … dominant)"));
+        ui.add(crate::ui::Slider::new(&mut p.sharp, 0.0..=1.0).text("Sharpness (soft … crisp)"));
         if channels > 1 {
             channel_picker(ui, "lenia ground", "Medium from channel", &mut p.ground_channel, channels);
         }
-        ui.add(egui::Slider::new(&mut p.ground, 0.0..=4.0).text("Medium hue"));
-        ui.add(egui::Slider::new(&mut p.medium, 0.0..=2.0).text("Light cast into the medium"));
-        ui.add(egui::Slider::new(&mut p.brightness, 0.2..=3.0).text("Brightness"));
+        ui.add(crate::ui::Slider::new(&mut p.ground, 0.0..=4.0).text("Medium hue"));
+        ui.add(crate::ui::Slider::new(&mut p.medium, 0.0..=2.0).text("Light cast into the medium"));
+        ui.add(crate::ui::Slider::new(&mut p.brightness, 0.2..=3.0).text("Brightness"));
     }
 
     fn post_settings(&self) -> PostSettings {

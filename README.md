@@ -14,9 +14,9 @@
   </picture>
 </p>
 
-Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems, **36 curated presets** and a *Mutate* button that jumps to a random but reliably interesting region of parameter space. A cinematic HDR pipeline is shared by all four worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
+Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems plus **Symbiosis**, an experiment that couples agents and chemistry, **39 presets** and a *Mutate* button for exploring new settings. A cinematic HDR pipeline is shared by all five worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
 
-- [The four worlds](#the-four-worlds)
+- [The five worlds](#the-five-worlds)
 - [Features](#features)
 - [Quick start](#quick-start)
 - [Controls](#controls)
@@ -24,7 +24,7 @@ Primordia is a playground for **emergence** and **self-organisation**. It has fo
 - [How it works](#how-it-works)
 - [Inspiration and references](#inspiration-and-references)
 
-## The four worlds
+## The five worlds
 
 ### 1 · Physarum (slime mould)
 
@@ -66,13 +66,31 @@ Two virtual chemicals, U and V, react (`U + 2V → 3V`) and diffuse. Depending o
 
 ![All reaction-diffusion presets](docs/images/reaction-diffusion-presets.png)
 
+### 5. Symbiosis
+
+![Symbiosis: pale agent networks crossing turquoise chemical colonies](docs/images/symbiosis.png)
+
+A coupled-world experiment: Physarum-style agents follow both their own trails and the margins of Gray-Scott chemical growth. Their trails reduce local chemical loss and help growth spread. Both directions respond to one **Coupling strength** slider; at zero, the two simulations keep running independently. This uses a dedicated shared habitat, with a bounded grid to keep larger displays responsive.
+
+Choose **Living Reef**, **Wandering Veins** or **Coral Maze**, then switch the **View** between Together, Chemistry and Agent trails to inspect the interaction. Changes to coupling take effect immediately; the existing habitat carries its history forward. To compare runs from the same starting point, save a recipe and load it before each experiment. Left-drag seeds chemistry; right-drag clears chemistry and trails. Seeds, parameters, palette and view mode all work with the saved library.
+
+Enable **Compare with coupling off** to restart two habitats from the same seed. The left uses your coupling strength; the right holds coupling at zero. All other settings, brush strokes, pan and zoom are shared. **Restart comparison** repeats the experiment from that seed with your current settings; turning comparison off keeps the left habitat running. The mode is saved with your recipe, and earlier saves still open in the single-world view. Press **H / Tab** to give both panes more room. Comparison runs two simulations, so it uses more GPU time and memory.
+
+![Living Reef, seed 42 after 720 frames: coupling 0.70 on the left, coupling off on the right](docs/images/symbiosis-comparison.png)
+
+```bash
+cargo run --release -- --world symbiosis --preset "Living Reef"
+primordia render --world symbiosis --preset "Wandering Veins" --seed 42 --frames 720 --out symbiosis.png
+```
+
 ## Features
 
-- **Real-time GPU simulation** in WGSL compute shaders. Every world runs at hundreds of fps at 1080p on an RTX 4090 (see [Performance](#performance)).
-- **36 curated presets** and **Mutate** (`M`), which lands on a new, random but interesting parameter set.
+- **Real-time GPU simulation** in WGSL compute shaders (see [Performance](#performance) for measurements of the four original worlds).
+- **39 presets** and **Mutate** (`M`) for exploring new parameter sets.
 - **Interactive.** Paint, feed, attract, repel and erase with the mouse. Zoom into any detail, and pan across the seamless toroidal world.
 - **Cinematic look.** HDR bloom (the Jimenez 13-tap chain with level falloff), AgX, ACES or Reinhard tonemapping, perceptual OKLab palettes, vignette, film grain and dithering.
 - **Live control panel** (egui) exposing every parameter of every world.
+- **Saved worlds library.** Name and keep your discoveries, including their seed, all world settings, colours, post effects and camera view.
 - **Tour mode** (`T`): a screensaver that fades through every preset of every world.
 - **Screenshots** (`F12`) and **MP4 recording** (`V`) straight from the app.
 - **Headless rendering.** PNGs, frame sequences, MP4s, galleries and contact sheets from the command line, deterministic from a seed. A scripted mouse lets you test interactions too.
@@ -103,12 +121,12 @@ cargo run --release -- --tour 20 --fullscreen
 | **Left drag** | The world's primary action (feed / attract / paint life / seed chemistry) |
 | **Right drag** | The world's secondary action (repel / erase) |
 | **Wheel** / **middle drag** | Zoom at the cursor / pan |
-| `1`–`4` | Switch world |
+| `1`–`5` | Switch world |
 | `,` `.` | Previous / next preset |
 | `R` / `M` | Reset with a new seed / mutate the parameters |
 | `Space` / `N` | Pause / single step |
 | `[` `]` | Brush size |
-| `H` or `Tab` | Hide the control panel |
+| `H` or `Tab` | Hide / show the control panel |
 | `F` or `F11` | Fullscreen |
 | `S` or `F12` | Screenshot (PNG) |
 | `V` | Start / stop recording an MP4 |
@@ -117,6 +135,14 @@ cargo run --release -- --tour 20 --fullscreen
 | `Esc` | Leave fullscreen; press it twice to quit |
 
 Shortcuts use physical key positions, so they work on any keyboard layout.
+
+The control panel keeps world selection, presets, playback and capture within reach. Use **World** for simulation parameters and materials, **Appearance** for bloom and colour grading, and **Tools** for the brush, camera, tour and keyboard reference. Settings scroll independently of the playback and capture controls; shorter windows use a compact world picker.
+
+The tabs fit their labels without wrapping, and the panel adapts to narrow windows. Dropdown labels sit above their fields, with gradient previews for palettes. When the panel is collapsed, click **Controls** at the top left or press **H / Tab** to reopen it.
+
+Use **Save settings** or the **Library** tab, enter a name, and choose **Save current world**. The library supports loading, renaming and deleting saves across all five worlds. Saving keeps the current simulation running. Loading restarts from the saved seed with its settings and original world dimensions; evolving patterns and brush edits at the saved moment are not snapshots. Duplicate names create separate saves.
+
+Saves are individual JSON files in `%APPDATA%\Primordia\library` on Windows, `~/Library/Application Support/Primordia/library` on macOS, or `$XDG_DATA_HOME/primordia/library` (default `~/.local/share/primordia/library`) on Linux. The Library tab shows the folder. Back up or copy these files to keep your collection; use **Refresh** to pick up copied saves. `PRIMORDIA_LIBRARY_DIR` overrides the folder.
 
 ## Rendering without a window
 
@@ -178,6 +204,10 @@ Under the hood, per world:
   - Periodic modulations keep the chemistry alive: kill-rate "weather", drifting lagoons, pattern-size variation, and a ridge flow that closes stripes into whorls.
   - Auto-contrast comes from a GPU histogram.
   - Five lighting materials are available for the height field.
+- **Symbiosis**
+  - Agents sense chemical growth alongside their own trails; trail deposits feed back into the chemistry's local loss rate.
+  - The optional comparison habitat has separate GPU state, the same seed and settings, and zero coupling.
+  - Both views share the camera and brush, with matching world scale in each half of the image.
 
 One lesson learned along the way: on some GPU/driver combinations, WGSL's signed integer `%` is wrong for negative operands, and wrapping with float division is off by one at some sizes. Both show up as seams on a torus. The prelude's `wrap_i` corrects for both, and `primordia selftest` checks it against the CPU on your hardware.
 
@@ -195,6 +225,18 @@ These are headless numbers on an RTX 4090 at 1920×1080, uncapped, for each worl
 ## Write your own world
 
 Copy `src/world/placeholder.rs`, the smallest possible world, register it in `src/world/mod.rs`, and follow [docs/WRITING_A_WORLD.md](docs/WRITING_A_WORLD.md). The engine gives you the window, camera, bloom, tonemapping, UI shell, screenshots, recording, headless rendering and contact sheets for free.
+
+## Development checks
+
+```bash
+cargo test --locked
+cargo test --locked -- --include-ignored  # also generate visual previews in target/
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
+cargo run --release --locked -- selftest
+```
+
+The tests need a supported GPU, but no window. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, and control-panel layout. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons.
 
 ## Inspiration and references
 

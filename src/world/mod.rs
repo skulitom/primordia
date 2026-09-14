@@ -28,6 +28,7 @@ pub mod particle_life;
 pub mod physarum;
 pub mod placeholder;
 pub mod reaction_diffusion;
+pub mod symbiosis;
 
 use anyhow::{anyhow, Result};
 
@@ -44,7 +45,7 @@ pub struct ViewXform {
 }
 
 /// Camera over a world: `center` in world uv, `zoom` 1 = the world covers the screen.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Camera {
     pub center: [f32; 2],
     pub zoom: f32,
@@ -130,10 +131,27 @@ pub trait World {
     /// interesting behaviour) and restarts.
     fn mutate(&mut self, gpu: &Gpu, seed: u64);
 
+    /// Complete editable recipe, independent of the evolving GPU buffers.
+    fn settings(&self) -> Result<crate::library::WorldSettings> {
+        anyhow::bail!("This world does not support saved settings")
+    }
+    fn restore_settings(&mut self, _gpu: &Gpu, _settings: &crate::library::WorldSettings, _seed: u64) -> Result<()> {
+        anyhow::bail!("This world does not support saved settings")
+    }
+
     /// Advances the simulation by one displayed frame (usually several sub-steps).
     fn step(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder);
     /// Paints the current state into `target` (`SCENE_FORMAT`, `frame.target_size`).
     fn render(&mut self, frame: &Frame, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView);
+
+    /// Map an input position through the world's presentation (e.g. split panes).
+    /// The app uses the same mapping for brushes and cursor-anchored zoom.
+    fn map_position(&self, view: ViewXform, screen_uv: [f32; 2]) -> [f32; 2] {
+        view.apply(screen_uv)
+    }
+
+    /// Optional labels for a left/right comparison, drawn by the app's HUD.
+    fn comparison_labels(&self) -> Option<[String; 2]> { None }
 
     /// Parameter controls, drawn inside the side panel.
     fn ui(&mut self, gpu: &Gpu, ui: &mut egui::Ui);
@@ -192,6 +210,13 @@ pub const WORLDS: &[WorldEntry] = &[
         tagline: "Gray-Scott chemistry painting coral, mitosis and fingerprints",
         create: reaction_diffusion::create,
     },
+    WorldEntry {
+        id: "symbiosis",
+        name: "Symbiosis",
+        aliases: &["coupled", "hybrid", "ecosystem"],
+        tagline: "Trail-following agents and living chemistry shape each other",
+        create: symbiosis::create,
+    },
 ];
 
 fn normalize(s: &str) -> String {
@@ -241,6 +266,9 @@ pub fn create(
         let ids: Vec<&str> = WORLDS.iter().map(|w| w.id).collect();
         anyhow!("unknown world '{query}' (available: {})", ids.join(", "))
     })?;
+    if WORLDS[index].id == "reaction-diffusion" {
+        reaction_diffusion::validate_output_size(gpu, output_size)?;
+    }
     let mut world = (WORLDS[index].create)(gpu, output_size, seed);
     if let Some(p) = preset {
         let presets = world.presets();
