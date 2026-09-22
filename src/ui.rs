@@ -16,6 +16,10 @@ pub const SELECTED: Color32 = Color32::from_rgb(30, 65, 59);
 pub const WARN: Color32 = Color32::from_rgb(255, 128, 130);
 pub const PANEL_WIDTH: f32 = 364.0;
 
+/// The app icon: a disc cut from a Physarum "Galaxy" render, as PNG images
+/// from 16 to 256 pixels. build.rs embeds the same file in the Windows exe.
+pub const ICON: &[u8] = include_bytes!("../assets/primordia.ico");
+
 pub fn control_panel(ctx: &egui::Context) -> egui::SidePanel {
     let frame = egui::Frame::side_top_panel(&ctx.style())
         .fill(PANEL)
@@ -461,6 +465,41 @@ pub fn measurements(
     toggle_log
 }
 
+/// RGBA pixels of a `size` x `size` icon taken from an `.ico` file whose images
+/// are PNG-compressed, as all of [`ICON`]'s are: the smallest image at least
+/// that large (else the largest), resized if it does not match exactly.
+pub fn icon_rgba(ico: &[u8], size: u32) -> anyhow::Result<Vec<u8>> {
+    use anyhow::{Context as _, ensure};
+    ensure!((1..=1024).contains(&size), "unsupported icon size {size}");
+    let u16_at = |at: usize| ico.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |at: usize| ico.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    ensure!(u16_at(0) == Some(0) && u16_at(2) == Some(1), "not an .ico file");
+    let mut images = Vec::new();
+    // Each 16-byte directory entry: width (0 = 256), height, colours, reserved,
+    // planes, bits per pixel, image length and image offset.
+    for entry in (0..usize::from(u16_at(4).unwrap_or(0))).map(|i| 6 + 16 * i) {
+        let width = *ico.get(entry).context("the .ico directory is truncated")?;
+        let (len, offset) = u32_at(entry + 8).zip(u32_at(entry + 12)).context("the .ico directory is truncated")?;
+        let data = ico.get(offset..offset.saturating_add(len)).context("an .ico image is truncated")?;
+        images.push((if width == 0 { 256 } else { u32::from(width) }, data));
+    }
+    let (_, data) = images
+        .iter()
+        .filter(|(width, _)| *width >= size)
+        .min_by_key(|(width, _)| *width)
+        .or_else(|| images.iter().max_by_key(|(width, _)| *width))
+        .context("the .ico file holds no images")?;
+    let image = image::load_from_memory_with_format(data, image::ImageFormat::Png)
+        .context("decoding an .ico image (only PNG-compressed ones are supported)")?
+        .into_rgba8();
+    let image = if image.dimensions() == (size, size) {
+        image
+    } else {
+        image::imageops::resize(&image, size, size, image::imageops::FilterType::Lanczos3)
+    };
+    Ok(image.into_raw())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +712,35 @@ mod tests {
         assert!(ys.iter().all(|y| (y - ys[0]).abs() < 1e-3), "a flat trace stays level");
         assert_eq!(lines[1].points.len(), 3, "non-finite points are skipped");
         assert!(lines[1].points.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+    }
+
+    #[test]
+    fn the_app_icon_decodes_at_every_size_the_window_asks_for() {
+        for size in [16, 20, 24, 28, 32, 40, 48, 56, 64, 128, 256, 300] {
+            let rgba = icon_rgba(ICON, size).unwrap();
+            assert_eq!(rgba.len(), (size * size * 4) as usize, "{size} px");
+            let alpha = |x: u32, y: u32| rgba[((y * size + x) * 4 + 3) as usize];
+            // A disc: clear corners, an opaque and visible middle.
+            assert_eq!(alpha(0, 0), 0, "{size} px corner");
+            assert_eq!(alpha(size / 2, size / 2), 255, "{size} px centre");
+            let lit = rgba.chunks_exact(4).filter(|px| px[3] > 0 && px[..3].iter().any(|&c| c > 96)).count();
+            assert!(lit > (size * size / 20) as usize, "{size} px icon is too dark");
+        }
+    }
+
+    #[test]
+    fn icon_decoding_rejects_damaged_files() {
+        assert!(icon_rgba(b"", 32).is_err());
+        assert!(icon_rgba(b"\x89PNG\r\n\x1a\n", 32).is_err());
+        assert!(icon_rgba(&ICON[..40], 32).is_err(), "directory entries pointing past the end");
+        let mut empty = ICON[..6].to_vec();
+        empty[4..6].copy_from_slice(&0u16.to_le_bytes());
+        assert!(icon_rgba(&empty, 32).is_err(), "no images");
+        let mut garbled = ICON.to_vec();
+        let first = u32::from_le_bytes(garbled[18..22].try_into().unwrap()) as usize;
+        garbled[first..first + 8].fill(0);
+        assert!(icon_rgba(&garbled, 16).is_err(), "not a PNG");
+        assert!(icon_rgba(ICON, 0).is_err());
     }
 
     #[test]

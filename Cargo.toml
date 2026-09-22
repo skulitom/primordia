@@ -42,6 +42,11 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 
+# The exe's icon and version information (build.rs). Without the `toml`
+# feature it needs nothing newer than Rust 1.86; it runs the Windows SDK's rc.exe.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
+
 [profile.dev]
 opt-level = 1
 

@@ -13,7 +13,7 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Icon, Window, WindowAttributes, WindowId};
 
 use crate::capture::{self, Readback};
 use crate::gpu::Gpu;
@@ -359,7 +359,8 @@ impl State {
         if opts.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
-        let window = Arc::new(event_loop.create_window(attrs).context("creating window")?);
+        let scale_factor = event_loop.primary_monitor().map_or(1.0, |monitor| monitor.scale_factor());
+        let window = Arc::new(event_loop.create_window(with_icons(attrs, scale_factor)).context("creating window")?);
 
         let instance = Gpu::create_instance();
         let surface = instance.create_surface(window.clone()).context("creating surface")?;
@@ -1792,6 +1793,27 @@ impl State {
 fn recording_frames_due(elapsed: Duration, written: u64) -> u32 {
     let total = (elapsed.as_secs_f64() * f64::from(RECORD_FPS)).floor() as u64 + 1;
     total.saturating_sub(written).min(u64::from(u32::MAX)) as u32
+}
+
+/// Title-bar and taskbar icons for a window on a display with this scale factor.
+fn with_icons(mut attrs: WindowAttributes, scale_factor: f64) -> WindowAttributes {
+    let icon = |points: f64| {
+        let size = (points * scale_factor).round().clamp(16.0, 256.0) as u32;
+        theme::icon_rgba(theme::ICON, size)
+            .and_then(|rgba| Ok(Icon::from_rgba(rgba, size, size)?))
+            .map_err(|e| log::warn!("window icon: {e:#}"))
+            .ok()
+    };
+    // Windows shows this one in the title bar; X11 window managers scale one
+    // larger icon as they need; macOS and Wayland ignore it.
+    attrs = attrs.with_window_icon(icon(if cfg!(windows) { 16.0 } else { 64.0 }));
+    // The big one goes in the taskbar and Alt+Tab.
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::WindowAttributesExtWindows as _;
+        attrs = attrs.with_taskbar_icon(icon(32.0));
+    }
+    attrs
 }
 
 fn scaled(size: [u32; 2], scale: f32) -> [u32; 2] {
