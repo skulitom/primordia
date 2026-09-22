@@ -102,6 +102,12 @@ impl Gpu {
 
         let info = adapter.get_info();
         log::info!("GPU: {}", describe_adapter(&info));
+        if info.backend == wgpu::Backend::Dx12 {
+            log::info!(
+                "DirectX 12 compiles shaders slowly: each world takes a minute or two to start, Lenia several \
+                 minutes (WGPU_BACKEND=vulkan starts in seconds where Vulkan is available)"
+            );
+        }
 
         // Optional niceties; only requested when the adapter has them.
         let wanted = wgpu::Features::FLOAT32_FILTERABLE;

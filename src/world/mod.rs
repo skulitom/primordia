@@ -517,6 +517,10 @@ pub fn create_at(gpu: &Gpu, index: usize, output_size: [u32; 2], preset: Option<
     if WORLDS[index].id == "reaction-diffusion" {
         reaction_diffusion::validate_output_size(gpu, output_size).map_err(|e| Failure::Usage.tag(e))?;
     }
+    if gpu.adapter.get_info().backend == wgpu::Backend::Dx12 {
+        // The DirectX 12 shader compiler takes a minute or more per world (see `Gpu::new`).
+        log::info!("preparing {}: compiling its shaders for DirectX 12, please wait", WORLDS[index].name);
+    }
     let mut world = (WORLDS[index].create)(gpu, output_size, seed);
     if let Some(i) = preset {
         let count = world.presets().len();
