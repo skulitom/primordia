@@ -19,7 +19,7 @@ pub const PANEL_WIDTH: f32 = 364.0;
 pub fn control_panel(ctx: &egui::Context) -> egui::SidePanel {
     let frame = egui::Frame::side_top_panel(&ctx.style())
         .fill(PANEL)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0f32, BORDER))
         .inner_margin(egui::Margin::same(18));
     egui::SidePanel::left("controls")
         .resizable(false)
@@ -71,11 +71,11 @@ pub fn configure(ctx: &egui::Context) {
     v.code_bg_color = SURFACE;
     v.weak_text_color = Some(MUTED);
     v.selection.bg_fill = SELECTED;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.selection.stroke = Stroke::new(1.0f32, ACCENT);
     v.hyperlink_color = ACCENT;
     v.warn_fg_color = Color32::from_rgb(235, 194, 130);
     v.error_fg_color = WARN;
-    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.window_stroke = Stroke::new(1.0f32, BORDER);
     v.window_corner_radius = 10.into();
     v.menu_corner_radius = 8.into();
     v.slider_trailing_fill = true;
@@ -88,8 +88,8 @@ pub fn configure(ctx: &egui::Context) {
         &mut v.widgets.open,
     ] {
         widget.corner_radius = 6.into();
-        widget.bg_stroke = Stroke::new(1.0, BORDER);
-        widget.fg_stroke = Stroke::new(1.0, TEXT);
+        widget.bg_stroke = Stroke::new(1.0f32, BORDER);
+        widget.fg_stroke = Stroke::new(1.0f32, TEXT);
         widget.expansion = 0.0;
     }
     v.widgets.noninteractive.bg_fill = PANEL;
@@ -98,11 +98,11 @@ pub fn configure(ctx: &egui::Context) {
     v.widgets.inactive.weak_bg_fill = SURFACE;
     v.widgets.hovered.bg_fill = Color32::from_rgb(47, 67, 70);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(35, 49, 54);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, MUTED);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0f32, MUTED);
     v.widgets.active.bg_fill = SELECTED;
     v.widgets.active.weak_bg_fill = SELECTED;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.active.bg_stroke = Stroke::new(1.0f32, ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0f32, ACCENT);
     v.widgets.open.bg_fill = SELECTED;
     v.widgets.open.weak_bg_fill = SELECTED;
     ctx.set_style(style);
@@ -148,7 +148,7 @@ pub fn dropdown<R>(
 pub fn overlay() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL.gamma_multiply(0.96))
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0f32, BORDER))
         .corner_radius(10)
         .inner_margin(egui::Margin::symmetric(14, 10))
 }
@@ -158,8 +158,8 @@ pub fn mark(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
     let p = ui.painter();
     let c = rect.center();
-    p.circle_stroke(c, 14.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.5)));
-    p.circle_stroke(c, 8.0, Stroke::new(1.0, ACCENT));
+    p.circle_stroke(c, 14.0, Stroke::new(1.0f32, ACCENT.gamma_multiply(0.5)));
+    p.circle_stroke(c, 8.0, Stroke::new(1.0f32, ACCENT));
     p.circle_filled(c, 3.0, ACCENT);
     for offset in [egui::vec2(0.0, -14.0), egui::vec2(12.1, 7.0), egui::vec2(-12.1, 7.0)] {
         p.circle_filled(c + offset, 2.5, ACCENT);
@@ -190,7 +190,7 @@ pub fn world_card(ui: &mut egui::Ui, width: f32, name: &str, detail: &str, selec
     } else {
         BORDER
     };
-    ui.painter().rect(rect, 8.0, fill, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+    ui.painter().rect(rect, 8.0, fill, Stroke::new(1.0f32, border), egui::StrokeKind::Inside);
     let title_size = if name.len() > 16 { 12.5 } else { 14.0 };
     ui.painter().text(
         rect.min + egui::vec2(12.0, 17.0),
@@ -227,7 +227,8 @@ pub fn inspector_tabs(ui: &mut egui::Ui, selected: &mut Inspector) {
         (Inspector::Tools, "Tools", "Brush, camera, tour and shortcuts"),
         (Inspector::Library, "Library", "Save and reload your favourite worlds"),
     ];
-    egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(8).inner_margin(3).show(ui, |ui| {
+    let frame = egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0f32, BORDER)).corner_radius(8).inner_margin(3);
+    frame.show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
         let widths = button_widths(ui, tabs.map(|(_, title, _)| title));
@@ -316,7 +317,7 @@ pub fn sparkline(
     const PAD: f32 = 10.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect(rect, 8.0, SURFACE, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    painter.rect(rect, 8.0, SURFACE, Stroke::new(1.0f32, BORDER), egui::StrokeKind::Inside);
     painter.text(rect.min + egui::vec2(PAD, 12.0), egui::Align2::LEFT_CENTER, label, FontId::proportional(11.0), MUTED);
     painter.text(
         egui::pos2(rect.max.x - PAD, rect.min.y + 12.0),
@@ -359,7 +360,7 @@ pub fn sparkline(
                     painter.circle_filled(points[0], 2.0, *colour);
                 }
                 _ => {
-                    painter.add(egui::Shape::line(points, Stroke::new(1.25, *colour)));
+                    painter.add(egui::Shape::line(points, Stroke::new(1.25f32, *colour)));
                 }
             }
         }

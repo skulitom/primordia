@@ -1497,8 +1497,8 @@ impl Physarum {
             let sp = p.species[s].sanitized();
             motion[s] = [sp.sensor_angle.to_radians(), sp.sensor_distance, sp.turn_angle.to_radians(), sp.speed];
             extra[s] = [sp.wander.to_radians(), sp.curl.to_radians(), sp.spread, 0.0];
-            for j in 0..k {
-                interact[s][j] = p.interact[s][j].clamp(-2.0, 2.0);
+            for (value, raw) in interact[s].iter_mut().zip(p.interact[s]).take(k) {
+                *value = raw.clamp(-2.0, 2.0);
             }
             if s < k {
                 deposit[s] = sp.deposit * scale;

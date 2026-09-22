@@ -271,6 +271,8 @@ fn random_matrix(rng: &mut Rng, k: usize) -> Matrix {
 ///   dots that end up out of each other's reach. A "spreader" (weak or negative
 ///   self-attraction) forms a foam, lace or membrane instead, which keeps the
 ///   world connected and moving.
+// Indices read better here: each pair is compared with its mirror, m[j][i].
+#[allow(clippy::needless_range_loop)]
 fn is_lively(m: &Matrix, k: usize) -> bool {
     let mut sum = 0.0;
     let mut asymmetry = 0.0;

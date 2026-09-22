@@ -1576,7 +1576,7 @@ impl State {
         }
         for (index, entry) in self.library.entries.iter().enumerate() {
             ui.push_id(&entry.path, |ui| {
-                egui::Frame::new().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0, theme::BORDER))
+                egui::Frame::new().fill(theme::SURFACE).stroke(egui::Stroke::new(1.0f32, theme::BORDER))
                     .inner_margin(12).corner_radius(8).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(egui::RichText::new(&entry.saved.name).strong().color(ACCENT));
@@ -1779,7 +1779,7 @@ impl State {
                 ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("brush"))).circle_stroke(
                     egui::pos2(c[0] / ppp, c[1] / ppp),
                     self.brush_pts,
-                    egui::Stroke::new(1.0, color),
+                    egui::Stroke::new(1.0f32, color),
                 );
             }
         }

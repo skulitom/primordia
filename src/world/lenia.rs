@@ -969,7 +969,7 @@ fn build_plan(params: &Params, r_max: u32) -> Plan {
         for y in 0..span {
             let row = &grid[y * span..(y + 1) * span];
             let Some(first) = row.iter().position(live) else { continue };
-            let end = row.iter().rposition(live).map_or(first, |e| e) + 1;
+            let end = row.iter().rposition(live).unwrap_or(first) + 1;
             plan.rows.push([plan.taps.len() as u32, (end - first + 3) as u32, y as u32 * tile_w + first as u32, 0]);
             plan.taps.extend_from_slice(&row[first..end]);
             plan.taps.extend_from_slice(&[[0.0; 4]; 3]);
@@ -2489,7 +2489,7 @@ impl World for Lenia {
             }
             amount *= 0.6;
         }
-        log::info!("lenia mutation of {}:\n{}", PRESET_NAMES[index], describe(&params));
+        log::debug!("lenia mutation of {}:\n{}", PRESET_NAMES[index], describe(&params));
 
         // A random but coherent look around the species' own.
         let b = &base.params;
@@ -2519,7 +2519,7 @@ impl World for Lenia {
         // A template species nudged out of its niche hatches nothing: fall
         // back to the species' own kernels (keeping the new look).
         if self.params.template.is_some() && self.windows.is_empty() {
-            log::info!("lenia mutation hatched nothing; keeping {}'s own kernels", PRESET_NAMES[index]);
+            log::debug!("lenia mutation hatched nothing; keeping {}'s own kernels", PRESET_NAMES[index]);
             self.params.kernels = base.params.kernels;
             self.params.scale = base.params.scale;
             self.reset(gpu, seed);
