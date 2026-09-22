@@ -1,0 +1,81 @@
+name: Bug report
+description: Something crashes, renders wrongly or behaves unexpectedly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Most problems in a GPU program depend on the graphics card, driver and backend,
+        so the GPU line and the selftest output below matter more than usual.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what you saw instead. A screenshot or a short clip helps.
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Exact command
+      description: How you started Primordia, with every argument. Write "double-clicked it" if that is how.
+      placeholder: primordia --world lenia --preset "Pearl Reef" --seed 42
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `primordia --version`, or the commit (`git rev-parse --short HEAD`) if you built it.
+      placeholder: primordia 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: With its version, and on Linux whether you run Wayland or X11.
+      placeholder: Windows 11 24H2 / Ubuntu 24.04 on Wayland / macOS 15.5
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU line from the log
+      description: >-
+        Primordia prints the adapter it picked when it starts, in the terminal it was started from. If you
+        double-clicked it, run it from a terminal once to see the line.
+      placeholder: "[INFO ] GPU: NVIDIA GeForce RTX 4090 (Vulkan, DiscreteGpu)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Output of `primordia selftest`
+      description: It checks, on your GPU, the shader maths every world relies on. Please paste all of it.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: >-
+        Everything the terminal printed, especially lines marked WARN or ERROR. Setting
+        `RUST_LOG=warn,primordia=debug` adds detail.
+      render: text
+
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else?
+      description: >-
+        Does it happen in every world and preset? Does another backend behave differently (`WGPU_BACKEND=vulkan`,
+        `dx12`, `metal` or `gl`)? On a laptop with two GPUs, does `WGPU_POWER_PREF=low` or `high` change it?

@@ -1,0 +1,12 @@
+# Blank issues stay open for questions and ideas that fit neither form.
+blank_issues_enabled: true
+contact_links:
+  - name: README
+    url: https://github.com/skulitom/primordia#readme
+    about: Controls, the command line (render, gallery, explore), the library and performance numbers.
+  - name: Writing a world
+    url: https://github.com/skulitom/primordia/blob/main/docs/WRITING_A_WORLD.md
+    about: The guide to adding a simulation of your own, with a checklist and the usual gotchas.
+  - name: Contributing
+    url: https://github.com/skulitom/primordia/blob/main/CONTRIBUTING.md
+    about: Building, testing, code style and how to report a GPU problem.

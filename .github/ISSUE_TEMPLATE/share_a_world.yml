@@ -1,0 +1,76 @@
+name: Share a world
+description: Show a world you found with Mutate, explore or by hand, with its recipe so others can open it
+title: "World: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Found something beautiful or strange? Share it here. A recipe is a small JSON file that holds the world,
+        its seed, every setting, the colours and the camera, so anyone can load it from the Library tab or
+        copy it into their library folder.
+
+  - type: dropdown
+    id: world
+    attributes:
+      label: World
+      options:
+        - Physarum
+        - Particle Life
+        - Lenia
+        - Reaction-Diffusion
+        - Symbiosis
+        - A world of my own
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot or clip
+      description: >-
+        Drag in a PNG (S or F12 in the app, or `primordia render`) or a short MP4 (V in the app, or
+        `primordia render --video`).
+    validations:
+      required: true
+
+  - type: textarea
+    id: recipe
+    attributes:
+      label: Recipe
+      description: >-
+        Paste the JSON of a Library save (the Library tab shows its folder) or of a `recipes/NN-seedS.json` written
+        by `primordia explore`. If the PNG above carries its recipe, you can leave this empty.
+      render: json
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: >-
+        How to get there, if the recipe alone does not say: for example the `primordia render` or
+        `primordia explore` command with its seed, or the preset and the Mutate presses.
+      render: shell
+      placeholder: primordia explore --world symbiosis --select max:growth_cover --keep 8 --refine 0 --seed 7
+
+  - type: textarea
+    id: story
+    attributes:
+      label: What makes it interesting?
+      description: What to look for, how it changes over time, and anything you changed by hand.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version and GPU
+      description: >-
+        `primordia --version` and the `GPU:` line from the log. Chaotic worlds (Particle Life, Physarum,
+        Symbiosis) replay exactly only on the same GPU, driver and backend; elsewhere they give the same kind of
+        pattern.
+      placeholder: "primordia 0.1.0, GPU: NVIDIA GeForce RTX 4090 (Vulkan, DiscreteGpu)"
+
+  - type: checkboxes
+    id: gallery
+    attributes:
+      label: Gallery
+      options:
+        - label: The project may show this world, credited to my GitHub name, in its README or a gallery.
