@@ -1,0 +1,120 @@
+# Checks every push to main and every pull request.
+#
+# - clippy on the MSRV (Rust 1.86, from Cargo.toml) and on current stable, which adds new lints over time.
+# - Linux runs the test suite, GPU tests included, on lavapipe (Mesa's software Vulkan driver). The ten tests that
+#   loop over every preset or every world only run in the weekly scheduled run, or on demand from the Actions tab.
+# - Windows and macOS runners have no usable GPU, so there the build is checked and the CPU-side tests run with
+#   PRIMORDIA_GPU_TESTS=skip.
+#
+# There is no rustfmt job on purpose: the code is formatted by hand to about 120 columns.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays at 04:17 UTC: the full GPU suite on lavapipe
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: Run every GPU test on Linux, including the slow every-preset and every-world ones
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to a pull request cancels its older run. Every other run has a group of its own, so runs on main
+  # (and the weekly run) always finish.
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Line tables keep file:line in panics and backtraces while shrinking the target directory (1.3 GB of debug
+  # dependencies with full debuginfo) and its cache, and speeding up links.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  clippy:
+    name: clippy (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.86", stable]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Building on Linux needs no -dev packages: winit, wayland-sys, x11rb and xkbcommon load their libraries with
+  # dlopen at run time, and the tests never open a window.
+  test-linux:
+    name: test (Linux, lavapipe, Rust 1.86)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.full_suite) && 240 || 60 }}
+    env:
+      # lavapipe is the only adapter installed; this also keeps wgpu off a GL (llvmpipe) adapter should the
+      # image ever ship one. PRIMORDIA_GPU_TESTS is left unset, so a GPU test that finds no adapter fails.
+      WGPU_BACKEND: vulkan
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+      - uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the tests
+        run: cargo test --locked --no-run
+      # Prints the adapter and stops early if lavapipe does not come up.
+      - name: selftest
+        run: cargo run --locked -- selftest
+      # The tests that loop over every preset or every world take 71% of the suite's time on an RTX 4090, and
+      # minutes each on a software adapter, so pushes and pull requests skip them.
+      - name: Tests (quick set)
+        if: ${{ !(github.event_name == 'schedule' || inputs.full_suite) }}
+        run: cargo test --locked -- --skip every_preset --skip every_world --skip full_coupling
+      - name: Tests (full suite)
+        if: ${{ github.event_name == 'schedule' || inputs.full_suite }}
+        run: cargo test --locked
+
+  # Windows runners only offer WARP through DX12, where naga 25 panics while translating some worlds' shaders to
+  # HLSL and FXC takes minutes per world; macOS runners only have a paravirtual Metal device. So these check that
+  # everything builds on current stable and run the CPU-side tests.
+  build:
+    name: build and CPU tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    env:
+      PRIMORDIA_GPU_TESTS: skip
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
