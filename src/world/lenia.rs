@@ -856,7 +856,7 @@ struct LightUniform {
     scale: f32,
 }
 
-/// Mirrors `Draw` in lenia_render.wgsl (160 bytes).
+/// Mirrors `Draw` in lenia_draw.wgsl (160 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
@@ -1890,6 +1890,7 @@ struct Graphics {
 impl Graphics {
     fn new(gpu: &Gpu) -> Self {
         let module = gpu.shader("lenia render", include_str!("../shaders/lenia_render.wgsl"));
+        let draw_module = gpu.shader("lenia draw", include_str!("../shaders/lenia_draw.wgsl"));
         let cs = ShaderStages::COMPUTE;
         let fs = ShaderStages::FRAGMENT;
 
@@ -1972,7 +1973,7 @@ impl Graphics {
             draw: gpu.fullscreen_pipeline(
                 "lenia draw",
                 &gpu.pipeline_layout("lenia draw", &[&draw_layout]),
-                &module,
+                &draw_module,
                 "fs_draw",
                 SCENE_FORMAT,
                 None,

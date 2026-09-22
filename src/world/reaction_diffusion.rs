@@ -863,7 +863,7 @@ struct PrepUniform {
     _pad1: [f32; 2],
 }
 
-/// Mirrors `Draw` in reaction_diffusion.wgsl (96 bytes).
+/// Mirrors `Draw` in reaction_diffusion_display.wgsl (96 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DrawUniform {
@@ -983,6 +983,8 @@ impl ReactionDiffusion {
             "reaction-diffusion",
             include_str!("../shaders/reaction_diffusion.wgsl"),
         );
+        let display_module =
+            gpu.shader("reaction-diffusion display", include_str!("../shaders/reaction_diffusion_display.wgsl"));
         let cells = size[0] as u64 * size[1] as u64;
         let bytes = cells * 8;
         let buffers = [
@@ -1081,7 +1083,7 @@ impl ReactionDiffusion {
         let draw_pipeline = gpu.fullscreen_pipeline(
             "rd display",
             &gpu.pipeline_layout("rd draw", &[&draw_layout]),
-            &module,
+            &display_module,
             "fs_display",
             SCENE_FORMAT,
             None,

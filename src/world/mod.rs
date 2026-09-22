@@ -20,6 +20,12 @@
 //!   skipped while paused.
 //! * Shader modules come from `Gpu::shader`, which prepends `shaders/common.wgsl`
 //!   (fullscreen vertex shader `vs_fullscreen`, `ViewXform`, hashing, palettes).
+//! * A sampler must not share its `@binding` with any other resource declared in
+//!   the same module. DirectX 12 translates the whole module for every pipeline,
+//!   and naga panics when a compute pipeline's layout puts a buffer where the
+//!   module declares a sampler (gfx-rs/wgpu#7638). Give a display pass that
+//!   samples textures its own module, as `lenia_draw.wgsl` does; a test checks
+//!   every file in `src/shaders`.
 //! * Parameters are plain Rust structs mirrored into uniform buffers; `ui` edits
 //!   them with egui and the next `step` uploads them.
 //! * Measurements (`metrics` / `measure`) are optional: a world reduces a few
@@ -638,6 +644,63 @@ mod tests {
         assert!(typo.to_string().starts_with("unknown measurement 'growth_cove' for Symbiosis; did you mean"), "{typo}");
         assert!(!typo.to_string().contains("1-"), "measurements are not numbered: {typo}");
         assert!(resolve_metric(symbiosis, "growth").is_err(), "measurement ids never match by prefix");
+    }
+
+    /// `(group, binding)`, whether it is a sampler, and the declaration, for
+    /// every resource a WGSL source declares (`@group(g) @binding(b) var ...;`).
+    fn resource_bindings(source: &str) -> Vec<([u32; 2], bool, String)> {
+        let code: Vec<&str> = source.lines().map(|line| line.split("//").next().unwrap_or("")).collect();
+        code.join("\n")
+            .split(';')
+            .filter_map(|statement| {
+                let decl = &statement[statement.find("@group(")?..];
+                let number = |key: &str| -> Option<u32> {
+                    let rest = &decl[decl.find(key)? + key.len()..];
+                    rest[..rest.find(')')?].trim().parse().ok()
+                };
+                let ty = decl.rsplit(':').next()?.trim();
+                let text = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+                Some(([number("@group(")?, number("@binding(")?], ty.starts_with("sampler"), text))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resource_bindings_reads_declarations() {
+        let source = "struct D { a: f32, };\n@group(0) @binding(3) var wrap: sampler; // repeat\n\
+                      @group(1) @binding(2)\n    var<storage, read> cells: array<vec4<f32>>;\nfn f() { let x = 1; }";
+        let found = resource_bindings(source);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!((found[0].0, found[0].1), ([0, 3], true));
+        assert_eq!((found[1].0, found[1].1), ([1, 2], false));
+        assert_eq!(found[1].2, "@group(1) @binding(2) var<storage, read> cells: array<vec4<f32>>");
+    }
+
+    /// DirectX 12 runs naga's HLSL writer over the whole module for every
+    /// pipeline, and it panics ("Sampler buffer of group ... not bound to a
+    /// register") when the pipeline's layout has another resource at a sampler's
+    /// binding and no sampler in that group. A sampler that shares its binding
+    /// with nothing else in its module cannot meet such a layout.
+    #[test]
+    fn shader_samplers_keep_their_bindings_to_themselves() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+        let (mut modules, mut clashes) = (0, Vec::new());
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "wgsl") {
+                continue;
+            }
+            modules += 1;
+            let bindings = resource_bindings(&std::fs::read_to_string(&path).unwrap());
+            for (slot, _, sampler) in bindings.iter().filter(|b| b.1) {
+                for (_, _, other) in bindings.iter().filter(|b| b.0 == *slot && !b.1) {
+                    let file = path.file_name().unwrap().to_string_lossy();
+                    clashes.push(format!("{file}: `{sampler}` shares its binding with `{other}`"));
+                }
+            }
+        }
+        assert!(modules >= 15, "found only {modules} shader files in {}", dir.display());
+        assert!(clashes.is_empty(), "move these samplers to a module of their own:\n{}", clashes.join("\n"));
     }
 
     /// The template is not registered in `WORLDS`, so nothing else compiles its
