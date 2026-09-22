@@ -1124,10 +1124,11 @@ mod tests {
     /// image bit for bit, in every world and for mutated recipes too; so does
     /// the explore PNG itself, which carries the same recipe.
     #[test]
-    fn gpu_explore_recipes_render_again_bit_for_bit() {
+    fn gpu_explore_recipes_render_again_bit_for_bit_in_every_world() {
         let Some((_guard, gpu)) = gpu::test_gpu() else { return };
         let dir = tempfile::tempdir().unwrap();
         for entry in WORLDS {
+            eprintln!("explore recipe replay: {}", entry.id);
             let job = explore::ExploreJob {
                 seed: 5,
                 runs: 2,

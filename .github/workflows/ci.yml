@@ -1,7 +1,7 @@
 # Checks every push to main and every pull request.
 #
 # - clippy on the MSRV (Rust 1.86, from Cargo.toml) and on current stable, which adds new lints over time.
-# - Linux runs the test suite, GPU tests included, on lavapipe (Mesa's software Vulkan driver). The ten tests that
+# - Linux runs the test suite, GPU tests included, on lavapipe (Mesa's software Vulkan driver). The tests that
 #   loop over every preset or every world only run in the weekly scheduled run, or on demand from the Actions tab.
 # - Windows and macOS runners have no usable GPU, so there the build is checked and the CPU-side tests run with
 #   PRIMORDIA_GPU_TESTS=skip.
@@ -86,14 +86,17 @@ jobs:
       # Prints the adapter and stops early if lavapipe does not come up.
       - name: selftest
         run: cargo run --locked -- selftest
-      # The tests that loop over every preset or every world take 71% of the suite's time on an RTX 4090, and
-      # minutes each on a software adapter, so pushes and pull requests skip them.
+      # All-world tests must include every_world in their names, including recipe replay and invalid-save
+      # recovery. A tiny output does not make a mutated Lenia recipe cheap: its nursery can still settle a
+      # million cells for over a thousand steps. These exhaustive checks belong to the full suite.
+      # One test thread makes the active test unambiguous; otherwise GPU-lock waiters also report themselves
+      # as slow. Show output as it happens, so a timeout retains the world/candidate that was being tested.
       - name: Tests (quick set)
         if: ${{ !(github.event_name == 'schedule' || inputs.full_suite) }}
-        run: cargo test --locked -- --skip every_preset --skip every_world --skip full_coupling
+        run: cargo test --locked -- --test-threads=1 --nocapture --skip every_preset --skip every_world --skip full_coupling
       - name: Tests (full suite)
         if: ${{ github.event_name == 'schedule' || inputs.full_suite }}
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1 --nocapture
 
   # Windows runners only offer WARP through DX12, where naga 25 panics while translating some worlds' shaders to
   # HLSL and FXC takes minutes per world; macOS runners only have a paravirtual Metal device. So these check that

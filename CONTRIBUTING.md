@@ -54,6 +54,10 @@ $env:PRIMORDIA_GPU_TESTS = "skip"; cargo test --locked  # PowerShell
 CI (`.github/workflows/ci.yml`) runs clippy on 1.86 and on stable, and runs the tests on Linux on lavapipe, Mesa's
 software Vulkan driver, with `WGPU_BACKEND=vulkan`. Pushes and pull requests skip the slow tests that loop over every
 preset or every world (`--skip every_preset --skip every_world --skip full_coupling`); a weekly run includes them.
+Name exhaustive GPU tests with `every_preset`, `every_world` or `full_coupling` so that the quick set recognises
+them. This includes tests that replay exploration recipes or check invalid saves across all worlds: a small output
+image can still trigger a large Lenia nursery. Both Linux suites run one test at a time and stream output, so the
+logs identify the active test instead of reporting other tests waiting for the GPU lock as slow.
 Windows and macOS runners have no usable GPU, so they build everything and run the tests with
 `PRIMORDIA_GPU_TESTS=skip`.
 

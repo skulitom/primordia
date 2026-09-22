@@ -474,9 +474,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_recipes_leave_the_gpu_available_for_a_valid_load() {
+    fn invalid_recipes_leave_the_gpu_available_for_a_valid_load_in_every_world() {
         let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         for entry in crate::world::WORLDS {
+            eprintln!("invalid recipe recovery: {}", entry.id);
             let original = (entry.create)(&gpu, [320, 240], 42);
             let saved = recipe(&*original, 42);
             let mut bad = saved.clone();
