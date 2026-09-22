@@ -2,6 +2,7 @@
 
 mod app;
 mod capture;
+mod console;
 mod explore;
 mod failure;
 mod gpu;
@@ -617,6 +618,7 @@ fn main() {
     let command = command_name(cli.command.as_ref());
     if let Err(e) = run(cli) {
         eprintln!("error: {e:#}");
+        console::show_error(&format!("{e:#}"));
         if json {
             print_stdout(&failure::json(command, &e).to_string());
         }
@@ -760,6 +762,7 @@ fn run(cli: Cli) -> Result<()> {
                      its window",
                 ));
             }
+            console::detach();
             let r = cli.run;
             // Resolve names before a window or GPU exists, so a typo fails at once.
             let world = world::resolve(&r.world)?;

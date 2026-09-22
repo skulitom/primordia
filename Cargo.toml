@@ -38,6 +38,10 @@ serde_json = "1"
 strsim = "0.11"
 tempfile = "3"
 
+# Closing the console of a double-clicked exe, and its error message box (src/console.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
 [profile.dev]
 opt-level = 1
 
