@@ -1218,11 +1218,12 @@ mod tests {
         assert!(frame.ends_with("--recipe reaction-diffusion_00006.png --frames 6"), "{frame}");
 
         // An unedited preset's PNG names the preset instead, and that command renders it again.
+        // Use soup seeding: this checks the PNG's command, not the expensive Orbium nursery.
         let plain = file("plain.png");
-        let args = ["-w", "lenia", "-p", "2", "--seed", "3", "--width", "64", "--height", "48", "--frames", "5"];
+        let args = ["-w", "lenia", "-p", "6", "--seed", "3", "--width", "64", "--height", "48", "--frames", "5"];
         render_cli(&gpu, &[&args[..], &["--zoom", "2", "--tonemap", "reinhard", "-o", &plain]].concat());
         let command = comment(&plain);
-        let expected = "primordia render -w lenia -p leviathans --seed 3 --width 64 --height 48 --tonemap reinhard \
+        let expected = "primordia render -w lenia -p hydrogeminium --seed 3 --width 64 --height 48 --tonemap reinhard \
                         --zoom 2 --frames 5";
         assert_eq!(command, expected);
         assert!(!library::load(Path::new(&plain)).unwrap().modified);
