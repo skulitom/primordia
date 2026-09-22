@@ -22,6 +22,8 @@ Primordia is a playground for **emergence** and **self-organisation**. It has fo
 - [Controls](#controls)
 - [Rendering without a window](#rendering-without-a-window)
 - [Exploring by novelty](#exploring-by-novelty)
+- [Scripting and automation](#scripting-and-automation)
+- [Troubleshooting](#troubleshooting)
 - [How it works](#how-it-works)
 - [Inspiration and references](#inspiration-and-references)
 
@@ -86,7 +88,7 @@ The presets explore different growth scales, steering and chemical regimes:
 
 **Habitat & growth** controls the pattern scale and a seamless fertility landscape generated from the seed. Choose scattered islands, clustered colonies, living threads or broken wave fronts, then **Restart this seed** to apply the seeding layout. **Mutate** explores these layouts, scale, geography, agent behaviour and fertility cycles across all six preset families. **Trail light**, under Look, balances the visible network against the chemistry.
 
-![All five Symbiosis presets after 3600 frames: seed 42 in the top row, seed 314159 below](docs/images/symbiosis-presets.png)
+![The first five Symbiosis presets after 3600 frames (Fallow Gardens is shown below): seed 42 in the top row, seed 314159 below](docs/images/symbiosis-presets.png)
 
 Switch the **View** between Together, Chemistry, Agent trails and Fertility to inspect the interaction. Changes to the relationship and coupling take effect immediately; the existing habitat carries its history forward. Left-drag seeds chemistry; right-drag clears chemistry and trails. The library keeps the relationship, habitat, seed, settings, palette and view. Earlier recipes retain their original cultivation behaviour, uniform habitat and seeding settings.
 
@@ -122,12 +124,26 @@ cargo run --release -- --world symbiosis --preset "Fallow Gardens" --seed 42
 - **Saved worlds library.** Name and keep your discoveries, including their seed, all world settings, colours, post effects and camera view.
 - **Tour mode** (`T`): a screensaver that fades through every preset of every world.
 - **Screenshots** (`F12`) and **MP4 recording** (`V`) straight from the app.
-- **Headless rendering.** PNGs, frame sequences, MP4s, galleries and contact sheets from the command line, deterministic from a seed. A scripted mouse lets you test interactions too.
+- **Headless rendering.** PNGs, frame sequences, MP4s, galleries and captioned contact sheets from the command line, repeatable from a seed on the same GPU. A scripted mouse lets you test interactions too.
+- **Recipes you can share.** Every PNG that Primordia writes carries its recipe, so `primordia render --recipe picture.png` renders it again; `--set` changes any setting from the command line.
+- **Scriptable.** `primordia list --json` describes every world without a GPU, `--json` prints one result object, and exit codes tell input errors, GPU failures and missing ffmpeg apart.
+- **Kind to smaller GPUs.** Integrated GPUs start at half simulation resolution; **Tools → Simulation resolution** changes it at any time.
 - **Extensible.** A small `World` trait; see [docs/WRITING_A_WORLD.md](docs/WRITING_A_WORLD.md).
 
 ## Quick start
 
-You need **Rust 1.86 or newer** and a GPU with Vulkan, DirectX 12 or Metal. [ffmpeg](https://ffmpeg.org) is optional and is only used for video.
+You need a GPU with Vulkan, DirectX 12 or Metal. [ffmpeg](https://ffmpeg.org) is optional and is only used for video.
+
+**Windows:** download the executable from the [latest release](https://github.com/skulitom/primordia/releases/latest) and run it. It is not code-signed, so SmartScreen may ask you to choose **More info → Run anyway**.
+
+**Any platform, with Rust 1.86 or newer:** install the `primordia` command that the examples in this README use,
+
+```bash
+cargo install --locked --git https://github.com/skulitom/primordia
+primordia
+```
+
+or build and run it from a clone:
 
 ```bash
 git clone https://github.com/skulitom/primordia
@@ -163,7 +179,7 @@ cargo run --release -- --tour 20 --fullscreen
 | `0` or `Home` | Reset the view |
 | `Esc` | Leave fullscreen; press it twice to quit |
 
-Shortcuts use physical key positions, so they work on any keyboard layout.
+Shortcuts use physical key positions: the letters above are where those keys sit on a US QWERTY keyboard, and they stay in the same place on any layout.
 
 The control panel keeps world selection, presets, playback and capture within reach. Use **World** for simulation parameters and materials, **Appearance** for bloom and colour grading, and **Tools** for the brush, camera, tour and keyboard reference. Settings scroll independently of the playback and capture controls; shorter windows use a compact world picker.
 
@@ -198,11 +214,21 @@ primordia render --world physarum --brush primary --brush-at 0.5,0.5
 # Every frame's measurements as CSV (frame, time, series, one column per metric)
 primordia render --world symbiosis --preset "Fallow Gardens" --seed 42 --frames 7200 --metrics fallow.csv
 
-primordia list       # worlds, presets and palettes
-primordia selftest   # verify this GPU's torus-wrapping maths
+# Render a recipe again: a library or explore .json, or any PNG Primordia wrote
+primordia render --recipe explore/lenia-orbium-s1/recipes/01-seed1.json --width 3840 --height 2160
+primordia render --recipe physarum.png --frames 600 --out physarum-again.png
+
+# Change any setting of a preset from the command line
+primordia render --world reaction-diffusion --preset mitosis --set params.feed=0.031 --save-recipe mito.json
+
+primordia list --world rd         # presets, measurements (with their meanings) and palettes; no GPU needed
+primordia recipe -w rd -p mitosis # a preset's complete recipe: every key --set accepts
+primordia selftest                # verify this GPU's shader maths and list its adapters
 ```
 
-Headless renders are capped at 240 fps by default, so long batch jobs don't run your GPU flat out; `--max-fps 0` removes the cap. `primordia help render` lists every option.
+Worlds and presets accept a name, a unique prefix, a number or an alias (`rd`, `pl`, `slime`, `gray-scott`); a typo gets a suggestion. Headless renders are capped at 240 fps by default, so long batch jobs don't run your GPU flat out; `--max-fps 0` removes the cap. `primordia help render` lists every option.
+
+Every PNG that Primordia writes names the program and its source and carries its recipe, the GPU and a command that reproduces it, in PNG text chunks (`Software`, `Source`, `Title`, `Comment`, `primordia:gpu` and `primordia:recipe`). The same seed, settings and frame count give the same image on the same GPU, driver and backend. Other GPUs give the same kind of pattern, but the chaotic worlds (Particle Life, Physarum, Symbiosis) diverge within a few hundred frames.
 
 ## Exploring by novelty
 
@@ -212,16 +238,45 @@ The Mutate button is a random roll judged by eye. `primordia explore` turns the 
 # 48 mutations of Physarum, one refinement round of 24 children, keep the 12 most novel
 primordia explore --world physarum --max-fps 0
 
-# The eight Symbiosis mutations with the most growth, without refinement
+# The eight candidates (the preset and its mutations) with the most growth, without refinement
 primordia explore --world symbiosis --select max:growth_cover --keep 8 --refine 0
 
 # Keep the recipes in the app's library as well (they appear under Library after a refresh)
 primordia explore --world lenia --install
 ```
 
-Everything lands in `explore/` (or `--out-dir`): the final frame of every kept candidate as `NN-seedS.png`, `contact-sheet.png` in rank order, `recipes/NN-seedS.json` (the same format as the library, so a copied file loads too), and `candidates.csv` with one row per evaluated candidate: its seed, origin (preset, mutation or child of a kept candidate), rank, novelty and the behaviour descriptor. The descriptor holds, for every measurement, the mean over the last 40% of the run, its variation over that window, and its drift from the first 20%. Candidates are scaled against each other robustly (median and MAD), novelty is the mean distance to the five nearest candidates, and the archive is filled by farthest-point selection, so near-duplicates never take two slots. `--select max:<metric>` or `min:<metric>` keeps the extremes of one measurement instead; `--all` also writes every candidate's image under `all/`. Candidates whose vital measurements sit at zero (no living cells, no activity, no mass, no motion) are logged as inert and left out of the archive, because a dead world is novel but never interesting; `--keep-inert` admits them.
+Each run gets its own folder, `explore/<world>-<preset>-s<seed>` (for example `explore/physarum-dendrites-s1`), or `--out-dir`. It holds the final frame of every kept candidate as `NN-seedS.png`, `contact-sheet.png` in rank order with a caption on every tile, `recipes/NN-seedS.json` (the library format, so a copied file loads too, plus a `provenance` object that older versions ignore), `candidates.csv` and `run.json`. `run.json` records the command, version, GPU, settings, what every CSV column means and which candidates were kept. Running again into the same folder first removes exactly the files its `run.json` lists; explore refuses a folder with explore outputs that no `run.json` lists unless you pass `--overwrite`.
 
-Every kept candidate is re-simulated from its recipe for its image, which proves the recipe reproduces the run. Runs are deterministic from `--seed`. Perturbations multiply numbers by log-normal noise (`--strength`), so a parameter that a mutation left at zero stays at zero through refinement; colours, names and switches are never perturbed. A default run evaluates 73 candidates and takes a few minutes at the frame-rate cap, or one to two minutes with `--max-fps 0`; Lenia is slower because every mutation hatches creatures in its nursery.
+`candidates.csv` has one row per evaluated candidate: index, round, origin (preset, recipe, mutation or child), parent, seed, preset (numbered from 1, as in `--preset`), preset_name, rank, novelty, status (`ok`, `inert` or `failed`), secs, and the behaviour descriptor. The descriptor holds, for every measurement, the mean over the last 40% of the run (`<id>_mean`), its variation over that window (`<id>_std`) and its drift from the first 20% (`<id>_drift`). Candidates are scaled against each other robustly (median and MAD), and novelty is the mean distance to the five nearest candidates. The archive is filled by farthest-point selection: the most novel candidate first, then each slot goes to the candidate farthest from those already kept, so near-duplicates are only chosen once nothing more distinct is left, and exact duplicates are skipped. The base preset competes like any other candidate. `--select max:<metric>` or `min:<metric>` keeps the extremes of one measurement instead (`primordia list --world <world>` lists the ids); `--all` also writes every candidate's image under `all/`. Candidates whose vital measurements sit at zero (no living cells, no activity, no mass, no motion) are logged as inert and left out of the archive, because a dead world is novel but never interesting; `--keep-inert` admits them.
+
+Every kept candidate is re-simulated from its recipe for its image, which proves the recipe reproduces the run. Runs are repeatable from `--seed` on the same GPU; candidate seeds differ from version 0.1.0 for the same `--seed`. `--recipe` starts the search from a saved recipe or PNG instead of a preset, and `--set` changes the base first. Refinement multiplies float parameters by log-normal noise (`--strength`), so a float a mutation left at zero stays at zero; small integer settings (counts, steps, channel indices) move by one and can leave zero. Palettes, colours and the rest of each world's look, names and switches are never perturbed, and refinement children reuse their parent's seed. Recipes keep the size they were explored at, and their name says it: explore with `--width 1920 --height 1080` before `--install` for full-size library entries, or render one larger with `render --recipe ... --width ... --height ...` (behaviour can change with the domain size). A default run evaluates 73 candidates and takes a few minutes at the frame-rate cap, or one to two minutes with `--max-fps 0`; Lenia is slower because every mutation hatches creatures in its nursery.
+
+## Scripting and automation
+
+Primordia is built to be driven by scripts and AI agents as well as by hand.
+
+- **Discovery without a GPU.** `primordia list --json` describes every world: ids, aliases, presets, measurements (id, unit, range, meaning, and whether explore treats it as vital) and palettes, plus the library folder.
+- **Output.** Logs and progress go to stderr (`-q` keeps warnings and errors, `-v` adds debug). stdout carries results only: the path of every file written, one per line, or with `--json` a single JSON object at the end, `{"ok":true,"command":"render",...}` or `{"ok":false,"error":{"kind":...,"message":...}}`. Seeds are JSON strings, because they can exceed what JavaScript numbers hold exactly.
+- **Exit status.** 0 success, 1 another failure (such as file I/O), 2 invalid input (an unknown or ambiguous world, preset, measurement or setting, an unreadable recipe, a size out of range or an unwritable output path), 3 no usable GPU or a GPU failure, 4 ffmpeg missing or failed. Names and output paths are checked before the GPU starts.
+- **Recipes.** `render --recipe` and `explore --recipe` take a library or explore JSON file or a PNG written by Primordia. `--set KEY=VALUE` (repeatable) edits a setting by its path, such as `params.feed=0.031`, `palette=Frost` or `post.exposure=1.2`; an unknown key lists the valid ones. `render --save-recipe` writes the recipe it rendered, and `primordia recipe` prints a preset's or recipe's complete JSON. A recipe restarts from its seed; pass the same `--frames` to reach the same moment.
+- **Bare `primordia` opens a window** and blocks until it is closed; add `--exit-after SECS` in scripts.
+
+| Environment variable | Effect |
+|---|---|
+| `WGPU_BACKEND` | Graphics backends to try: `vulkan`, `dx12`, `metal` or `gl` |
+| `WGPU_ADAPTER_NAME` | Use the GPU whose name contains this text (a mismatch lists every adapter) |
+| `WGPU_POWER_PREF` | `high` (default) or `low` when there are several GPUs |
+| `PRIMORDIA_LIBRARY_DIR` | Folder of saved recipes |
+| `PRIMORDIA_FFMPEG` | ffmpeg executable for video [default: `ffmpeg` on the PATH] |
+| `RUST_LOG` | Log filter, e.g. `warn` for quiet batch runs |
+
+## Troubleshooting
+
+- **No GPU found**: update your graphics driver, then run `primordia selftest`, which checks the GPU and lists every adapter. `WGPU_BACKEND` and `WGPU_ADAPTER_NAME` choose another backend or GPU.
+- **Slow first start on DirectX 12**: Windows machines without Vulkan use DirectX 12, whose shader compiler takes a minute or more per world on the first start. Primordia says so while it waits; `WGPU_BACKEND=vulkan` avoids it where a Vulkan driver exists.
+- **Low frame rate**: lower **Tools → Simulation resolution**, or start with `--sim-scale 0.5`. Integrated GPUs start at half resolution already; Physarum is the heaviest world.
+- **Video fails**: install ffmpeg (`winget install Gyan.FFmpeg`, `brew install ffmpeg` or `sudo apt install ffmpeg`) or point `PRIMORDIA_FFMPEG` at it.
+- **An internal error**: Primordia prints a short report; please open an [issue](https://github.com/skulitom/primordia/issues) with it and the output of `primordia selftest`.
 
 ## How it works
 
@@ -273,7 +328,7 @@ These are headless numbers on an RTX 4090 at 1920×1080, uncapped, for each worl
 
 | World | fps | GPU time per frame |
 |---|---|---|
-| Physarum (Dendrites, ~3 M agents) | 339 | ~2.9 ms |
+| Physarum (Dendrites, ~4 M agents) | 339 | ~2.9 ms |
 | Particle Life (Tidepool) | 859 | ~1.2 ms |
 | Lenia (Orbium) | 888 | ~1.1 ms |
 | Reaction-Diffusion (Coral Reef) | 903 | ~1.1 ms |
@@ -287,12 +342,14 @@ Copy `src/world/placeholder.rs`, the smallest possible world, register it in `sr
 ```bash
 cargo test --locked
 cargo test --locked -- --include-ignored  # also generate visual previews in target/
+PRIMORDIA_GPU_TESTS=skip cargo test --locked  # without a GPU: GPU tests report ok as skipped
 cargo clippy --all-targets --locked -- -D warnings
+cargo +stable clippy --all-targets --locked -- -D warnings  # keep current stable Rust clean too
 cargo build --release --locked
 cargo run --release --locked -- selftest
 ```
 
-The tests need a supported GPU, but no window. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, fertility depletion and recovery, control-panel layout, and the measurements: every world's GPU reduction is checked against the same metrics recomputed on the CPU from the read-back state, the readback ring is exercised, and headless CSV logs are parsed back. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons. `cargo test --locked render_fertility_cycle_preview -- --ignored --nocapture` records a two-minute, same-seed experiment as living and fertility-view timelapse frames in `target/fertility-preview`.
+The tests need a supported GPU, but no window; with `PRIMORDIA_GPU_TESTS=skip` the GPU tests are skipped and the rest still run. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to send changes. They cover saved-library operations, every preset's settings round trip, invalid saves, Symbiosis coupling and comparison behaviour, fertility depletion and recovery, control-panel layout, and the measurements: every world's GPU reduction is checked against the same metrics recomputed on the CPU from the read-back state, the readback ring is exercised, and headless CSV logs are parsed back. GPU tests serialize device creation to avoid concurrent initialization failures in some Windows Vulkan drivers. Ignored tests render PNG previews for visual inspection; they are not pixel-perfect reference comparisons. `cargo test --locked render_fertility_cycle_preview -- --ignored --nocapture` records a two-minute, same-seed experiment as living and fertility-view timelapse frames in `target/fertility-preview`.
 
 ## Inspiration and references
 
