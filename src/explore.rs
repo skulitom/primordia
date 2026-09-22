@@ -11,7 +11,14 @@
 //! `render --recipe` renders them (or the images, which carry them) again.
 //!
 //! The search starts from a preset, or from a recipe (`--recipe`), and `--set`
-//! edits either before the first candidate is evaluated.
+//! edits either before the first candidate is evaluated. Refinement never
+//! perturbs a world's appearance settings (`WorldEntry::appearance`).
+//!
+//! Each run writes into a folder of its own (`explore/<world>-<preset>-s<seed>`
+//! by default) and leaves `run.json` there ([`MANIFEST`]): what ran, what every
+//! column of `candidates.csv` holds, and every file it wrote. The next run into
+//! the folder removes exactly those files first, so runs never mix; outputs
+//! that no manifest lists make it refuse the folder unless `--overwrite`.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -30,6 +37,7 @@ use crate::library::{Library, SavedWorld, WorldSettings};
 use crate::metrics::{MetricDesc, Sample, Sampler, MAX_METRICS};
 use crate::post::{Post, PostSettings};
 use crate::recipe::{self, Recipe, Setting, Source};
+use crate::report;
 use crate::rng::Rng;
 use crate::world::{self, guarded, Camera, Frame, ViewXform, World, WORLDS};
 
@@ -115,7 +123,11 @@ pub struct ExploreJob {
     pub size: [u32; 2],
     /// Frames-per-second ceiling per candidate (0 = unlimited).
     pub max_fps: f32,
-    pub out_dir: PathBuf,
+    /// `None` = `explore/<world>-<preset>-s<seed>` ([`default_out_dir`]).
+    pub out_dir: Option<PathBuf>,
+    /// Remove explore outputs in `out_dir` that no `run.json` lists instead of
+    /// refusing the folder (a previous run's listed outputs are always removed).
+    pub overwrite: bool,
     pub select: Select,
     /// Also save the kept recipes into this library folder.
     pub library: Option<PathBuf>,
@@ -124,6 +136,8 @@ pub struct ExploreJob {
     pub all: bool,
     /// Let inert candidates (dead, empty or frozen worlds) into the archive.
     pub inert: bool,
+    /// The command line, recorded in `run.json` (empty when not run from one).
+    pub argv: Vec<String>,
 }
 
 impl ExploreJob {
@@ -142,12 +156,14 @@ impl ExploreJob {
             frames: 600,
             size: [640, 360],
             max_fps: headless::DEFAULT_MAX_FPS,
-            out_dir: PathBuf::from("explore"),
+            out_dir: None,
+            overwrite: false,
             select: Select::Novelty,
             library: None,
             sheet: true,
             all: false,
             inert: false,
+            argv: Vec::new(),
         }
     }
 }
@@ -204,15 +220,30 @@ pub struct Candidate {
     pub secs: f32,
 }
 
+impl Candidate {
+    /// The `status` column of candidates.csv: `ok`, `inert` or `failed`.
+    pub fn status(&self) -> &'static str {
+        match (&self.descriptor, self.inert) {
+            (None, _) => "failed",
+            (Some(_), true) => "inert",
+            (Some(_), false) => "ok",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Summary {
     /// Index into `WORLDS`.
     pub world: usize,
     /// 0-based preset the search started from.
     pub preset: usize,
+    /// Seed of the base candidate (the recipe's own, or the master seed).
+    pub base_seed: u64,
     pub candidates: Vec<Candidate>,
     /// Indices of the kept candidates in rank order.
     pub kept: Vec<usize>,
+    /// The folder every output but the library files went into.
+    pub out_dir: PathBuf,
     /// Image and recipe of each kept candidate, in rank order.
     pub images: Vec<PathBuf>,
     pub recipes: Vec<PathBuf>,
@@ -222,6 +253,8 @@ pub struct Summary {
     pub all: Vec<PathBuf>,
     pub sheet: Option<PathBuf>,
     pub csv: PathBuf,
+    /// `run.json`, written last.
+    pub manifest: PathBuf,
     pub secs: f32,
 }
 
@@ -235,18 +268,23 @@ impl Summary {
         }
         files.push(&self.csv);
         files.extend(self.sheet.as_deref());
+        files.push(&self.manifest);
         files
+    }
+
+    /// The files the manifest lists: every file written into `out_dir` before
+    /// it. The library's never are, wherever the library is.
+    fn outputs(&self) -> Vec<&Path> {
+        let library = |file: &&Path| self.installed.iter().any(|i| i == file);
+        self.files().into_iter().filter(|f| !library(f) && *f != self.manifest).collect()
     }
 }
 
 // --- behaviour descriptors -----------------------------------------------------
 
-/// Column names of a descriptor: three per metric.
+/// Column names of a descriptor: three per metric ([`DESCRIPTOR_STATS`]).
 pub(crate) fn dim_names(metrics: &[MetricDesc]) -> Vec<String> {
-    metrics
-        .iter()
-        .flat_map(|m| [format!("{}_mean", m.id), format!("{}_std", m.id), format!("{}_drift", m.id)])
-        .collect()
+    metrics.iter().flat_map(|m| DESCRIPTOR_STATS.map(|(stat, _)| format!("{}_{stat}", m.id))).collect()
 }
 
 /// Per metric: the mean of the last 40% of the samples, the temporal standard
@@ -644,10 +682,12 @@ fn sheet_caption(rank: usize, candidate: &Candidate) -> String {
     format!("#{rank:02} · seed {}", candidate.seed)
 }
 
+/// The recipe of kept candidate `rank`. Its name gives the size it was
+/// explored at, which is the size it opens at in the app.
 fn recipe(world_name: &str, candidate: &Candidate, rank: usize, size: [u32; 2]) -> SavedWorld {
     SavedWorld {
         version: crate::library::RECIPE_VERSION,
-        name: format!("{world_name} explore #{rank:02} (seed {})", candidate.seed),
+        name: format!("{world_name} explore #{rank:02} (seed {}, {}x{})", candidate.seed, size[0], size[1]),
         seed: candidate.seed,
         output_size: size,
         preset: candidate.preset,
@@ -666,14 +706,34 @@ fn image_provenance(saved: &SavedWorld, gpu: &Gpu, image: &Path, frames: u32) ->
     Provenance::of(saved, gpu).with_command(command)
 }
 
-/// `candidates.csv`: one row per candidate. `preset` is 1-based like `--preset`
-/// (recipes store it 0-based), followed by the preset's name.
+/// The columns of `candidates.csv` before the descriptor, with what they hold
+/// (`run.json` repeats them).
+pub(crate) const CSV_COLUMNS: &[(&str, &str)] = &[
+    ("index", "candidate number from 0, in the order the candidates were evaluated"),
+    ("round", "0 for the base and the mutations, then the refinement round that made the child"),
+    ("origin", "preset, recipe (a --recipe, or a preset edited by --set), mutation, or child"),
+    ("parent", "a child's parent: the index of the kept candidate it perturbs, whose seed it reuses; empty otherwise"),
+    ("seed", "the seed the candidate runs from"),
+    ("preset", "preset number from 1, as --preset takes it (recipes store it from 0)"),
+    ("preset_name", "the preset's name"),
+    ("rank", "place among the kept candidates from 1, the NN of NN-seedS.png; empty when not kept"),
+    ("novelty", "mean scaled distance to the (up to) five nearest other candidates; 0 for failed and left-out ones"),
+    ("status", "ok, inert (a vital measurement stayed near zero) or failed (no usable measurements)"),
+    ("secs", "seconds the evaluation took"),
+];
+
+/// The descriptor's three columns per measurement, `<id>_<stat>`, with what they hold.
+pub(crate) const DESCRIPTOR_STATS: [(&str, &str); 3] = [
+    ("mean", "mean over the last 40% of the frames"),
+    ("std", "standard deviation over the last 40% of the frames"),
+    ("drift", "the mean over the last 40% of the frames minus the mean over the first 20%"),
+];
+
+/// `candidates.csv`: one row per candidate, in [`CSV_COLUMNS`] then the
+/// descriptor's columns ([`dim_names`]).
 fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[&str]) -> Result<()> {
-    let mut text = String::from("index,round,origin,parent,seed,preset,preset_name,rank,novelty,status,secs");
-    for dim in dims {
-        text.push(',');
-        text.push_str(dim);
-    }
+    let header: Vec<&str> = CSV_COLUMNS.iter().map(|(name, _)| *name).chain(dims.iter().map(String::as_str)).collect();
+    let mut text = header.join(",");
     text.push('\n');
     for c in candidates {
         let origin = c.origin.name();
@@ -682,21 +742,17 @@ fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[
             _ => String::new(),
         };
         let rank = c.rank.map(|r| r.to_string()).unwrap_or_default();
-        let status = match (&c.descriptor, c.inert) {
-            (None, _) => "failed",
-            (Some(_), true) => "inert",
-            (Some(_), false) => "ok",
-        };
         // Preset names never contain commas or quotes (checked in `world::tests`).
         let preset_name = presets.get(c.preset).copied().unwrap_or("custom");
         let _ = write!(
             text,
-            "{},{},{origin},{parent},{},{},{preset_name},{rank},{:.6},{status},{:.3}",
+            "{},{},{origin},{parent},{},{},{preset_name},{rank},{:.6},{},{:.3}",
             c.index,
             c.round,
             c.seed,
             c.preset + 1,
             c.novelty,
+            c.status(),
             c.secs
         );
         for d in 0..dims.len() {
@@ -712,6 +768,159 @@ fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
+// --- the output folder ---------------------------------------------------------------
+
+/// The manifest each run writes into its folder, last: what ran, and every
+/// file it wrote there ([`crate::report::explore_manifest`]).
+pub const MANIFEST: &str = "run.json";
+/// The manifest's `tool`, which marks a folder as explore's.
+pub(crate) const MANIFEST_TOOL: &str = "primordia explore";
+
+/// `explore/<world>-<preset>-s<seed>`, or `explore/<world>-<recipe file
+/// name>-s<seed>` for a run from `--recipe`; the seed is the master seed.
+pub(crate) fn default_out_dir(job: &ExploreJob, source: &Source) -> PathBuf {
+    let entry = &WORLDS[source.world()];
+    let recipe = job.recipe.as_ref().and_then(|r| r.path.file_stem()).map(|s| headless::slug(&s.to_string_lossy()));
+    let base = recipe.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        headless::slug((entry.presets)().get(source.preset().unwrap_or(0)).copied().unwrap_or("custom"))
+    });
+    Path::new("explore").join(format!("{}-{base}-s{}", entry.id, job.seed))
+}
+
+/// Whether a file called `name` in the subfolder `sub` of an explore folder
+/// ("" for the folder itself) is named like one of explore's outputs.
+fn is_output_name(sub: &str, name: &str) -> bool {
+    let digits = |s: &str, at_least: usize| s.len() >= at_least && s.bytes().all(|b| b.is_ascii_digit());
+    // NN-seedS: a rank and a seed.
+    let kept = |stem: &str| stem.split_once("-seed").is_some_and(|(rank, seed)| digits(rank, 2) && digits(seed, 1));
+    // NNN-rR-seedS: a candidate, its round and its seed.
+    let candidate = |stem: &str| {
+        stem.split_once("-r").is_some_and(|(index, rest)| {
+            let round_and_seed = rest.split_once("-seed");
+            digits(index, 3) && round_and_seed.is_some_and(|(round, seed)| digits(round, 1) && digits(seed, 1))
+        })
+    };
+    match sub {
+        "" => name == "candidates.csv" || name == "contact-sheet.png" || name.strip_suffix(".png").is_some_and(kept),
+        "recipes" => name.strip_suffix(".json").is_some_and(kept),
+        "all" => name.strip_suffix(".png").is_some_and(candidate),
+        _ => false,
+    }
+}
+
+/// `file` relative to `dir`, with `/` between its parts, or `None` outside `dir`.
+pub(crate) fn relative(dir: &Path, file: &Path) -> Option<String> {
+    let parts: Vec<String> =
+        file.strip_prefix(dir).ok()?.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// A manifest's `relative` path inside `dir`, or `None` when it would leave
+/// `dir` (a manifest never makes a run remove anything elsewhere).
+fn inside(dir: &Path, relative: &str) -> Option<PathBuf> {
+    let parts: Vec<&str> = relative.split('/').collect();
+    let plain = |part: &&str| !part.is_empty() && *part != "." && *part != ".." && !part.contains(['\\', ':']);
+    parts.iter().all(plain).then(|| parts.iter().fold(dir.to_path_buf(), |path, part| path.join(part)))
+}
+
+/// The outputs an earlier run left in an explore folder.
+#[derive(Debug, Default)]
+struct Previous {
+    /// The files its `run.json` lists, which a new run removes.
+    listed: Vec<PathBuf>,
+    /// Files named like explore's outputs that no `run.json` lists: another
+    /// run's, one from before manifests, or one from a run that was killed.
+    unlisted: Vec<PathBuf>,
+    /// The `run.json` itself.
+    manifest: Option<PathBuf>,
+}
+
+/// What an earlier run left in `dir`. A `run.json` that explore did not write
+/// is invalid input: nothing in that folder is explore's to remove.
+fn previous_outputs(dir: &Path) -> Result<Previous> {
+    let manifest = dir.join(MANIFEST);
+    let mut previous = Previous::default();
+    if manifest.exists() {
+        let foreign = || {
+            Failure::Usage.error(format!(
+                "{} was not written by primordia explore, so this folder is not explore's: choose another --out-dir",
+                manifest.display()
+            ))
+        };
+        let text = std::fs::read_to_string(&manifest).map_err(|_| foreign())?;
+        let value: Value = serde_json::from_str(&text).map_err(|_| foreign())?;
+        if value["tool"] != MANIFEST_TOOL {
+            return Err(foreign());
+        }
+        let files = value["files"].as_array().into_iter().flatten().filter_map(Value::as_str);
+        previous.listed = files.filter_map(|file| inside(dir, file)).filter(|path| path.is_file()).collect();
+        previous.manifest = Some(manifest);
+    }
+    for sub in ["", "recipes", "all"] {
+        let Ok(entries) = std::fs::read_dir(dir.join(sub)) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let named = is_output_name(sub, &entry.file_name().to_string_lossy());
+            if named && path.is_file() && !previous.listed.contains(&path) {
+                previous.unlisted.push(path);
+            }
+        }
+    }
+    previous.unlisted.sort();
+    Ok(previous)
+}
+
+/// "a, b, c and 4 more": the first few of `files`, relative to `dir`.
+fn listing(dir: &Path, files: &[PathBuf]) -> String {
+    let names: Vec<String> =
+        files.iter().take(3).map(|f| relative(dir, f).unwrap_or_else(|| f.display().to_string())).collect();
+    match files.len().saturating_sub(3) {
+        0 => names.join(", "),
+        more => format!("{} and {more} more", names.join(", ")),
+    }
+}
+
+/// Removes what an earlier run left in `dir`: the files its manifest lists and
+/// the manifest, and with `overwrite` the unlisted outputs as well; then
+/// `recipes/` and `all/` when they are left empty. Nothing else is touched.
+/// Returns the number of files removed.
+fn clear_previous(dir: &Path, previous: &Previous, overwrite: bool) -> Result<usize> {
+    let unlisted = if overwrite { &previous.unlisted[..] } else { &[] };
+    let mut removed = 0;
+    for file in previous.listed.iter().chain(unlisted).chain(&previous.manifest) {
+        match std::fs::remove_file(file) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("removing {} of an earlier run", file.display())));
+            }
+        }
+    }
+    for sub in ["recipes", "all"] {
+        // Fails, and keeps the folder, unless it is empty.
+        let _ = std::fs::remove_dir(dir.join(sub));
+    }
+    Ok(removed)
+}
+
+/// What `run.json` records about a run besides its job ([`crate::report::explore_manifest`]).
+pub(crate) struct Record<'a> {
+    /// Index into `WORLDS`.
+    pub world: usize,
+    /// 0-based preset of the base candidate.
+    pub preset: usize,
+    pub base_seed: u64,
+    /// When the run started, in UTC (RFC 3339).
+    pub started: String,
+    /// The GPU's name and backend.
+    pub gpu: String,
+    pub secs: f32,
+    /// Every file written into the output folder, relative to it.
+    pub files: Vec<String>,
+    /// The finished run, or why it failed.
+    pub outcome: std::result::Result<&'a Summary, String>,
+}
+
 /// An exploration's names resolved and its inputs checked, before any GPU work.
 struct Plan {
     /// Index into `WORLDS`.
@@ -722,11 +931,16 @@ struct Plan {
     source: Source,
     /// Seed of the base candidate: the recipe's own, or the master seed.
     base_seed: u64,
+    /// The output folder, the default filled in.
+    out_dir: PathBuf,
+    /// What an earlier run left there.
+    previous: Previous,
 }
 
 /// Resolves and checks `job` without a GPU: world, preset and metric names,
-/// the recipe and its `--set` edits, size and pacing, and that the output (and
-/// library) folders can be written.
+/// the recipe and its `--set` edits, size and pacing, that the output (and
+/// library) folders can be written, and that the output folder holds no
+/// explore outputs that no `run.json` lists (unless `overwrite`).
 fn plan(job: &ExploreJob) -> Result<Plan> {
     frame_deadline(Instant::now(), job.frames.max(1), job.max_fps).map_err(|e| Failure::Usage.tag(e))?;
     headless::check_size(job.size)?;
@@ -741,32 +955,45 @@ fn plan(job: &ExploreJob) -> Result<Plan> {
         Select::Novelty => None,
         Select::Max(id) | Select::Min(id) => Some(world::resolve_metric(world, id)?),
     };
-    headless::check_writable_dir(&job.out_dir)?;
+    let out_dir = job.out_dir.clone().unwrap_or_else(|| default_out_dir(job, &source));
+    headless::check_writable_dir(&out_dir)?;
     if let Some(library) = &job.library {
         headless::check_writable_dir(library)?;
     }
-    Ok(Plan { world, lane, source, base_seed })
+    let previous = previous_outputs(&out_dir)?;
+    if !previous.unlisted.is_empty() && !job.overwrite {
+        return Err(Failure::Usage.error(format!(
+            "{} already holds explore outputs that no {MANIFEST} lists ({}): pass --overwrite to replace them, or \
+             choose another --out-dir",
+            out_dir.display(),
+            listing(&out_dir, &previous.unlisted)
+        )));
+    }
+    Ok(Plan { world, lane, source, base_seed, out_dir, previous })
 }
 
 pub fn explore(job: &ExploreJob) -> Result<Summary> {
     plan(job)?;
     let gpu = headless::open_gpu()?;
     let summary = explore_with(&gpu, job)?;
+    let name = |path: &Path| path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     log::info!(
-        "kept {} of {} candidates: {} images and {} recipes in {}, {}{}",
+        "kept {} of {} candidates in {}: images, recipes, {}{} and {MANIFEST}",
         summary.kept.len(),
         summary.candidates.len(),
-        summary.images.len(),
-        summary.recipes.len(),
-        job.out_dir.display(),
-        summary.csv.display(),
-        summary.sheet.as_ref().map(|s| format!(" and {}", s.display())).unwrap_or_default()
+        summary.out_dir.display(),
+        name(&summary.csv),
+        summary.sheet.as_deref().map(|s| format!(", {}", name(s))).unwrap_or_default()
     );
     Ok(summary)
 }
 
+/// Runs `job` on `gpu`. The output folder is cleared of the earlier run's
+/// files first, and `run.json` is written last; when the run fails after
+/// writing files, it is written too, marked incomplete, so that the next run
+/// into the folder removes them.
 pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
-    let Plan { world: world_index, lane, source, base_seed } = plan(job)?;
+    let plan = plan(job)?;
     let size = job.size;
     let max = gpu.device.limits().max_texture_dimension_2d;
     if size[0] > max || size[1] > max {
@@ -775,8 +1002,60 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
             size[0], size[1]
         )));
     }
+    let removed = clear_previous(&plan.out_dir, &plan.previous, job.overwrite)?;
+    if removed > 0 {
+        log::info!("removed {removed} files of an earlier run from {}", plan.out_dir.display());
+    }
+    let started = report::utc_time(std::time::SystemTime::now());
+    let clock = Instant::now();
+    let result = search(gpu, job, &plan);
+    let written = {
+        let (preset, files, outcome) = match &result {
+            Ok(summary) => {
+                let files = summary.outputs().into_iter().filter_map(|f| relative(&plan.out_dir, f)).collect();
+                (summary.preset, files, Ok(summary))
+            }
+            // The folder held no outputs when the run began, so every one in it now is this run's.
+            Err(e) => {
+                let files = previous_outputs(&plan.out_dir).map(|p| p.unlisted).unwrap_or_default();
+                let files = files.iter().filter_map(|f| relative(&plan.out_dir, f)).collect();
+                (plan.source.preset().unwrap_or(0), files, Err(format!("{e:#}")))
+            }
+        };
+        let record = Record {
+            world: plan.world,
+            preset,
+            base_seed: plan.base_seed,
+            started,
+            gpu: capture::gpu_name(gpu),
+            secs: clock.elapsed().as_secs_f32(),
+            files,
+            outcome,
+        };
+        if record.outcome.is_err() && record.files.is_empty() {
+            Ok(())
+        } else {
+            recipe::write_json(&plan.out_dir.join(MANIFEST), &report::explore_manifest(job, &record))
+        }
+    };
+    match result {
+        Ok(summary) => written.map(|()| summary),
+        Err(e) => {
+            if let Err(problem) = written {
+                log::warn!("{problem:#}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The search itself: evaluates the candidates, chooses the archive and
+/// writes every output but the manifest.
+fn search(gpu: &Gpu, job: &ExploreJob, plan: &Plan) -> Result<Summary> {
+    let (world_index, lane, base_seed, out_dir) = (plan.world, plan.lane, plan.base_seed, &plan.out_dir);
+    let size = job.size;
     let keep = job.keep.max(1);
-    let world = source.create(gpu, size, base_seed, &job.sets)?;
+    let world = plan.source.create(gpu, size, base_seed, &job.sets)?;
     let entry = &WORLDS[world_index];
     let world_name = entry.name;
     let presets = world.presets();
@@ -786,7 +1065,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     let metric_count = metrics.len();
     let vital: Vec<usize> =
         entry.vital.iter().filter_map(|id| metrics.iter().position(|m| m.id == *id)).collect();
-    std::fs::create_dir_all(&job.out_dir).with_context(|| format!("creating {}", job.out_dir.display()))?;
+    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let started = Instant::now();
     let total = 1 + job.runs + job.refine * job.children;
     let frames = job.frames.max(1);
@@ -807,6 +1086,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         frames,
         job.select
     );
+    log::info!("writing into {}", out_dir.display());
 
     let mut bench = Bench::new(gpu, world, size, frames, job.max_fps);
     let mut rng = Rng::new(job.seed ^ SEED_SALT);
@@ -822,7 +1102,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         let descriptor = descriptor(&samples, metric_count);
         let inert = descriptor.as_ref().is_some_and(|d| vital.iter().any(|&lane| d[lane * 3] < INERT));
         if let Some(pixels) = pixels {
-            let path = job.out_dir.join("all").join(format!("{index:03}-r{round}-seed{seed}.png"));
+            let path = out_dir.join("all").join(format!("{index:03}-r{round}-seed{seed}.png"));
             let saved = SavedWorld {
                 version: crate::library::RECIPE_VERSION,
                 name: format!("{world_name} explore candidate {index} (seed {seed})"),
@@ -942,7 +1222,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     let mut images = Vec::new();
     let mut recipes = Vec::new();
     let mut installed = Vec::new();
-    let recipe_dir = job.out_dir.join("recipes");
+    let recipe_dir = out_dir.join("recipes");
     let mut library = job.library.clone().map(Library::open);
     for (rank, &i) in kept.iter().enumerate() {
         let rank = rank + 1;
@@ -951,11 +1231,14 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         // Re-simulating from the recipe both renders the image and proves the recipe round-trips.
         bench.restore(&candidate.settings, candidate.seed).with_context(|| format!("restoring the recipe of #{i}"))?;
         let (_, pixels) = bench.run(true)?;
-        let image = job.out_dir.join(format!("{stem}.png"));
+        let image = out_dir.join(format!("{stem}.png"));
         let saved = recipe(world_name, candidate, rank, size);
         capture::write_png(&image, size, &pixels.expect("captured"), &image_provenance(&saved, gpu, &image, frames))?;
         let path = recipe_dir.join(format!("{stem}.json"));
-        recipe::write(&path, &saved)?;
+        // Builds that do not know `provenance` ignore it; the library's copy (--install) goes without it.
+        let mut value = serde_json::to_value(&saved).context("serialising the recipe")?;
+        value["provenance"] = report::explore_provenance(job, &candidates, i);
+        recipe::write_json(&path, &value)?;
         if let Some(library) = &mut library {
             installed.push(library.save_as_new(saved).with_context(|| format!("installing {}", path.display()))?);
         }
@@ -970,9 +1253,16 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         recipes.push(path);
     }
     if let Some(library) = &library {
-        log::info!("installed {} recipes into {}", kept.len(), library.directory.display());
+        log::info!(
+            "installed {} recipes into {}; they open at the {}x{} they were explored at (explore with --width and \
+             --height for larger ones, or render one larger with render --recipe)",
+            kept.len(),
+            library.directory.display(),
+            size[0],
+            size[1]
+        );
     }
-    let csv = job.out_dir.join("candidates.csv");
+    let csv = out_dir.join("candidates.csv");
     write_csv(&csv, &dims, &candidates, presets)?;
     let sheet = if job.sheet {
         let tiles: Vec<Tile> = kept
@@ -981,7 +1271,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
             .enumerate()
             .map(|(rank, (&i, path))| Tile { group: "kept", path, caption: sheet_caption(rank + 1, &candidates[i]) })
             .collect();
-        let path = job.out_dir.join("contact-sheet.png");
+        let path = out_dir.join("contact-sheet.png");
         contact_sheet(&tiles, &path, kept.len().clamp(1, 4), 2)?;
         Some(path)
     } else {
@@ -992,14 +1282,17 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     Ok(Summary {
         world: world_index,
         preset: base_preset,
+        base_seed,
         candidates,
         kept,
+        out_dir: out_dir.clone(),
         images,
         recipes,
         installed,
         all,
         sheet,
         csv,
+        manifest: out_dir.join(MANIFEST),
         secs,
     })
 }
@@ -1128,24 +1421,28 @@ mod tests {
         assert_eq!(select_extreme(&score, &dist, true, 10), vec![0, 4, 1]);
     }
 
-    #[test]
-    fn metric_extremes_leave_out_inert_and_failed_candidates() {
+    /// A Reaction-Diffusion mutation whose descriptor starts with `alive` (`None`: it failed).
+    fn candidate(index: usize, alive: Option<f32>, inert: bool) -> Candidate {
         let text = std::fs::read_to_string("tests/fixtures/reaction-diffusion.json").unwrap();
         let saved: SavedWorld = serde_json::from_str(&text).unwrap();
-        let candidate = |index: usize, alive: Option<f32>, inert: bool| Candidate {
+        Candidate {
             index,
             round: 0,
             origin: Origin::Mutation,
             seed: index as u64,
             preset: 0,
-            settings: saved.settings.clone(),
+            settings: saved.settings,
             look: saved.look,
             descriptor: alive.map(|a| vec![a, 0.0, 0.0, index as f32, 0.0, 0.0]),
             inert,
             novelty: 0.0,
             rank: None,
             secs: 0.0,
-        };
+        }
+    }
+
+    #[test]
+    fn metric_extremes_leave_out_inert_and_failed_candidates() {
         let candidates = vec![
             candidate(0, Some(0.5), false),
             candidate(1, Some(0.0), true),
@@ -1335,6 +1632,7 @@ mod tests {
     fn explore_keeps_the_most_novel_symbiosis_candidates_and_writes_loadable_recipes() {
         let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
         let job = ExploreJob {
             seed: 42,
             runs: 3,
@@ -1344,9 +1642,10 @@ mod tests {
             frames: 10,
             size: [96, 64],
             max_fps: 0.0,
-            out_dir: dir.path().join("out"),
+            out_dir: Some(out.clone()),
             library: Some(dir.path().join("lib")),
             all: true,
+            argv: ["primordia", "explore", "-w", "symbiosis", "--seed", "42"].map(String::from).to_vec(),
             ..ExploreJob::new("symbiosis")
         };
         let summary = explore_with(&gpu, &job).unwrap();
@@ -1364,12 +1663,14 @@ mod tests {
             assert_eq!((png.width(), png.height()), (96, 64));
         }
         assert!(summary.sheet.as_ref().unwrap().exists());
-        assert_eq!(std::fs::read_dir(job.out_dir.join("all")).unwrap().count(), 6);
+        assert_eq!(std::fs::read_dir(out.join("all")).unwrap().count(), 6);
         assert_eq!(summary.all.len(), 6);
-        assert_eq!((WORLDS[summary.world].id, summary.preset), ("symbiosis", 0));
+        assert_eq!((WORLDS[summary.world].id, summary.preset, summary.base_seed), ("symbiosis", 0, 42));
         let files = summary.files();
-        assert_eq!(files.len(), 6 + 2 * 3 + 2, "all/, image + recipe + install per kept candidate, csv, sheet");
+        let count = 6 + 2 * 3 + 3;
+        assert_eq!(files.len(), count, "all/, image + recipe + install per kept candidate, csv, sheet, run.json");
         assert!(files.iter().all(|f| f.exists()), "{files:?}");
+        assert_eq!(files.last().copied(), Some(out.join(MANIFEST).as_path()), "the manifest is written last");
 
         let csv = std::fs::read_to_string(&summary.csv).unwrap();
         let mut lines = csv.lines();
@@ -1398,11 +1699,39 @@ mod tests {
         assert_eq!(summary.installed.len(), 2);
         assert!(summary.installed.iter().all(|p| p.starts_with(dir.path().join("lib"))));
 
-        let recipes = Library::open(job.out_dir.join("recipes"));
+        // run.json lists every file written into the folder, relative to it (the library's are elsewhere).
+        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(&summary.manifest).unwrap()).unwrap();
+        assert_eq!((manifest["tool"].as_str(), manifest["complete"].as_bool()), (Some(MANIFEST_TOOL), Some(true)));
+        let listed: Vec<PathBuf> =
+            manifest["files"].as_array().unwrap().iter().map(|f| inside(&out, f.as_str().unwrap()).unwrap()).collect();
+        let in_folder: Vec<&Path> = files.iter().copied().filter(|f| !f.starts_with(dir.path().join("lib"))).collect();
+        assert_eq!(listed.iter().map(PathBuf::as_path).collect::<Vec<_>>(), in_folder[..in_folder.len() - 1]);
+        assert_eq!(manifest["argv"], json!(job.argv));
+        assert_eq!(manifest["gpu"], capture::gpu_name(&gpu));
+        assert_eq!(manifest["csv"]["columns"].as_array().unwrap().len(), header.split(',').count());
+        for (rank, kept) in manifest["kept"].as_array().unwrap().iter().enumerate() {
+            let candidate = &summary.candidates[summary.kept[rank]];
+            assert_eq!(kept["seed"], candidate.seed.to_string(), "seeds are strings");
+            assert_eq!(kept["image"], relative(&out, &summary.images[rank]).unwrap());
+            let recipe = format!("recipes/{}.json", file_stem(rank + 1, candidate.seed));
+            assert_eq!(kept["recipe"].as_str(), Some(recipe.as_str()));
+        }
+
+        // Each kept recipe says how explore found it; the library ignores that and loads it.
+        for (rank, path) in summary.recipes.iter().enumerate() {
+            let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let provenance = &value["provenance"];
+            let origin = (provenance["tool"].as_str(), provenance["run_seed"].as_str());
+            assert_eq!(origin, (Some(MANIFEST_TOOL), Some("42")));
+            let place = (provenance["rank"].as_u64(), provenance["candidate"].as_u64());
+            assert_eq!(place, (Some(rank as u64 + 1), Some(summary.kept[rank] as u64)));
+        }
+        let recipes = Library::open(out.join("recipes"));
         assert!(recipes.warnings.is_empty(), "{:?}", recipes.warnings);
         assert_eq!(recipes.entries.len(), 2);
         for entry in &recipes.entries {
-            assert!(entry.saved.name.contains("explore #"), "{}", entry.saved.name);
+            let name = &entry.saved.name;
+            assert!(name.contains("explore #") && name.ends_with(", 96x64)"), "the size explored at: {name}");
             let (index, restored) = entry.saved.instantiate(&gpu).unwrap();
             assert_eq!(WORLDS[index].id, "symbiosis");
             assert_eq!(
@@ -1417,7 +1746,7 @@ mod tests {
         let extreme = ExploreJob {
             select: Select::Max("growth_cover".into()),
             refine: 0,
-            out_dir: dir.path().join("max"),
+            out_dir: Some(dir.path().join("max")),
             library: None,
             all: false,
             ..job.clone()
@@ -1436,7 +1765,7 @@ mod tests {
         assert!(error.contains("growth_cover"), "{error}");
 
         // A search can start from a kept recipe, edited by --set: it is evaluated first, from its own seed.
-        let path = summary_recipe(&job);
+        let path = summary_recipe(&out);
         let from_recipe = ExploreJob {
             recipe: Some(Recipe::load(&path).unwrap()),
             sets: vec!["params.steps=3".parse().unwrap()],
@@ -1444,7 +1773,7 @@ mod tests {
             runs: 1,
             refine: 0,
             keep: 1,
-            out_dir: dir.path().join("from-recipe"),
+            out_dir: Some(dir.path().join("from-recipe")),
             library: None,
             all: false,
             inert: true,
@@ -1458,25 +1787,258 @@ mod tests {
         assert_eq!(params.steps, 3, "--set applies to the base");
         let csv = std::fs::read_to_string(&summary.csv).unwrap();
         assert!(csv.lines().nth(1).unwrap().starts_with(&format!("0,0,recipe,,{},", saved.seed)), "{csv}");
+
+        // A second run into the first folder replaces that run's files, and only those.
+        std::fs::write(out.join("notes.txt"), "mine").unwrap();
+        let again = ExploreJob { seed: 43, library: None, all: false, sheet: false, ..job.clone() };
+        let summary = explore_with(&gpu, &again).unwrap();
+        assert!(!out.join("all").exists() && !out.join("contact-sheet.png").exists(), "the first run's extras went");
+        let names = |folder: &Path| {
+            let files = std::fs::read_dir(folder).unwrap();
+            let mut names: Vec<String> = files.map(|f| f.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let mut expected: Vec<String> = summary.images.iter().map(|p| relative(&out, p).unwrap()).collect();
+        expected.extend(["candidates.csv", "notes.txt", "recipes", MANIFEST].map(String::from));
+        expected.sort();
+        assert_eq!(names(&out), expected);
+        assert_eq!(names(&out.join("recipes")).len(), summary.recipes.len());
+        assert_eq!(std::fs::read_to_string(out.join("notes.txt")).unwrap(), "mine");
+        assert_eq!(Library::open(dir.path().join("lib")).entries.len(), 2, "installed recipes are never removed");
         assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
     }
 
-    /// The first recipe `job` kept.
-    fn summary_recipe(job: &ExploreJob) -> PathBuf {
-        let recipes = job.out_dir.join("recipes");
+    /// The first recipe kept in `out`.
+    fn summary_recipe(out: &Path) -> PathBuf {
+        let recipes = out.join("recipes");
         let mut files: Vec<PathBuf> = std::fs::read_dir(recipes).unwrap().map(|f| f.unwrap().path()).collect();
         files.sort();
         files.remove(0)
     }
 
     #[test]
+    fn default_folders_name_the_world_the_base_and_the_seed() {
+        let job = ExploreJob::new("symbiosis");
+        let source = |job: &ExploreJob| {
+            Source::resolve(job.recipe.as_ref(), &job.world, job.preset.as_deref(), job.seed, &job.sets).unwrap()
+        };
+        assert_eq!(default_out_dir(&job, &source(&job)), Path::new("explore").join("symbiosis-living-reef-s1"));
+        let coral = ExploreJob { world: "rd".into(), preset: Some("mito".into()), seed: 7, ..job.clone() };
+        let expected = Path::new("explore").join("reaction-diffusion-mitosis-s7");
+        assert_eq!(default_out_dir(&coral, &source(&coral)), expected);
+        let recipe = Recipe::load(Path::new("tests/fixtures/reaction-diffusion.json")).unwrap();
+        let from_recipe = ExploreJob { recipe: Some(recipe), ..job.clone() };
+        let expected = Path::new("explore").join("reaction-diffusion-reaction-diffusion-s1");
+        assert_eq!(default_out_dir(&from_recipe, &source(&from_recipe)), expected);
+    }
+
+    #[test]
+    fn output_names_are_recognised_exactly() {
+        for (sub, name) in [
+            ("", "01-seed1.png"),
+            ("", "12-seed8010643033089386035.png"),
+            ("", "candidates.csv"),
+            ("", "contact-sheet.png"),
+            ("recipes", "03-seed42.json"),
+            ("all", "000-r0-seed1.png"),
+            ("all", "123-r12-seed99.png"),
+        ] {
+            assert!(is_output_name(sub, name), "{sub}/{name}");
+        }
+        for (sub, name) in [
+            ("", "1-seed1.png"),
+            ("", "01-seed.png"),
+            ("", "01-seed1.json"),
+            ("", "notes.txt"),
+            ("", MANIFEST),
+            ("recipes", "01-seed1.png"),
+            ("recipes", "world-abc.json"),
+            ("all", "00-r0-seed1.png"),
+            ("all", "000-seed1.png"),
+            ("other", "01-seed1.png"),
+        ] {
+            assert!(!is_output_name(sub, name), "{sub}/{name}");
+        }
+        let dir = Path::new("out");
+        assert_eq!(relative(dir, &dir.join("recipes").join("01-seed1.json")).as_deref(), Some("recipes/01-seed1.json"));
+        assert_eq!(relative(dir, Path::new("elsewhere/x.png")), None);
+        assert_eq!(inside(dir, "recipes/01-seed1.json"), Some(dir.join("recipes").join("01-seed1.json")));
+        for escape in ["../x.png", "/etc/x", "C:/x.png", "a//b", "./x", "a\\..\\b", ""] {
+            assert_eq!(inside(dir, escape), None, "{escape}");
+        }
+    }
+
+    #[test]
+    fn a_run_removes_only_what_the_earlier_manifest_lists_and_refuses_unlisted_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let write = |relative: &str| {
+            let path = inside(&out, relative).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+            path
+        };
+        // An earlier run's outputs and its manifest, next to files of the user's own.
+        let names =
+            ["01-seed5.png", "recipes/01-seed5.json", "all/000-r0-seed5.png", "candidates.csv", "contact-sheet.png"];
+        let earlier: Vec<PathBuf> = names.iter().map(|f| write(f)).collect();
+        let mine = [write("notes.txt"), write("recipes/favourite.json"), write("all/sketch.png")];
+        let outside = dir.path().join("keep.png");
+        std::fs::write(&outside, "x").unwrap();
+        let mut listed: Vec<&str> = names.to_vec();
+        listed.extend(["../keep.png", outside.to_str().unwrap(), "gone.png"]);
+        let manifest = json!({ "tool": MANIFEST_TOOL, "schema": 1, "files": listed });
+        std::fs::write(out.join(MANIFEST), manifest.to_string()).unwrap();
+
+        let job = ExploreJob { out_dir: Some(out.clone()), ..ExploreJob::new("symbiosis") };
+        let plan = plan(&job).unwrap();
+        assert_eq!(plan.out_dir, out);
+        assert_eq!((plan.previous.listed.len(), plan.previous.unlisted.len()), (5, 0), "{:?}", plan.previous);
+        assert_eq!(clear_previous(&out, &plan.previous, false).unwrap(), 6, "five outputs and the manifest");
+        assert!(earlier.iter().all(|f| !f.exists()) && !out.join(MANIFEST).exists());
+        assert!(mine.iter().all(|f| f.exists()) && outside.exists(), "nothing the manifest does not list is touched");
+        assert!(out.join("recipes").is_dir(), "a folder that still holds a file of the user's stays");
+
+        // Outputs that no manifest lists: refused, unless --overwrite, which removes them and nothing else.
+        let stray = [write("02-seed9.png"), write("recipes/02-seed9.json"), write("all/001-r1-seed9.png")];
+        let error = super::plan(&job).err().expect("a folder with unlisted outputs");
+        let message = format!("{error:#}");
+        let names = "no run.json lists (02-seed9.png, all/001-r1-seed9.png, recipes/02-seed9.json)";
+        assert!(message.contains(names), "{message}");
+        assert!(message.contains("pass --overwrite to replace them, or choose another --out-dir"), "{message}");
+        assert_eq!(crate::failure::exit_code(&error), 2);
+        let overwrite = ExploreJob { overwrite: true, ..job.clone() };
+        let plan = super::plan(&overwrite).unwrap();
+        assert_eq!(clear_previous(&out, &plan.previous, true).unwrap(), 3);
+        assert!(stray.iter().all(|f| !f.exists()) && mine.iter().all(|f| f.exists()));
+        write("03-seed1.png");
+        assert_eq!(listing(&out, &[out.join("a"), out.join("b"), out.join("c"), out.join("d")]), "a, b, c and 1 more");
+
+        // A run.json that explore did not write puts the folder off limits, even with --overwrite.
+        std::fs::write(out.join(MANIFEST), "{\"name\": \"a different tool's run\"}").unwrap();
+        let error = super::plan(&overwrite).err().expect("a foreign run.json");
+        assert!(format!("{error:#}").contains("was not written by primordia explore"), "{error:#}");
+        assert_eq!(crate::failure::exit_code(&error), 2);
+        assert!(out.join("03-seed1.png").exists());
+    }
+
+    #[test]
+    fn manifests_describe_the_run_every_column_and_every_file() {
+        let out = Path::new("explore").join("reaction-diffusion-coral-reef-s7");
+        let mut candidates = vec![candidate(0, Some(0.5), false), candidate(1, Some(0.9), false)];
+        candidates[0].origin = Origin::Preset;
+        candidates.push(Candidate { origin: Origin::Child { parent: 1 }, seed: 1, ..candidate(2, Some(0.7), true) });
+        candidates[2].rank = Some(1);
+        candidates[0].rank = Some(2);
+        let stem = |rank: usize, c: usize| file_stem(rank, candidates[c].seed);
+        let (first, second) = (stem(1, 2), stem(2, 0));
+        let summary = Summary {
+            world: 3,
+            preset: 0,
+            base_seed: 7,
+            kept: vec![2, 0],
+            out_dir: out.clone(),
+            images: vec![out.join(format!("{first}.png")), out.join(format!("{second}.png"))],
+            recipes: [&first, &second].map(|stem| out.join("recipes").join(format!("{stem}.json"))).to_vec(),
+            // A library inside the folder: its files are still not the run's to list (or remove).
+            installed: ["world-a.json", "world-b.json"].map(|name| out.join("library").join(name)).to_vec(),
+            all: Vec::new(),
+            sheet: Some(out.join("contact-sheet.png")),
+            csv: out.join("candidates.csv"),
+            manifest: out.join(MANIFEST),
+            secs: 1.5,
+            candidates,
+        };
+        let argv: Vec<String> = ["primordia", "explore", "-w", "rd", "--seed", "7"].map(String::from).to_vec();
+        let job = ExploreJob { world: "rd".into(), seed: 7, argv, ..ExploreJob::new("rd") };
+        let record = |outcome| Record {
+            world: 3,
+            preset: 0,
+            base_seed: 7,
+            started: "2026-09-22T14:59:49Z".into(),
+            gpu: "Test GPU (Vulkan)".into(),
+            secs: 2.0,
+            files: summary.outputs().into_iter().filter_map(|f| relative(&out, f)).collect(),
+            outcome,
+        };
+        // Through text and back, as a script would read it.
+        let text = report::explore_manifest(&job, &record(Ok(&summary))).to_string();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((value["tool"].as_str(), value["schema"].as_u64()), (Some(MANIFEST_TOOL), Some(1)));
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!((value["complete"].as_bool(), value["error"].is_null()), (Some(true), true));
+        assert_eq!(value["argv"], json!(job.argv));
+        assert_eq!((&value["started"], &value["gpu"]), (&json!("2026-09-22T14:59:49Z"), &json!("Test GPU (Vulkan)")));
+        assert_eq!(value["world"], json!({ "index": 4, "id": "reaction-diffusion", "name": "Reaction-Diffusion" }));
+        assert_eq!(value["base"]["origin"], "preset");
+        assert_eq!(value["base"]["preset"], json!({ "index": 1, "name": "Coral Reef", "slug": "coral-reef" }));
+        assert_eq!((value["base"]["seed"].as_str(), value["settings"]["seed"].as_str()), (Some("7"), Some("7")));
+        let settings = &value["settings"];
+        assert_eq!((settings["runs"].as_u64(), settings["size"].clone()), (Some(48), json!([640, 360])));
+        assert_eq!((settings["select"].as_str(), settings["install"].is_null()), (Some("novelty"), true));
+
+        // Every column of candidates.csv, in order, with what it holds; descriptor columns name their measurement.
+        let columns = value["csv"]["columns"].as_array().unwrap();
+        let metrics = WORLDS[3].metrics;
+        assert_eq!(columns.len(), CSV_COLUMNS.len() + 3 * metrics.len());
+        let names: Vec<&str> = columns.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(&names[..3], ["index", "round", "origin"]);
+        assert_eq!(names[CSV_COLUMNS.len()..], dim_names(metrics));
+        assert!(columns.iter().all(|c| !c["meaning"].as_str().unwrap().is_empty()));
+        let alive = &columns[CSV_COLUMNS.len()];
+        assert_eq!((alive["name"].as_str(), alive["stat"].as_str()), (Some("alive_mean"), Some("mean")));
+        assert_eq!(alive["metric"]["id"], "alive");
+        assert_eq!((&alive["metric"]["unit"], &alive["metric"]["vital"]), (&json!("fraction"), &json!(true)));
+
+        // Files are relative to the folder; the library's are never among them.
+        let files: Vec<&str> = value["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+        let expected = [
+            format!("{first}.png"),
+            format!("recipes/{first}.json"),
+            format!("{second}.png"),
+            format!("recipes/{second}.json"),
+            "candidates.csv".into(),
+            "contact-sheet.png".into(),
+        ];
+        assert_eq!(files, expected);
+        let counts = [&value["evaluated"], &value["inert"], &value["failed"]].map(Value::as_u64);
+        assert_eq!(counts, [Some(3), Some(1), Some(0)]);
+        let kept = &value["kept"][0];
+        assert_eq!((kept["rank"].as_u64(), kept["candidate"].as_u64()), (Some(1), Some(2)));
+        assert_eq!((kept["origin"].as_str(), kept["parent"].as_u64()), (Some("child"), Some(1)));
+        assert_eq!(kept["seed"], "1", "a child runs from its parent's seed, written as a string");
+        assert_eq!((&kept["image"], &kept["recipe"]), (&json!(expected[0]), &json!(expected[1])));
+        assert_eq!(kept["installed"], summary.installed[0].display().to_string(), "as written, not relative");
+        assert!(value["kept"][1]["parent"].is_null());
+
+        // A failed run is marked incomplete, with its error and no kept candidates.
+        let failed = report::explore_manifest(&job, &record(Err("GPU error while exploring".into())));
+        let outcome = (failed["complete"].as_bool(), failed["error"].as_str());
+        assert_eq!(outcome, (Some(false), Some("GPU error while exploring")));
+        assert!(failed["kept"].is_null() && failed["files"].is_array());
+
+        // A kept recipe's provenance: the run, the candidate and its parent, seeds as strings.
+        let provenance = report::explore_provenance(&job, &summary.candidates, 2);
+        assert_eq!(
+            provenance,
+            json!({
+                "tool": MANIFEST_TOOL, "version": env!("CARGO_PKG_VERSION"), "run_seed": "7", "select": "novelty",
+                "candidate": 2, "round": 0, "rank": 1, "novelty": 0.0, "origin": "child", "parent": 1,
+                "parent_seed": "1",
+            })
+        );
+    }
+
+    #[test]
     fn plans_reject_bad_names_and_sizes_before_any_gpu_work() {
         let dir = tempfile::tempdir().unwrap();
-        let job = ExploreJob { out_dir: dir.path().join("out"), ..ExploreJob::new("symbiosis") };
+        let out = dir.path().join("out");
+        let job = ExploreJob { out_dir: Some(out.clone()), ..ExploreJob::new("symbiosis") };
         let select = Select::Max("growth_cover".into());
         let plan = plan(&ExploreJob { preset: Some("coral".into()), select, ..job.clone() }).unwrap();
         assert_eq!((WORLDS[plan.world].id, plan.source.preset(), plan.lane), ("symbiosis", Some(2), Some(0)));
-        assert!(job.out_dir.is_dir(), "the output folder is created and probed up front");
+        assert!(out.is_dir(), "the output folder is created and probed up front");
         let cases = [
             (ExploreJob { world: "symbiosys".into(), ..job.clone() }, "did you mean 'symbiosis'?"),
             (ExploreJob { preset: Some("9".into()), ..job.clone() }, "Symbiosis has presets 1-6"),

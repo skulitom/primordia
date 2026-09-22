@@ -386,12 +386,17 @@ impl Source {
 
 /// Writes `saved` as a recipe file in the library's format (pretty JSON).
 pub fn write(path: &Path, saved: &SavedWorld) -> Result<()> {
+    write_json(path, saved)
+}
+
+/// Writes `value` as pretty JSON, creating the folder it goes into.
+pub fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    let mut json = serde_json::to_string_pretty(saved).context("serialising the recipe")?;
+    let mut json = serde_json::to_string_pretty(value).context("serialising the JSON")?;
     json.push('\n');
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }

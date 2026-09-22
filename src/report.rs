@@ -1,5 +1,6 @@
 //! What the CLI prints on stdout: the `primordia list` catalogue and the result
-//! of each headless command, as text or as one JSON object (`--json`).
+//! of each headless command, as text or as one JSON object (`--json`); and the
+//! JSON explore leaves in its folder (`run.json`, the recipes' `provenance`).
 //!
 //! Conventions of every JSON object: seeds are strings (a `u64` does not fit a
 //! JSON number exactly), including the seed of a recipe object; presets are
@@ -8,11 +9,11 @@
 //! whether the command succeeded (failures come from [`crate::failure::json`]).
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::explore::{self, Origin};
+use crate::explore::{self, Candidate, Origin};
 use crate::headless::{self, GallerySummary, RenderJob, RenderSummary};
 use crate::library::{self, SavedWorld};
 use crate::metrics::MetricDesc;
@@ -218,34 +219,44 @@ pub fn gallery(summary: &GallerySummary, seed: u64, size: [u32; 2], frames: u32)
     })
 }
 
-/// `explore --json`: the kept candidates in rank order, with their files.
-pub fn explore(summary: &explore::Summary, job: &explore::ExploreJob) -> Value {
-    let world = summary.world;
-    let kept: Vec<Value> = summary
+/// The parent of a child candidate.
+fn parent(candidate: &Candidate) -> Option<usize> {
+    match candidate.origin {
+        Origin::Child { parent } => Some(parent),
+        _ => None,
+    }
+}
+
+/// The kept candidates of an exploration in rank order; `file` prints the
+/// path of an image or recipe.
+fn explore_kept(summary: &explore::Summary, file: impl Fn(&Path) -> Value) -> Vec<Value> {
+    let file = |p: Option<&PathBuf>| p.map_or(Value::Null, |p| file(p));
+    summary
         .kept
         .iter()
         .enumerate()
         .map(|(rank, &i)| {
             let c = &summary.candidates[i];
-            let (origin, parent) = match c.origin {
-                Origin::Child { parent } => (c.origin.name(), Some(parent)),
-                other => (other.name(), None),
-            };
             json!({
                 "rank": rank + 1,
                 "candidate": c.index,
                 "round": c.round,
-                "origin": origin,
-                "parent": parent,
+                "origin": c.origin.name(),
+                "parent": parent(c),
                 "seed": c.seed.to_string(),
-                "preset": preset(world, c.preset),
+                "preset": preset(summary.world, c.preset),
                 "novelty": number(c.novelty),
-                "image": optional_path(summary.images.get(rank).map(|p| p.as_path())),
-                "recipe": optional_path(summary.recipes.get(rank).map(|p| p.as_path())),
+                "image": file(summary.images.get(rank)),
+                "recipe": file(summary.recipes.get(rank)),
                 "installed": optional_path(summary.installed.get(rank).map(|p| p.as_path())),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// `explore --json`: the kept candidates in rank order, with their files.
+pub fn explore(summary: &explore::Summary, job: &explore::ExploreJob) -> Value {
+    let world = summary.world;
     json!({
         "ok": true,
         "command": "explore",
@@ -254,21 +265,132 @@ pub fn explore(summary: &explore::Summary, job: &explore::ExploreJob) -> Value {
             "preset": preset(world, summary.preset),
             "source": optional_path(job.recipe.as_ref().map(|r| r.path.as_path())),
             "set": settings(&job.sets),
+            "seed": summary.base_seed.to_string(),
         },
         "seed": job.seed.to_string(),
         "select": job.select.to_string(),
         "evaluated": summary.candidates.len(),
         "inert": summary.candidates.iter().filter(|c| c.inert).count(),
-        "kept": kept,
+        "kept": explore_kept(summary, path),
         "files": {
-            "out_dir": path(&job.out_dir),
+            "out_dir": path(&summary.out_dir),
             "csv": path(&summary.csv),
             "sheet": optional_path(summary.sheet.as_deref()),
             "all": summary.all.iter().map(|p| path(p)).collect::<Vec<_>>(),
+            "manifest": path(&summary.manifest),
         },
         "library": optional_path(job.library.as_deref()),
         "secs": number(summary.secs),
     })
+}
+
+/// Version of the `run.json` layout; bumped only when fields change meaning or go away.
+pub const MANIFEST_SCHEMA: u32 = 1;
+
+/// `run.json`, the record an exploration leaves in its folder: the command
+/// line, version, GPU and settings, what every column of candidates.csv
+/// holds, the kept candidates, and `files`, every file the run wrote into the
+/// folder. Those paths (and the kept candidates' images and recipes) are
+/// relative to the folder, with `/` between their parts; the next run into
+/// the folder removes exactly them. A failed run that wrote files leaves
+/// `"complete": false`, its `error` and no `kept`.
+pub fn explore_manifest(job: &explore::ExploreJob, record: &explore::Record) -> Value {
+    let entry = &WORLDS[record.world];
+    let fixed = explore::CSV_COLUMNS.iter().map(|(name, meaning)| json!({ "name": name, "meaning": meaning }));
+    let descriptor = entry.metrics.iter().flat_map(|m| {
+        explore::DESCRIPTOR_STATS.iter().map(move |(stat, meaning)| {
+            json!({
+                "name": format!("{}_{stat}", m.id),
+                "meaning": meaning,
+                "stat": stat,
+                "metric": metric(m, entry.vital.contains(&m.id)),
+            })
+        })
+    });
+    let base = if job.recipe.is_some() || !job.sets.is_empty() { Origin::Recipe } else { Origin::Preset };
+    let mut value = json!({
+        "tool": explore::MANIFEST_TOOL,
+        "schema": MANIFEST_SCHEMA,
+        "version": env!("CARGO_PKG_VERSION"),
+        "complete": record.outcome.is_ok(),
+        "error": record.outcome.as_ref().err(),
+        "argv": job.argv,
+        "started": record.started,
+        "secs": number(record.secs),
+        "gpu": record.gpu,
+        "world": { "index": record.world + 1, "id": entry.id, "name": entry.name },
+        "base": {
+            "origin": base.name(),
+            "preset": preset(record.world, record.preset),
+            "recipe": optional_path(job.recipe.as_ref().map(|r| r.path.as_path())),
+            "set": settings(&job.sets),
+            "seed": record.base_seed.to_string(),
+        },
+        "settings": {
+            "seed": job.seed.to_string(),
+            "runs": job.runs,
+            "refine": job.refine,
+            "children": job.children,
+            "strength": number(job.strength),
+            "keep": job.keep,
+            "frames": job.frames,
+            "size": job.size,
+            "max_fps": number(job.max_fps),
+            "select": job.select.to_string(),
+            "keep_inert": job.inert,
+            "all": job.all,
+            "sheet": job.sheet,
+            "install": optional_path(job.library.as_deref()),
+        },
+        "csv": { "file": "candidates.csv", "columns": fixed.chain(descriptor).collect::<Vec<_>>() },
+        "files": record.files,
+    });
+    if let Ok(summary) = record.outcome {
+        let count = |status: &str| summary.candidates.iter().filter(|c| c.status() == status).count();
+        value["evaluated"] = json!(summary.candidates.len());
+        value["inert"] = json!(count("inert"));
+        value["failed"] = json!(count("failed"));
+        let file = |p: &Path| explore::relative(&summary.out_dir, p).map_or_else(|| path(p), Value::String);
+        value["kept"] = Value::Array(explore_kept(summary, file));
+    }
+    value
+}
+
+/// The `provenance` object of a kept recipe: which exploration found it and
+/// how. Seeds are strings; `parent` is the candidate a child perturbs, whose
+/// seed it reuses.
+pub fn explore_provenance(job: &explore::ExploreJob, candidates: &[Candidate], index: usize) -> Value {
+    let c = &candidates[index];
+    json!({
+        "tool": explore::MANIFEST_TOOL,
+        "version": env!("CARGO_PKG_VERSION"),
+        "run_seed": job.seed.to_string(),
+        "select": job.select.to_string(),
+        "candidate": c.index,
+        "round": c.round,
+        "rank": c.rank,
+        "novelty": number(c.novelty),
+        "origin": c.origin.name(),
+        "parent": parent(c),
+        "parent_seed": parent(c).map(|p| candidates[p].seed.to_string()),
+    })
+}
+
+/// `time` in UTC as RFC 3339, to the second: "2026-09-22T14:59:49Z".
+pub fn utc_time(time: std::time::SystemTime) -> String {
+    let secs = time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil-from-days algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
 #[cfg(test)]
@@ -321,6 +443,15 @@ mod tests {
         assert_eq!(lenia["worlds"].as_array().unwrap().len(), 1);
         assert_eq!(lenia["worlds"][0]["id"], "lenia");
         assert_eq!(lenia["worlds"][0]["palette_setting"], "palettes");
+    }
+
+    #[test]
+    fn times_are_utc_in_rfc_3339() {
+        let at = |secs: u64| utc_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(at(1_790_000_000), "2026-09-21T14:13:20Z");
+        assert_eq!(at(4_102_444_799), "2099-12-31T23:59:59Z");
     }
 
     #[test]

@@ -45,7 +45,7 @@ Examples:
   primordia render -w physarum --video network.mp4     render a video (needs ffmpeg)
   primordia gallery -o gallery                         every preset of every world, plus a contact sheet
   primordia explore -w symbiosis --runs 24 --json      search for novel behaviour and keep recipes
-  primordia render --recipe explore/recipes/01-seed1.json --width 3840 --height 2160
+  primordia render --recipe explore/symbiosis-living-reef-s1/recipes/01-seed1.json --width 3840 --height 2160
                                                        render a kept recipe (or a PNG Primordia wrote) again
   primordia recipe -w rd -p mitosis --set params.feed=0.031 -o mito.json
                                                        a preset's complete recipe, with one setting changed";
@@ -167,7 +167,8 @@ enum Command {
         "  primordia render -w rd -p mitosis -o mitosis.png\n",
         "  primordia render -w lenia -p 5 --frames 1200 --video necklaces.mp4 --metrics necklaces.csv\n",
         "  primordia render -w physarum --zoom 3 --center 0.25,0.5 --json\n",
-        "  primordia render --recipe explore/recipes/01-seed1.json --width 3840 --height 2160\n",
+        "  primordia render --recipe explore/symbiosis-living-reef-s1/recipes/01-seed1.json ",
+        "--width 3840 --height 2160\n",
         "  primordia render -w rd -p mitosis --set params.feed=0.031 --save-recipe mito.json\n",
         "  primordia render --recipe mito.png -o mito-again.png\n\n",
         "--recipe reproduces a recipe exactly at its own size, seed, look and camera; --width and --height run the ",
@@ -185,10 +186,18 @@ enum Command {
     Recipe(RecipeArgs),
     /// Search a world's mutations for the most novel behaviour and keep them as recipes
     #[command(after_long_help = concat!(
+        "Each run writes into a folder of its own, explore/<world>-<preset>-s<seed> unless --out-dir names one: ",
+        "NN-seedS.png for the kept candidate of rank NN, recipes/NN-seedS.json (loadable by the app's library, ",
+        "render --recipe and explore --recipe; its \"provenance\" says how explore found it), candidates.csv, ",
+        "contact-sheet.png (captioned with rank and seed), all/NNN-rR-seedS.png with --all, and run.json: the ",
+        "command line, version, GPU, settings, what every candidates.csv column holds, the kept candidates and ",
+        "every file the run wrote. A later run into the same folder first removes exactly the files its run.json ",
+        "lists; a folder holding explore outputs that no run.json lists is refused unless --overwrite.\n\n",
         "candidates.csv has one row per candidate: index, round, origin (preset, recipe, mutation or child), parent, ",
-        "seed, preset (from 1, like --preset), preset_name, rank, novelty, status, secs, then three columns per ",
-        "measurement: <id>_mean (mean of the last 40% of the frames), <id>_std (its standard deviation) and ",
-        "<id>_drift (that mean minus the mean of the first 20%).\n\n",
+        "seed, preset (from 1, like --preset), preset_name, rank, novelty, status (ok, inert or failed), secs, then ",
+        "three columns per measurement: <id>_mean (mean of the last 40% of the frames), <id>_std (its standard ",
+        "deviation) and <id>_drift (that mean minus the mean of the first 20%). Children reuse their parent's ",
+        "seed.\n\n",
         "Output, environment variables and exit status: see `primordia --help`."
     ))]
     Explore(ExploreArgs),
@@ -201,7 +210,7 @@ const RENDER_EXAMPLES: &str = "\
 Examples:
   primordia render -w rd -p mitosis -o mitosis.png
   primordia render -w lenia -p 5 --frames 1200 --video necklaces.mp4 --metrics necklaces.csv
-  primordia render --recipe explore/recipes/01-seed1.json --width 3840 --height 2160";
+  primordia render --recipe explore/symbiosis-living-reef-s1/recipes/01-seed1.json --width 3840 --height 2160";
 
 const RECIPE_LONG_HELP: &str = "\
 Examples:
@@ -438,7 +447,8 @@ struct ExploreArgs {
     /// Children to evaluate per refinement round
     #[arg(long, default_value_t = 24, value_parser = at_least_one)]
     children: u32,
-    /// Relative size of a perturbation (log-normal noise on the recipe's numbers)
+    /// Relative size of a perturbation (log-normal noise on the recipe's numbers; colours, palettes and the
+    /// rest of the look are never perturbed)
     #[arg(long, default_value_t = 0.15, value_parser = finite_float)]
     strength: f32,
     /// Candidates to keep
@@ -456,9 +466,14 @@ struct ExploreArgs {
     /// Frame-rate ceiling per candidate, keeps the GPU from running flat out (0 = unlimited)
     #[arg(long, default_value_t = headless::DEFAULT_MAX_FPS, value_parser = finite_float)]
     max_fps: f32,
-    /// Folder for the images, contact sheet, candidates.csv and recipes/
-    #[arg(short, long, default_value = "explore")]
-    out_dir: PathBuf,
+    /// Folder for the images, recipes/, candidates.csv, contact-sheet.png and run.json [default:
+    /// explore/<world>-<preset>-s<seed>, or explore/<world>-<recipe file name>-s<seed> with --recipe]
+    #[arg(short, long)]
+    out_dir: Option<PathBuf>,
+    /// Also replace explore outputs in --out-dir that no run.json lists (from an older build, another tool or
+    /// a killed run); without it such a folder is refused. The files an earlier run.json lists are always replaced
+    #[arg(long)]
+    overwrite: bool,
     /// What to keep: "novelty" (mutually most different), "max:<metric>" or "min:<metric>"
     /// (metric ids: `primordia list --world W`)
     #[arg(long, default_value = "novelty")]
@@ -672,6 +687,12 @@ fn emit(json: bool, value: serde_json::Value, files: &[&Path]) {
     }
 }
 
+/// The command line as typed, for the records a command leaves: `primordia`, then the arguments.
+fn command_line() -> Vec<String> {
+    let args = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned());
+    std::iter::once("primordia".to_string()).chain(args).collect()
+}
+
 /// The seed and size a command runs with: the options given, else the
 /// recipe's, else seed 1 at 1920x1080.
 fn recipe_defaults(recipe: Option<&recipe::Recipe>, seed: Option<u64>, size: [Option<u32>; 2]) -> (u64, [u32; 2]) {
@@ -800,11 +821,13 @@ fn run(cli: Cli) -> Result<()> {
             job.size = [e.width, e.height];
             job.max_fps = e.max_fps;
             job.out_dir = e.out_dir;
+            job.overwrite = e.overwrite;
             job.select = e.select;
             job.library = e.install.then(library::default_directory);
             job.sheet = !e.no_sheet;
             job.all = e.all;
             job.inert = e.keep_inert;
+            job.argv = command_line();
             let summary = explore::explore(&job)?;
             emit(json, report::explore(&summary, &job), &summary.files());
             Ok(())
@@ -889,7 +912,7 @@ mod tests {
         assert!(args.install && args.no_sheet && args.all);
         assert_eq!((args.keep, args.runs, args.refine, args.children), (4, 8, 1, 24));
         assert_eq!(args.strength, 0.15);
-        assert_eq!(args.out_dir, PathBuf::from("explore"));
+        assert_eq!((args.out_dir, args.overwrite), (None, false), "each run gets a folder of its own");
         assert!(parse(["primordia", "explore", "--select", "best"]).is_err());
         assert!(parse(["primordia", "explore", "--keep", "0"]).is_err());
         assert!(parse(["primordia", "explore", "--runs", "0"]).is_err());
@@ -996,6 +1019,9 @@ mod tests {
         }
         let explore = cli.find_subcommand_mut("explore").unwrap().render_long_help().to_string();
         assert!(explore.contains("PRIMORDIA_LIBRARY_DIR overrides") && explore.contains("<id>_drift"));
+        for text in ["explore/<world>-<preset>-s<seed>", "run.json lists", "--overwrite", "provenance"] {
+            assert!(explore.contains(text), "explore's help explains its folder: missing {text:?}");
+        }
     }
 
     #[test]
@@ -1098,7 +1124,7 @@ mod tests {
                 frames: 12,
                 size: [96, 64],
                 max_fps: 0.0,
-                out_dir: dir.path().join(entry.id),
+                out_dir: Some(dir.path().join(entry.id)),
                 sheet: false,
                 inert: true,
                 ..explore::ExploreJob::new(entry.id)
