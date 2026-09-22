@@ -63,8 +63,8 @@ pub fn test_gpu() -> Option<(std::sync::MutexGuard<'static, ()>, Gpu)> {
 /// Shared GPU handles. Cloning is cheap: every wgpu handle is reference counted.
 #[derive(Clone)]
 pub struct Gpu {
-    /// Held so the instance outlives everything created from it (e.g. surfaces).
-    #[allow(dead_code)]
+    /// Held so the instance outlives everything created from it (e.g. surfaces);
+    /// `selftest` also lists its adapters.
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,

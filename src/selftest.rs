@@ -5,7 +5,7 @@
 use anyhow::{anyhow, bail, Context as _, Result};
 use wgpu::ShaderStages;
 
-use crate::gpu::{layout, Gpu};
+use crate::gpu::{describe_adapter, layout, Gpu, ADAPTER_NAME_ENV};
 use crate::rng::Rng;
 
 const SHADER: &str = r#"
@@ -33,7 +33,6 @@ fn cs_wrap(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 pub fn run() -> Result<()> {
     let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))?;
-    println!("GPU: {} ({:?})", gpu.adapter_name(), gpu.adapter.get_info().backend);
 
     // Every size up to 8192 at the edges that matter, plus random far-away points.
     let mut cases: Vec<[i32; 2]> = Vec::new();
@@ -84,7 +83,7 @@ pub fn run() -> Result<()> {
     let results: Vec<[i32; 4]> = bytemuck::pod_collect_to_vec(&slice.get_mapped_range());
     staging.unmap();
 
-    let (mut wrap_bad, mut legacy_bad) = (Vec::new(), Vec::new());
+    let (mut wrap_bad, mut legacy_wrong) = (Vec::new(), 0);
     for (c, r) in cases.iter().zip(&results) {
         let (p, s) = (c[0], c[1]);
         let expected = [p.rem_euclid(s), (-p).rem_euclid(s)];
@@ -92,21 +91,73 @@ pub fn run() -> Result<()> {
             wrap_bad.push(format!("wrap_i(({p}, {}), {s}) = ({}, {}), expected ({}, {})", -p, r[0], r[1], expected[0], expected[1]));
         }
         if [r[2], r[3]] != expected {
-            legacy_bad.push(format!("(({p} % {s}) + {s}) % {s} = {}, expected {}", r[2], expected[0]));
+            legacy_wrong += 1;
         }
     }
 
-    println!("wrap_i:       {}/{n} cases correct", n as usize - wrap_bad.len());
-    for line in wrap_bad.iter().take(8) {
-        println!("  {line}");
+    // The verdict comes first; everything after it is detail.
+    let adapter = describe_adapter(&gpu.adapter.get_info());
+    if wrap_bad.is_empty() {
+        println!("PASS: torus wrapping (wrap_i) is correct in all {n} cases on {adapter}");
+    } else {
+        println!("FAIL: torus wrapping (wrap_i) is wrong in {} of {n} cases on {adapter}", wrap_bad.len());
+        for line in wrap_bad.iter().take(8) {
+            println!("  {line}");
+        }
     }
-    println!("signed-% wrap: {}/{n} cases correct (informational)", n as usize - legacy_bad.len());
-    for line in legacy_bad.iter().take(4) {
-        println!("  {line}");
-    }
+    println!();
+    println!("{}", reference_line(legacy_wrong, n));
+    println!();
+    print_adapters(&gpu);
     if !wrap_bad.is_empty() {
         bail!("wrap_i is wrong on this GPU/driver in {} cases", wrap_bad.len());
     }
-    println!("all checks passed");
     Ok(())
+}
+
+/// How the naive `((p % s) + s) % s` wrap fared: informational, since the
+/// shaders use `wrap_i` precisely because this is often wrong.
+fn reference_line(wrong: usize, cases: u64) -> String {
+    if wrong == 0 {
+        format!(
+            "For reference, a naive signed-% wrap is also right in all {cases} cases here.\n\
+             Other GPUs and backends get it wrong, so the shaders use wrap_i everywhere."
+        )
+    } else {
+        format!(
+            "For reference, a naive signed-% wrap is wrong in {wrong} of {cases} cases here.\n\
+             That is expected (% of negative numbers is unreliable on many GPUs and backends) and is why the \
+             shaders use wrap_i: nothing to fix."
+        )
+    }
+}
+
+/// Every adapter wgpu can use, marking the one this check ran on.
+fn print_adapters(gpu: &Gpu) {
+    let in_use = gpu.adapter.get_info();
+    let mut lines: Vec<String> = Vec::new();
+    for info in gpu.instance.enumerate_adapters(wgpu::Backends::all()).iter().map(wgpu::Adapter::get_info) {
+        let line = format!("  {} {}", if info == in_use { "*" } else { " " }, describe_adapter(&info));
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    println!("Adapters (* = in use; choose another with {ADAPTER_NAME_ENV}=<part of its name>):");
+    for line in &lines {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_signed_modulo_reference_reads_as_expected_behaviour() {
+        let wrong = reference_line(126_303, 134_688);
+        assert!(wrong.contains("wrong in 126303 of 134688 cases here.\nThat is expected"), "{wrong}");
+        assert!(wrong.contains("nothing to fix"), "{wrong}");
+        let right = reference_line(0, 134_688);
+        assert!(right.contains("also right in all 134688 cases"), "{right}");
+    }
 }
