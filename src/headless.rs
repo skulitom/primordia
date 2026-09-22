@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
+use ab_glyph::{Font as _, FontRef, ScaleFont as _};
 use anyhow::{anyhow, bail, Context as _, Result};
 
 use crate::capture::{self, Provenance, Readback};
@@ -727,7 +728,13 @@ pub fn gallery(job: &GalleryJob) -> Result<GallerySummary> {
         images.push((index, i, out));
     }
     let sheet = if job.sheet && !images.is_empty() {
-        let tiles: Vec<(&str, PathBuf)> = images.iter().map(|(index, _, path)| (WORLDS[*index].id, path.clone())).collect();
+        let several = images.iter().any(|(index, _, _)| *index != images[0].0);
+        let tiles: Vec<Tile> = images
+            .iter()
+            .map(|(index, i, path)| {
+                Tile { group: WORLDS[*index].id, path, caption: gallery_caption(*index, *i, several) }
+            })
+            .collect();
         let sheet = job.out_dir.join("contact-sheet.png");
         contact_sheet(&tiles, &sheet, 5, 4)?;
         log::info!("wrote {}", sheet.display());
@@ -740,42 +747,137 @@ pub fn gallery(job: &GalleryJob) -> Result<GallerySummary> {
     Ok(GallerySummary { images, sheet, secs })
 }
 
-// Tiles gallery images (quarter size) into one overview image. Each world
-/// starts a new row; rows hold at most `cols` images.
-/// Tiles `images` (each paired with a grouping key: a new row starts when the
-/// key changes) at `1 / divisor` of the first image's size.
-pub(crate) fn contact_sheet(images: &[(&str, PathBuf)], out: &Path, cols: usize, divisor: u32) -> Result<()> {
-    const GAP: u32 = 8;
-    const BACKGROUND: image::Rgba<u8> = image::Rgba([11, 13, 18, 255]);
+/// The gallery sheet's caption of preset `preset` (0-based) of world `world`:
+/// "2 · Mitosis", followed by the world's name on a sheet of several worlds
+/// ("5 · Symbiosis (Physarum)"), where a narrow tile cuts it first.
+fn gallery_caption(world: usize, preset: usize, several: bool) -> String {
+    let entry = &WORLDS[world];
+    let name = format!("{} · {}", preset + 1, (entry.presets)().get(preset).copied().unwrap_or("custom"));
+    if several { format!("{name} ({})", entry.name) } else { name }
+}
 
-    let mut rows: Vec<Vec<&Path>> = Vec::new();
-    let mut last_world = "";
-    for (world, path) in images {
-        if *world != last_world || rows.last().is_some_and(|r| r.len() == cols) {
+/// One image of a contact sheet.
+#[derive(Clone, Debug)]
+pub(crate) struct Tile<'a> {
+    /// Tiles of a group share rows; a new row starts where the group changes
+    /// (the gallery's world, for example).
+    pub group: &'a str,
+    pub path: &'a Path,
+    /// Printed under the image, cut short with "…" to its width; empty for none.
+    pub caption: String,
+}
+
+/// Background of contact sheets.
+const SHEET_BACKGROUND: image::Rgba<u8> = image::Rgba([11, 13, 18, 255]);
+/// Colour of contact-sheet captions.
+const CAPTION_COLOUR: [u8; 3] = [206, 211, 222];
+
+/// Tiles `tiles` into one overview image at `1 / divisor` of the first image's
+/// size, at most `cols` to a row, with each caption in a strip under its image.
+pub(crate) fn contact_sheet(tiles: &[Tile], out: &Path, cols: usize, divisor: u32) -> Result<()> {
+    const GAP: u32 = 8;
+
+    let mut rows: Vec<Vec<&Tile>> = Vec::new();
+    let mut last_group = "";
+    for tile in tiles {
+        if tile.group != last_group || rows.last().is_some_and(|r| r.len() == cols) {
             rows.push(Vec::new());
-            last_world = world;
+            last_group = tile.group;
         }
         if let Some(row) = rows.last_mut() {
-            row.push(path);
+            row.push(tile);
         }
     }
 
-    let first = image::open(&images[0].1).with_context(|| format!("reading {}", images[0].1.display()))?;
+    let first = tiles.first().context("a contact sheet needs at least one image")?.path;
+    let first = image::open(first).with_context(|| format!("reading {}", first.display()))?;
     let divisor = divisor.max(1);
     let (tw, th) = ((first.width() / divisor).max(1), (first.height() / divisor).max(1));
+    // Captions sit in a strip under each row, their size following the tiles'.
+    let font = caption_font();
+    let px = (th as f32 * 0.12).clamp(10.0, 16.0);
+    let (ascent, line) = (font.as_scaled(px).ascent().ceil() as u32, font.as_scaled(px).height().ceil() as u32);
+    let band = if tiles.iter().any(|t| !t.caption.is_empty()) { line + 8 } else { 0 };
     let width = cols as u32 * tw + (cols as u32 + 1) * GAP;
-    let height = rows.len() as u32 * th + (rows.len() as u32 + 1) * GAP;
-    let mut sheet = image::RgbaImage::from_pixel(width, height, BACKGROUND);
+    let height = rows.len() as u32 * (th + band) + (rows.len() as u32 + 1) * GAP;
+    let mut sheet = image::RgbaImage::from_pixel(width, height, SHEET_BACKGROUND);
     for (r, row) in rows.iter().enumerate() {
-        for (c, path) in row.iter().enumerate() {
-            let img = image::open(path).with_context(|| format!("reading {}", path.display()))?.to_rgba8();
+        for (c, tile) in row.iter().enumerate() {
+            let img = image::open(tile.path).with_context(|| format!("reading {}", tile.path.display()))?.to_rgba8();
             let thumb = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
             let x = GAP + c as u32 * (tw + GAP);
-            let y = GAP + r as u32 * (th + GAP);
+            let y = GAP + r as u32 * (th + band + GAP);
             image::imageops::replace(&mut sheet, &thumb, i64::from(x), i64::from(y));
+            if !tile.caption.is_empty() {
+                draw_caption(&mut sheet, &font, &tile.caption, [x, y + th + 4 + ascent], px, tw as f32);
+            }
         }
     }
     capture::save_png(out, [width, height], sheet.into_raw())
+}
+
+/// The captions' typeface: egui's Ubuntu Light, compiled in (no font file is read).
+fn caption_font() -> FontRef<'static> {
+    FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("egui's bundled font parses")
+}
+
+/// Width of `text` set in `font` at `px` pixels, kerning included.
+fn text_width(font: &FontRef, px: f32, text: &str) -> f32 {
+    let scaled = font.as_scaled(px);
+    let mut width = 0.0;
+    let mut last = None;
+    for c in text.chars() {
+        let id = scaled.glyph_id(c);
+        if let Some(previous) = last {
+            width += scaled.kern(previous, id);
+        }
+        width += scaled.h_advance(id);
+        last = Some(id);
+    }
+    width
+}
+
+/// `text`, cut short with "…" where it would be wider than `width` pixels.
+fn fit_text(font: &FontRef, px: f32, text: &str, width: f32) -> String {
+    if text_width(font, px, text) <= width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len())
+        .rev()
+        .map(|n| format!("{}…", chars[..n].iter().collect::<String>().trim_end()))
+        .find(|cut| text_width(font, px, cut) <= width)
+        .unwrap_or_default()
+}
+
+/// Draws `text` in [`CAPTION_COLOUR`] with its left edge and baseline at
+/// `origin`, `px` pixels high and at most `width` pixels wide.
+fn draw_caption(image: &mut image::RgbaImage, font: &FontRef, text: &str, origin: [u32; 2], px: f32, width: f32) {
+    let text = fit_text(font, px, text, width);
+    let scaled = font.as_scaled(px);
+    let (mut caret, mut last) = (origin[0] as f32, None);
+    for c in text.chars() {
+        let id = scaled.glyph_id(c);
+        if let Some(previous) = last {
+            caret += scaled.kern(previous, id);
+        }
+        let glyph = id.with_scale_and_position(px, ab_glyph::point(caret, origin[1] as f32));
+        caret += scaled.h_advance(id);
+        last = Some(id);
+        let Some(outline) = font.outline_glyph(glyph) else { continue };
+        let bounds = outline.px_bounds();
+        outline.draw(|gx, gy, coverage| {
+            let (x, y) = (bounds.min.x as i64 + i64::from(gx), bounds.min.y as i64 + i64::from(gy));
+            if x < 0 || y < 0 || x >= i64::from(image.width()) || y >= i64::from(image.height()) {
+                return;
+            }
+            let pixel = image.get_pixel_mut(x as u32, y as u32);
+            let alpha = coverage.clamp(0.0, 1.0);
+            for (channel, ink) in pixel.0.iter_mut().zip(CAPTION_COLOUR) {
+                *channel = (f32::from(*channel) * (1.0 - alpha) + f32::from(ink) * alpha).round() as u8;
+            }
+        });
+    }
 }
 
 pub fn slug(name: &str) -> String {
@@ -970,6 +1072,61 @@ mod tests {
         assert_eq!(shell_word("C:\\renders\\a.png"), "\"C:\\\\renders\\\\a.png\"");
         assert_eq!(shell_word(""), "\"\"");
         assert_eq!(shell_word("--center=-0.5,1"), "--center=-0.5,1");
+    }
+
+    #[test]
+    fn contact_sheets_caption_every_tile_within_its_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let tile = |name: &str, rgb: [u8; 3]| {
+            let path = dir.path().join(name);
+            let pixels: Vec<u8> = (0..120 * 90).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect();
+            capture::save_png(&path, [120, 90], pixels).unwrap();
+            path
+        };
+        let (red, green, blue) = (tile("r.png", [200, 0, 0]), tile("g.png", [0, 200, 0]), tile("b.png", [0, 0, 200]));
+        let long = "#02 · seed 9007199254740991 and a caption far too long for its tile".to_string();
+        let tiles = [
+            Tile { group: "a", path: &red, caption: "1 · Mitosis".into() },
+            Tile { group: "a", path: &green, caption: long.clone() },
+            Tile { group: "b", path: &blue, caption: String::new() },
+        ];
+        let out = dir.path().join("sheet.png");
+        contact_sheet(&tiles, &out, 2, 1).unwrap();
+        let sheet = image::open(&out).unwrap().to_rgba8();
+        const GAP: u32 = 8;
+        assert_eq!(sheet.width(), 2 * 120 + 3 * GAP);
+        let band = (sheet.height() - 2 * 90 - 3 * GAP) / 2;
+        assert!((12..=40).contains(&band), "a strip for the captions under each row: {band}");
+
+        // The images are intact, and ink sits only in the strips under captioned tiles.
+        assert_eq!(sheet.get_pixel(GAP + 60, GAP + 45).0, [200, 0, 0, 255]);
+        assert_eq!(sheet.get_pixel(2 * GAP + 120 + 60, GAP + 45).0, [0, 200, 0, 255]);
+        let ink = |x0: u32, x1: u32, y0: u32, y1: u32| {
+            let lit = |x: u32, y: u32| sheet.get_pixel(x, y).0[..3].iter().any(|&c| c > 60);
+            (x0..x1).flat_map(|x| (y0..y1).map(move |y| (x, y))).filter(|&(x, y)| lit(x, y)).count()
+        };
+        let strip = |row: u32| (GAP + row * (90 + band + GAP) + 90, GAP + row * (90 + band + GAP) + 90 + band);
+        let (top, bottom) = strip(0);
+        assert!(ink(GAP, GAP + 120, top, bottom) > 20, "the first caption is drawn");
+        assert!(ink(2 * GAP + 120, 2 * GAP + 240, top, bottom) > 20, "the long caption is drawn");
+        assert_eq!(ink(GAP + 120, 2 * GAP + 120, top, bottom), 0, "nothing spills into the gap");
+        assert_eq!(ink(2 * GAP + 240, sheet.width(), top, bottom), 0, "the long caption is cut to its tile");
+        let (top, bottom) = strip(1);
+        assert_eq!(ink(0, sheet.width(), top, bottom), 0, "an empty caption draws nothing");
+
+        let font = caption_font();
+        let cut = fit_text(&font, 14.0, &long, 120.0);
+        assert!(cut.ends_with('…') && long.starts_with(cut.trim_end_matches('…')), "{cut}");
+        assert!(text_width(&font, 14.0, &cut) <= 120.0);
+        assert_eq!(fit_text(&font, 14.0, "1 · Mitosis", 120.0), "1 · Mitosis");
+
+        // Without captions there is no strip.
+        let plain: Vec<Tile> = tiles.iter().map(|t| Tile { caption: String::new(), ..t.clone() }).collect();
+        contact_sheet(&plain, &out, 2, 1).unwrap();
+        assert_eq!(image::open(&out).unwrap().height(), 2 * 90 + 3 * GAP);
+
+        assert_eq!(gallery_caption(3, 1, false), "2 · Mitosis");
+        assert_eq!(gallery_caption(0, 4, true), "5 · Symbiosis (Physarum)", "the world, where it could be mistaken");
     }
 
     #[test]

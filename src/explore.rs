@@ -25,7 +25,7 @@ use serde_json::Value;
 use crate::capture::{self, Provenance, Readback};
 use crate::failure::Failure;
 use crate::gpu::Gpu;
-use crate::headless::{self, contact_sheet, frame_deadline, OUTPUT_FORMAT};
+use crate::headless::{self, contact_sheet, frame_deadline, Tile, OUTPUT_FORMAT};
 use crate::library::{Library, SavedWorld, WorldSettings};
 use crate::metrics::{MetricDesc, Sample, Sampler, MAX_METRICS};
 use crate::post::{Post, PostSettings};
@@ -639,6 +639,11 @@ fn file_stem(rank: usize, seed: u64) -> String {
     format!("{rank:02}-seed{seed}")
 }
 
+/// The contact sheet's caption of a kept candidate: "#01 · seed 1".
+fn sheet_caption(rank: usize, candidate: &Candidate) -> String {
+    format!("#{rank:02} · seed {}", candidate.seed)
+}
+
 fn recipe(world_name: &str, candidate: &Candidate, rank: usize, size: [u32; 2]) -> SavedWorld {
     SavedWorld {
         version: crate::library::RECIPE_VERSION,
@@ -970,7 +975,12 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     let csv = job.out_dir.join("candidates.csv");
     write_csv(&csv, &dims, &candidates, presets)?;
     let sheet = if job.sheet {
-        let tiles: Vec<(&str, PathBuf)> = images.iter().map(|p| ("kept", p.clone())).collect();
+        let tiles: Vec<Tile> = kept
+            .iter()
+            .zip(&images)
+            .enumerate()
+            .map(|(rank, (&i, path))| Tile { group: "kept", path, caption: sheet_caption(rank + 1, &candidates[i]) })
+            .collect();
         let path = job.out_dir.join("contact-sheet.png");
         contact_sheet(&tiles, &path, kept.len().clamp(1, 4), 2)?;
         Some(path)

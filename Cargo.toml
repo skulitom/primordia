@@ -25,6 +25,9 @@ bytemuck = { version = "1.23", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # PNG text chunks: provenance and the embedded recipe (the version the image crate already uses).
 png = "0.18"
+# Captions on contact sheets: egui's glyph rasteriser and its bundled fonts (both already in the lock).
+ab_glyph = "0.2.32"
+epaint_default_fonts = "0.32.3"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 log = "0.4"

@@ -284,12 +284,19 @@ fn render_symbiosis_previews() {
         images.push((if seed == 42 { "42" } else { "314159" }, job.out.unwrap()));
     }
     // Keep each seed in a row, with presets in their menu order.
-    images.sort_by_key(|(seed, path)| {
-        let index =
-            PRESETS.iter().position(|name| path.file_stem().unwrap() == crate::headless::slug(name).as_str()).unwrap();
-        (*seed != "42", index)
-    });
-    crate::headless::contact_sheet(&images, std::path::Path::new("target/symbiosis-preview/presets.png"), 5, 4).unwrap();
+    let preset = |path: &std::path::Path| {
+        PRESETS.iter().position(|name| path.file_stem().unwrap() == crate::headless::slug(name).as_str()).unwrap()
+    };
+    images.sort_by_key(|(seed, path)| (*seed != "42", preset(path)));
+    let tiles: Vec<crate::headless::Tile> = images
+        .iter()
+        .map(|(seed, path)| crate::headless::Tile {
+            group: seed,
+            path,
+            caption: format!("{} · seed {seed}", PRESETS[preset(path)]),
+        })
+        .collect();
+    crate::headless::contact_sheet(&tiles, std::path::Path::new("target/symbiosis-preview/presets.png"), 5, 4).unwrap();
 }
 
 #[test]

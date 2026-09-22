@@ -1976,6 +1976,7 @@ checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 name = "primordia"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "bytemuck",
  "clap",
@@ -1983,6 +1984,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "env_logger",
+ "epaint_default_fonts",
  "image",
  "log",
  "png",
