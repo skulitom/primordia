@@ -1,0 +1,165 @@
+# Builds Primordia for Windows, Linux and macOS and attaches the archives, with SHA256SUMS.txt, to a DRAFT GitHub
+# release. It never publishes anything: read the generated notes, then publish the draft by hand.
+#
+# Push a tag such as v0.2.0 to run it; the tag must match `version` in Cargo.toml. To build an existing tag again,
+# or to add archives to an older release such as v0.1.0, run it from the Actions tab with that tag. Files with the
+# same names are replaced. A release that is already published is left alone unless attach_to_published is ticked.
+#
+# Each archive holds the binary, README.md and LICENSE in a folder named like the archive:
+#   primordia-vX.Y.Z-x86_64-pc-windows-msvc.zip
+#   primordia-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+#   primordia-vX.Y.Z-universal-apple-darwin.tar.gz
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, e.g. v0.1.0
+        required: true
+        type: string
+      attach_to_published:
+        description: If that tag's release is already published, add the archives to it
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            rust-targets: x86_64-pc-windows-msvc
+            # A static C runtime, so the .exe runs without the Visual C++ redistributable (the hand-built v0.1.0
+            # exe imports VCRUNTIME140.dll).
+            rustflags: -C target-feature=+crt-static
+          - target: x86_64-unknown-linux-gnu
+            # The oldest hosted Ubuntu has the oldest glibc (2.35), so the binary also runs on Ubuntu 22.04+ and
+            # Debian 12+. Move to the next image when GitHub retires this one.
+            os: ubuntu-22.04
+            rust-targets: x86_64-unknown-linux-gnu
+          - target: universal-apple-darwin
+            # Built on Apple silicon with Intel cross-compiled, then merged into one universal binary. rustc's
+            # default deployment targets apply (macOS 11 on arm64, 10.12 on x86_64).
+            os: macos-latest
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - name: Build
+        shell: bash
+        env:
+          TARGETS: ${{ matrix.rust-targets }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra targets <<< "$TARGETS"
+          for t in "${targets[@]}"; do
+            cargo build --release --locked --target "$t"
+          done
+      - name: Package
+        shell: bash
+        env:
+          TARGETS: ${{ matrix.rust-targets }}
+          ARCHIVE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra targets <<< "$TARGETS"
+          name="primordia-$TAG-$ARCHIVE_TARGET"
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          mkdir -p "dist/$name"
+          if [ "${#targets[@]}" -gt 1 ]; then
+            slices=()
+            for t in "${targets[@]}"; do slices+=("target/$t/release/primordia"); done
+            lipo -create -output "dist/$name/primordia" "${slices[@]}"
+            lipo -info "dist/$name/primordia"
+            # An ad-hoc signature only, since Apple silicon refuses to run unsigned code. The binary is not
+            # notarised, so Gatekeeper asks before its first launch.
+            codesign --force --sign - "dist/$name/primordia"
+          else
+            cp "target/${targets[0]}/release/primordia$exe" "dist/$name/"
+          fi
+          cp README.md LICENSE "dist/$name/"
+
+          # A smoke test that needs no GPU, and a guard against tagging without bumping Cargo.toml.
+          version="$("dist/$name/primordia$exe" --version)"
+          echo "$version"
+          if [ "$version" != "primordia ${TAG#v}" ]; then
+            echo "::error::'$version' does not match the tag $TAG: set version in Cargo.toml to ${TAG#v} and tag again"
+            exit 1
+          fi
+
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            # Keeps macOS's tar from adding ._ metadata files.
+            COPYFILE_DISABLE=1 tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+          ls -l
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: draft release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create a draft release, or update one
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ATTACH_TO_PUBLISHED: ${{ inputs.attach_to_published }}
+        run: |
+          set -euo pipefail
+          if ! draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null)"; then
+            case "$TAG" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+            gh release create "$TAG" dist/* --draft --verify-tag --prerelease="$prerelease" \
+              --title "Primordia $TAG" --generate-notes
+          elif [ "$draft" = "true" ] || [ "$ATTACH_TO_PUBLISHED" = "true" ]; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "::error::The $TAG release is already published. To add these archives to it, run this workflow" \
+              "from the Actions tab with attach_to_published ticked."
+            exit 1
+          fi
