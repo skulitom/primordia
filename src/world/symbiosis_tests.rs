@@ -77,8 +77,7 @@ fn chemicals(field: &[[f32; 4]]) -> Vec<[f32; 2]> {
 
 #[test]
 fn gpu_feedback_works_in_both_directions_and_zero_decouples() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     // Odd sub-step counts also exercise alternating frame-start bind groups.
     world.params.steps = 7;
@@ -129,8 +128,7 @@ fn gpu_feedback_works_in_both_directions_and_zero_decouples() {
 
 #[test]
 fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [160, 120], 42);
     let mut coverage = Vec::new();
     for (index, name, seed) in PRESETS.iter().enumerate().flat_map(|(i, name)| [42, 314159].map(|seed| (i, name, seed)))
@@ -164,8 +162,7 @@ fn gpu_presets_keep_a_finite_living_habitat_at_full_coupling() {
 
 #[test]
 fn relationships_change_growth_in_opposite_directions_and_weave_germinates_bare_routes() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     world.params.steps = 1;
     world.params.scale = 1.0;
@@ -198,12 +195,11 @@ fn relationships_change_growth_in_opposite_directions_and_weave_germinates_bare_
 
 #[test]
 fn gpu_brush_wraps_at_the_edges_and_display_layers_leave_simulation_unchanged() {
-    let _guard = crate::gpu::test_lock();
     use crate::capture::{self, Readback};
     use crate::post::Post;
     use crate::world::Pointer;
 
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     let blank = vec![[1.0_f32, 0.0, 0.0, 0.0]; 96 * 80];
     for buffer in &world.fields {
@@ -274,8 +270,7 @@ fn gpu_brush_wraps_at_the_edges_and_display_layers_leave_simulation_unchanged() 
 #[test]
 #[ignore = "renders the Symbiosis presets to target/symbiosis-preview"]
 fn render_symbiosis_previews() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut images = Vec::new();
     for (name, seed) in PRESETS.iter().flat_map(|name| [42, 314159].map(|seed| (name, seed))) {
         let mut job = crate::headless::RenderJob::new("symbiosis");
@@ -299,8 +294,7 @@ fn render_symbiosis_previews() {
 
 #[test]
 fn mutations_explore_relationships_geography_and_seeding_with_valid_recipes() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     let mut relationships = std::collections::BTreeSet::new();
     let mut seedings = std::collections::BTreeSet::new();
@@ -325,8 +319,7 @@ fn mutations_explore_relationships_geography_and_seeding_with_valid_recipes() {
 
 #[test]
 fn comparison_replays_the_seed_stays_independent_and_restores_saved_settings() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     let initial = read::<[f32; 4]>(&gpu, &world.fields[world.current]);
     advance(&gpu, &mut world, 25);
@@ -403,8 +396,7 @@ fn comparison_replays_the_seed_stays_independent_and_restores_saved_settings() {
 
 #[test]
 fn fertility_remembers_local_traffic_and_recovers_after_it_leaves() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     world.count = 0;
     world.params.depletion = 1.0;
@@ -443,8 +435,7 @@ fn fertility_remembers_local_traffic_and_recovers_after_it_leaves() {
 
 #[test]
 fn fertility_recovery_uses_frames_not_chemical_substeps_and_depletion_inhibits_growth() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [64, 64], 42);
     world.count = 0;
     world.params.depletion = 1.0;
@@ -486,8 +477,7 @@ fn fertility_recovery_uses_frames_not_chemical_substeps_and_depletion_inhibits_g
 
 #[test]
 fn fertility_comparison_isolates_the_cycle_and_replays_saved_recipes() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [128, 96], 42);
     world.load_preset(&gpu, 5, 42);
     world.set_comparison(&gpu, true);
@@ -535,8 +525,7 @@ fn fertility_settings_reject_unsafe_values() {
 
 #[test]
 fn comparison_maps_brushes_and_zoom_to_the_same_place_in_both_panes() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     world.set_comparison(&gpu, true);
     for target in [[1280, 800], [801, 600], [320, 900]] {
@@ -596,10 +585,9 @@ fn comparison_maps_brushes_and_zoom_to_the_same_place_in_both_panes() {
 #[test]
 #[ignore = "renders paired habitats to target/symbiosis-preview/comparison.png"]
 fn render_comparison_preview() {
-    let _guard = crate::gpu::test_lock();
     use crate::capture::{self, Readback};
     use crate::post::Post;
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [640, 400], 42);
     world.set_comparison(&gpu, true);
     advance(&gpu, &mut world, 720);
@@ -639,10 +627,9 @@ fn render_comparison_preview() {
 #[test]
 #[ignore = "renders a two-minute fertility experiment and timelapse frames to target/fertility-preview"]
 fn render_fertility_cycle_preview() {
-    let _guard = crate::gpu::test_lock();
     use crate::capture::{self, Readback};
     use crate::post::Post;
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [640, 360], 42);
     world.load_preset(&gpu, 5, 42);
     world.set_comparison(&gpu, true);
@@ -692,8 +679,7 @@ fn render_fertility_cycle_preview() {
 
 #[test]
 fn gpu_measurements_match_a_cpu_reduction_of_the_habitat() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [160, 120], 42);
     world.params.steps = 7;
     world.params.depletion = 0.8;
@@ -728,8 +714,7 @@ fn gpu_measurements_match_a_cpu_reduction_of_the_habitat() {
 #[test]
 fn gpu_comparison_measures_both_panes_in_label_order() {
     use crate::metrics::Sampler;
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [96, 80], 42);
     world.params.coupling = 0.0;
     world.params.reference = Reference::CouplingOff;
@@ -783,8 +768,7 @@ fn gpu_comparison_measures_both_panes_in_label_order() {
 
 #[test]
 fn gpu_measurements_are_finite_and_bounded_for_every_preset() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Symbiosis::new(&gpu, [256, 144], 42);
     for (index, name) in PRESETS.iter().enumerate() {
         world.load_preset(&gpu, index, 314159);

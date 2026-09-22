@@ -258,10 +258,8 @@ mod tests {
 
     #[test]
     fn every_world_restores_a_serialized_recipe_on_the_gpu() {
-        use crate::gpu::Gpu;
         use crate::world::{self, WORLDS};
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         for entry in WORLDS {
             let (_, mut original) = world::create(&gpu, entry.id, [320, 240], None, 42).unwrap();
             let settings = original.settings().unwrap();
@@ -311,8 +309,7 @@ mod tests {
 
     #[test]
     fn every_preset_loads_through_the_library_and_disabled_lenia_channels_survive() {
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(crate::gpu::Gpu::new(crate::gpu::Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         for entry in crate::world::WORLDS {
             let mut original = (entry.create)(&gpu, [320, 240], 42);
             for (preset, name) in original.presets().iter().enumerate() {
@@ -362,8 +359,7 @@ mod tests {
 
     #[test]
     fn invalid_recipes_leave_the_gpu_available_for_a_valid_load() {
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(crate::gpu::Gpu::new(crate::gpu::Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         for entry in crate::world::WORLDS {
             let original = (entry.create)(&gpu, [320, 240], 42);
             let saved = recipe(&*original, 42);

@@ -1053,8 +1053,7 @@ mod tests {
 
     #[test]
     fn every_world_names_vital_measurements_that_exist() {
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         for entry in WORLDS {
             let (_, world) = world::create(&gpu, entry.id, [64, 64], None, 1).unwrap();
             let vital = vital_metrics(entry.id);
@@ -1067,8 +1066,7 @@ mod tests {
 
     #[test]
     fn explore_keeps_the_most_novel_symbiosis_candidates_and_writes_loadable_recipes() {
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let dir = tempfile::tempdir().unwrap();
         let job = ExploreJob {
             seed: 42,

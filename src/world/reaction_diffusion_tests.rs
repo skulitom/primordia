@@ -72,8 +72,7 @@ fn cpu_metrics(gpu: &Gpu, world: &ReactionDiffusion) -> Vec<f64> {
 
 #[test]
 fn gpu_measurements_match_a_cpu_reduction_of_the_field() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = ReactionDiffusion::new(&gpu, [256, 144], 42);
     world.params.steps_per_frame = 5;
     world.reset(&gpu, 42);
@@ -106,8 +105,7 @@ fn gpu_measurements_match_a_cpu_reduction_of_the_field() {
 
 #[test]
 fn gpu_measurements_are_finite_and_bounded_for_every_preset() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = ReactionDiffusion::new(&gpu, [256, 144], 42);
     for (index, name) in preset_names().iter().enumerate() {
         world.load_preset(&gpu, index, 314159);

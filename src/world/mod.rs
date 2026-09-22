@@ -297,3 +297,46 @@ pub fn create(
     }
     Ok((index, world))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The template is not registered in `WORLDS`, so nothing else compiles its
+    /// inline WGSL: build it, then step and render one small frame through post.
+    #[test]
+    fn gpu_placeholder_template_renders_a_frame() {
+        use crate::capture::Readback;
+        use crate::post::Post;
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
+        let size = [64, 64];
+        let mut world = placeholder::Placeholder::new(&gpu, "placeholder", "Placeholder", size, 0.3);
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let post = Post::new(&gpu, size, format);
+        let (texture, view) = gpu.texture_2d(
+            "placeholder test",
+            size,
+            format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let frame = Frame {
+            gpu: &gpu,
+            time: 0.5,
+            dt: 1.0 / 60.0,
+            frame: 0,
+            view: ViewXform::fit(world.size(), size, &Camera::default()),
+            target_size: size,
+            pointer: None,
+        };
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        world.step(&frame, &mut encoder);
+        world.render(&frame, &mut encoder, post.scene_view());
+        post.run(&gpu, &mut encoder, &world.post_settings(), frame.time, &view);
+        let readback = Readback::new(&gpu, size, format);
+        readback.copy_from(&mut encoder, &texture);
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = readback.read(&gpu).unwrap();
+        assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+        assert!(pixels.chunks_exact(4).any(|px| px[..3].iter().any(|&c| c > 16)), "the rings should be visible");
+    }
+}

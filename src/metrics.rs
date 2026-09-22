@@ -699,8 +699,7 @@ mod tests {
 
     #[test]
     fn gpu_reduce_sums_partials_exactly_and_the_ring_returns_frames_in_order() {
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let reduction = Reduction::new(&gpu, "test", 1000);
         assert_eq!(reduction.capacity, 1000);
         let partials: Vec<f32> = (0..1000).flat_map(|g| (0..MAX_METRICS).map(move |k| partial(g, k))).collect();
@@ -771,8 +770,7 @@ mod tests {
     #[test]
     fn every_world_publishes_a_valid_metric_table_and_finite_measurements() {
         use crate::world::{Frame, ViewXform, WORLDS};
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let mut sampler = Sampler::new(&gpu, 2);
         for entry in WORLDS {
             let size = [96, 64];

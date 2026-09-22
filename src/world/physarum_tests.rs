@@ -170,8 +170,7 @@ fn check_against_cpu(gpu: &Gpu, world: &Physarum) -> Vec<f32> {
 
 #[test]
 fn gpu_measurements_match_a_cpu_reduction_and_a_cleared_run_reads_empty() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Physarum::new(&gpu, [256, 144], 42);
     let rivals = world.presets().iter().position(|p| *p == "Rival Colonies").unwrap();
     world.load_preset(&gpu, rivals, 42);
@@ -206,8 +205,7 @@ fn gpu_measurements_match_a_cpu_reduction_and_a_cleared_run_reads_empty() {
 
 #[test]
 fn gpu_measurements_are_finite_and_bounded_for_every_preset() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Physarum::new(&gpu, [256, 144], 42);
     for (index, name) in world.presets().iter().copied().enumerate() {
         world.load_preset(&gpu, index, 314159);

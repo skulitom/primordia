@@ -15,10 +15,28 @@ pub const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Hold this before creating an instance and until its GPU is dropped. The
 /// Windows Vulkan loader can crash during concurrent instance creation/drop
 /// across otherwise independent tests. CPU-only tests can still run in parallel.
+/// Tests normally take it through [`test_gpu`].
 #[cfg(test)]
 pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A GPU for a test, with [`test_lock`] held while the guard lives. Bind it as
+/// `let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };` (`_`
+/// would release the lock at once; `_guard` comes first so it outlives the GPU).
+/// With `PRIMORDIA_GPU_TESTS=skip` this prints a note and returns `None`, so the
+/// test passes without running; otherwise a missing adapter fails the test.
+#[cfg(test)]
+pub fn test_gpu() -> Option<(std::sync::MutexGuard<'static, ()>, Gpu)> {
+    if std::env::var("PRIMORDIA_GPU_TESTS").is_ok_and(|v| v == "skip") {
+        eprintln!("skipped: PRIMORDIA_GPU_TESTS=skip");
+        return None;
+    }
+    let guard = test_lock();
+    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))
+        .expect("GPU tests need a GPU adapter (set PRIMORDIA_GPU_TESTS=skip to skip them)");
+    Some((guard, gpu))
 }
 
 /// Shared GPU handles. Cloning is cheap: every wgpu handle is reference counted.

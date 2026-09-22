@@ -80,8 +80,7 @@ fn cpu_metrics(gpu: &Gpu, world: &Lenia) -> Vec<f64> {
 
 #[test]
 fn gpu_measurements_match_a_cpu_reduction_and_the_compose_pass_mass() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Lenia::new(&gpu, [640, 360], 42);
     let scene = scene(&gpu, &world);
     let soup = world.presets().iter().position(|p| *p == "Hydrogeminium").unwrap();
@@ -120,8 +119,7 @@ fn gpu_measurements_match_a_cpu_reduction_and_the_compose_pass_mass() {
 
 #[test]
 fn gpu_measurements_are_finite_and_bounded_for_every_preset() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     let mut world = Lenia::new(&gpu, [640, 360], 42);
     let scene = scene(&gpu, &world);
     for (index, name) in world.presets().iter().copied().enumerate() {

@@ -523,8 +523,7 @@ mod tests {
 
     #[test]
     fn render_logs_one_measurement_row_per_frame_and_series() {
-        let _guard = crate::gpu::test_lock();
-        let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("logs").join("run.csv");
         let job = RenderJob {

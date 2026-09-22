@@ -2,13 +2,12 @@
 //! window is opened or controlled; previews go to target/ui-preview.
 
 use super::*;
-use crate::{capture, gpu::Gpu, palette, post::PostSettings, world};
+use crate::{capture, palette, post::PostSettings, world};
 
 #[test]
 #[ignore = "writes offscreen UI previews to target/ui-preview"]
 fn render_inspector_previews() {
-    let _guard = crate::gpu::test_lock();
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None)).unwrap();
+    let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     for width in [320, 364] {
         for tab in ["world", "appearance", "symbiosis", "comparison", "fertility", "measurements"] {
             let appearance = tab == "appearance";
