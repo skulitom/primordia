@@ -242,6 +242,11 @@ pub struct WorldEntry {
     /// holds one name, Lenia's `palettes` one name per channel, and Particle
     /// Life's `params.colors` a colour scheme by 0-based index.
     pub palette_setting: &'static str,
+    /// Recipe settings that change how the world looks, never what it does:
+    /// the palette, colours, tone and display-only trails, and `post`. They are
+    /// dotted paths as `--set` takes them, with `*` for every item of a list.
+    /// Explore's refinement never perturbs them, so a child keeps its parent's look.
+    pub appearance: &'static [&'static str],
     /// Creates the world sized for an output of `output_size` pixels.
     pub create: fn(&Gpu, [u32; 2], u64) -> Box<dyn World>,
 }
@@ -257,6 +262,13 @@ pub const WORLDS: &[WorldEntry] = &[
         vital: &["ground"],
         palettes: physarum::palette_names,
         palette_setting: "palette",
+        // The traffic long exposure is display-only, even though `travelled` measures it.
+        appearance: &[
+            "palette", "post", "params.species.*.color", "params.color_mode", "params.exposure",
+            "params.trail_weight", "params.traffic_weight", "params.traffic_persistence", "params.traffic_blur",
+            "params.brightness", "params.filigree", "params.glow", "params.palette_span", "params.smoothing",
+            "params.ground",
+        ],
         create: physarum::create,
     },
     WorldEntry {
@@ -269,6 +281,12 @@ pub const WORLDS: &[WorldEntry] = &[
         vital: &["speed"],
         palettes: particle_life::scheme_names,
         palette_setting: "params.colors",
+        // `ground` is the background colour (packed sRGB).
+        appearance: &[
+            "ground", "post", "params.colors", "params.color_shift", "params.sizes", "params.size", "params.glow",
+            "params.speed_glow", "params.trail", "params.trail_gain", "params.trail_scale", "params.knee",
+            "params.relief",
+        ],
         create: particle_life::create,
     },
     WorldEntry {
@@ -281,6 +299,12 @@ pub const WORLDS: &[WorldEntry] = &[
         vital: &["mass", "active"],
         palettes: palette::names,
         palette_setting: "palettes",
+        appearance: &[
+            "palettes", "post", "params.gain", "params.glow", "params.halo", "params.trail", "params.persistence",
+            "params.relief", "params.brightness", "params.tint", "params.level", "params.rim", "params.core",
+            "params.hue", "params.mix_power", "params.ground", "params.medium", "params.ground_channel",
+            "params.sharp",
+        ],
         create: lenia::create,
     },
     WorldEntry {
@@ -293,6 +317,13 @@ pub const WORLDS: &[WorldEntry] = &[
         vital: &["alive", "active"],
         palettes: palette::names,
         palette_setting: "palette",
+        // `params.ground` is chemistry here (kill added in drifting lagoons), so it is perturbed.
+        appearance: &[
+            "palette", "post", "params.material", "params.invert", "params.pal_lo", "params.pal_hi",
+            "params.contrast_lo", "params.contrast_hi", "params.relief", "params.gloss", "params.glow", "params.halo",
+            "params.aura_tint", "params.iridescence", "params.reflect", "params.clarity", "params.activity",
+            "params.shadow", "params.brightness",
+        ],
         create: reaction_diffusion::create,
     },
     WorldEntry {
@@ -305,6 +336,7 @@ pub const WORLDS: &[WorldEntry] = &[
         vital: &["growth_cover", "growth_active"],
         palettes: palette::names,
         palette_setting: "palette",
+        appearance: &["palette", "post", "params.layer", "params.brightness", "params.trail_light"],
         create: symbiosis::create,
     },
 ];
@@ -540,6 +572,14 @@ mod tests {
             assert!(!palettes.is_empty(), "{}: no palettes", entry.id);
             for (i, name) in palettes.iter().enumerate() {
                 assert!(!palettes[..i].contains(name), "{}: palette {name} is listed twice", entry.id);
+            }
+
+            // The look and the palette are appearance; every path is a --set key (list items as `*`).
+            let appearance = entry.appearance;
+            assert!(appearance.contains(&"post") && appearance.contains(&entry.palette_setting), "{}", entry.id);
+            for (i, path) in appearance.iter().enumerate() {
+                assert!(path.split('.').all(|part| !part.is_empty() && part.trim() == part), "{}: '{path}'", entry.id);
+                assert!(!appearance[..i].contains(path), "{}: {path} is listed twice", entry.id);
             }
         }
     }

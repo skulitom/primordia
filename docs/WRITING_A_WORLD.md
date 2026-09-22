@@ -35,7 +35,9 @@ is a complete, full-featured reference that uses every convention below.
    and register it in `WORLDS` in `src/world/mod.rs`: id, name, aliases, tagline, and
    the static tables that `primordia list` and name lookups use without a GPU (the
    preset names, the `METRICS` table, the vital measurement ids explore uses to spot
-   dead candidates, the palette names and the recipe field that picks one).
+   dead candidates, the palette names and the recipe field that picks one, and the
+   `appearance` settings: the recipe paths that only change the look, such as colours,
+   palette positions, display-only trails and `post`, which explore never perturbs).
    `create` chooses the simulation domain size, usually proportional to the output.
 2. **Shaders.** Put WGSL in `src/shaders/my_world.wgsl` and compile it with
    `gpu.shader(label, include_str!(...))`. The prelude (`src/shaders/common.wgsl`) is

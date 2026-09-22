@@ -390,26 +390,47 @@ pub(crate) fn select_extreme(score: &[Option<f32>], dist: &[Vec<f32>], largest: 
 
 // --- recipe perturbation ----------------------------------------------------------
 
-/// Nudges the numbers of a recipe: floats by log-normal noise (each with
-/// probability one half), large integers likewise, small integers by one and
-/// never below zero. Integers inside arrays (colours), booleans, strings, nulls
-/// and the `post` look are left alone.
-pub(crate) fn perturb(value: &mut Value, rng: &mut Rng, strength: f32) {
-    perturb_inner(value, rng, strength, false);
+/// Nudges the numbers of a recipe's settings. Floats are multiplied by
+/// log-normal noise (each with probability one half), so a float at zero stays
+/// at zero; integers above 32 likewise, and smaller ones move by one, never
+/// below zero (so a zero can become one). Integers directly inside lists,
+/// booleans, text (and so named variants), nulls and every setting in `frozen`
+/// (dotted paths, `*` for every item of a list) are left alone.
+pub(crate) fn perturb(value: &mut Value, rng: &mut Rng, strength: f32, frozen: &[&str]) {
+    let frozen: Vec<Vec<&str>> = frozen.iter().map(|path| path.split('.').collect()).collect();
+    perturb_inner(value, rng, strength, &mut Vec::new(), &frozen, false);
 }
 
-fn perturb_inner(value: &mut Value, rng: &mut Rng, strength: f32, in_array: bool) {
+/// Whether the setting at `path` is one of `frozen`.
+fn is_frozen(path: &[String], frozen: &[Vec<&str>]) -> bool {
+    frozen.iter().any(|f| f.len() == path.len() && f.iter().zip(path).all(|(f, p)| *f == "*" || f == p))
+}
+
+fn perturb_inner(
+    value: &mut Value,
+    rng: &mut Rng,
+    strength: f32,
+    path: &mut Vec<String>,
+    frozen: &[Vec<&str>],
+    in_array: bool,
+) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                if key != "post" {
-                    perturb_inner(child, rng, strength, false);
+                path.push(key.clone());
+                if !is_frozen(path, frozen) {
+                    perturb_inner(child, rng, strength, path, frozen, false);
                 }
+                path.pop();
             }
         }
         Value::Array(items) => {
-            for child in items.iter_mut() {
-                perturb_inner(child, rng, strength, true);
+            for (index, child) in items.iter_mut().enumerate() {
+                path.push(index.to_string());
+                if !is_frozen(path, frozen) {
+                    perturb_inner(child, rng, strength, path, frozen, true);
+                }
+                path.pop();
             }
         }
         Value::Number(number) => {
@@ -453,10 +474,12 @@ fn numbers_fit_f32(value: &Value) -> bool {
     }
 }
 
-/// A perturbed copy of `settings`, as a recipe the world can validate.
+/// A perturbed copy of `settings`, as a recipe the world can validate. The
+/// world's appearance settings ([`world::WorldEntry::appearance`]) keep their values.
 pub(crate) fn perturbed(settings: &WorldSettings, rng: &mut Rng, strength: f32) -> Result<WorldSettings> {
     let mut value = serde_json::to_value(settings).context("serialising the recipe")?;
-    perturb(&mut value, rng, strength);
+    let appearance = world::find(settings.world_id()).map_or(&[][..], |w| WORLDS[w].appearance);
+    perturb(&mut value, rng, strength, appearance);
     if !numbers_fit_f32(&value) {
         bail!("a perturbed value left the f32 range");
     }
@@ -595,13 +618,17 @@ fn analyse(candidates: &[Candidate], usable: &[bool]) -> Analysis {
     Analysis { dist, ok, novelty }
 }
 
-/// Indices of the archive for `select`, in rank order.
+/// Indices of the archive for `select`, in rank order. Only the candidates
+/// `analysis` marks usable (measured, and alive unless `--keep-inert`) take part.
 fn choose(candidates: &[Candidate], analysis: &Analysis, select: &Select, lane: Option<usize>, keep: usize) -> Vec<usize> {
     match (select, lane) {
         (Select::Novelty, _) => select_novel(&analysis.dist, &analysis.novelty, &analysis.ok, keep),
         (Select::Max(_), Some(lane)) | (Select::Min(_), Some(lane)) => {
-            let scores: Vec<Option<f32>> =
-                candidates.iter().map(|c| c.descriptor.as_ref().and_then(|d| d.get(lane * 3).copied())).collect();
+            let scores: Vec<Option<f32>> = candidates
+                .iter()
+                .zip(&analysis.ok)
+                .map(|(c, ok)| c.descriptor.as_ref().filter(|_| *ok).and_then(|d| d.get(lane * 3).copied()))
+                .collect();
             select_extreme(&scores, &analysis.dist, matches!(select, Select::Max(_)), keep)
         }
         _ => Vec::new(),
@@ -1092,6 +1119,41 @@ mod tests {
     }
 
     #[test]
+    fn metric_extremes_leave_out_inert_and_failed_candidates() {
+        let text = std::fs::read_to_string("tests/fixtures/reaction-diffusion.json").unwrap();
+        let saved: SavedWorld = serde_json::from_str(&text).unwrap();
+        let candidate = |index: usize, alive: Option<f32>, inert: bool| Candidate {
+            index,
+            round: 0,
+            origin: Origin::Mutation,
+            seed: index as u64,
+            preset: 0,
+            settings: saved.settings.clone(),
+            look: saved.look,
+            descriptor: alive.map(|a| vec![a, 0.0, 0.0, index as f32, 0.0, 0.0]),
+            inert,
+            novelty: 0.0,
+            rank: None,
+            secs: 0.0,
+        };
+        let candidates = vec![
+            candidate(0, Some(0.5), false),
+            candidate(1, Some(0.0), true),
+            candidate(2, Some(0.9), false),
+            candidate(3, None, false),
+        ];
+        for (inert_allowed, smallest) in [(false, vec![0, 2]), (true, vec![1, 0, 2])] {
+            let usable: Vec<bool> = candidates.iter().map(|c| inert_allowed || !c.inert).collect();
+            let analysis = analyse(&candidates, &usable);
+            let min = choose(&candidates, &analysis, &Select::Min("alive".into()), Some(0), 3);
+            assert_eq!(min, smallest, "--keep-inert {inert_allowed}");
+            let max = choose(&candidates, &analysis, &Select::Max("alive".into()), Some(0), 3);
+            assert_eq!(max[0], 2);
+            assert!(!max.contains(&3), "a failed candidate is never kept");
+        }
+    }
+
+    #[test]
     fn perturbation_is_deterministic_and_touches_only_scalar_numbers() {
         let original = json!({
             "color": [255, 0, 10],
@@ -1099,30 +1161,40 @@ mod tests {
             "k": 3,
             "z": 0,
             "f": 0.5,
+            "off": 0.0,
             "negative": -0.25,
             "s": "Orbium",
             "b": true,
             "t": null,
             "post": { "exposure": 1.0, "bloom": 0.6 },
-            "nested": { "list": [0.5, 1.5], "count": 40 }
+            "nested": { "list": [0.5, 1.5], "count": 40, "tint": 0.3 },
+            "species": [{ "speed": 1.0, "tint": 0.5 }, { "speed": 2.0, "tint": 0.25 }]
         });
+        let frozen = ["post", "nested.tint", "species.*.tint"];
         let mut changed_float = false;
         let mut changed_int = false;
+        let mut changed_in_list = false;
         for seed in 0..200u64 {
             let mut a = original.clone();
-            perturb(&mut a, &mut Rng::new(seed), 1.0);
+            perturb(&mut a, &mut Rng::new(seed), 1.0, &frozen);
             let mut b = original.clone();
-            perturb(&mut b, &mut Rng::new(seed), 1.0);
+            perturb(&mut b, &mut Rng::new(seed), 1.0, &frozen);
             assert_eq!(a, b, "the same seed must give the same perturbation");
             assert_eq!(a["color"], original["color"], "integer arrays stay untouched");
             assert_eq!(a["s"], original["s"]);
             assert_eq!(a["b"], original["b"]);
             assert_eq!(a["t"], original["t"]);
             assert_eq!(a["post"], original["post"], "the look is not perturbed");
+            assert_eq!(a["nested"]["tint"], original["nested"]["tint"], "frozen settings keep their value");
+            for (item, before) in a["species"].as_array().unwrap().iter().zip(original["species"].as_array().unwrap()) {
+                assert_eq!(item["tint"], before["tint"], "`*` freezes the setting in every item");
+                changed_in_list |= item["speed"] != before["speed"];
+            }
+            assert_eq!(a["off"], 0.0, "a float at zero stays at zero");
             assert!(a["n"].is_u64() && a["n"].as_u64().unwrap() >= 1);
             assert!(a["nested"]["count"].is_u64() && a["nested"]["count"].as_u64().unwrap() >= 1);
             assert!([2, 3, 4].contains(&a["k"].as_u64().unwrap()));
-            assert!([0, 1].contains(&a["z"].as_u64().unwrap()));
+            assert!([0, 1].contains(&a["z"].as_u64().unwrap()), "a small integer at zero can become one");
             let f = a["f"].as_f64().unwrap();
             assert!(a["f"].is_f64() && f.is_finite() && f > 0.0);
             assert!(a["negative"].as_f64().unwrap() < 0.0, "multiplicative noise keeps the sign");
@@ -1130,7 +1202,105 @@ mod tests {
             changed_float |= f != 0.5;
             changed_int |= a["n"] != original["n"];
         }
-        assert!(changed_float && changed_int);
+        assert!(changed_float && changed_int && changed_in_list);
+    }
+
+    /// The JSON values at a dotted path (`*` = every list item).
+    fn at_path<'a>(value: &'a Value, path: &str) -> Vec<&'a Value> {
+        let mut found = vec![value];
+        for part in path.split('.') {
+            found = found
+                .into_iter()
+                .flat_map(|v| match (v, part) {
+                    (Value::Array(items), "*") => items.iter().collect(),
+                    (Value::Array(items), index) => index.parse().ok().and_then(|i: usize| items.get(i)).into_iter().collect(),
+                    (Value::Object(fields), key) => fields.get(key).into_iter().collect(),
+                    _ => Vec::new(),
+                })
+                .collect();
+        }
+        found
+    }
+
+    /// Asserts that `child` kept every appearance setting of `parent`, and returns whether anything else changed.
+    fn keeps_the_look(parent: &Value, child: &Value, world: usize) -> bool {
+        for path in WORLDS[world].appearance {
+            let before = at_path(parent, path);
+            assert!(!before.is_empty(), "{}: '{path}' is not a setting", WORLDS[world].id);
+            assert_eq!(before, at_path(child, path), "{}: '{path}' was perturbed", WORLDS[world].id);
+        }
+        parent != child
+    }
+
+    #[test]
+    fn perturbation_never_touches_colours_palettes_or_the_look() {
+        // Reaction-Diffusion, through the recipe format: its `params.ground` is chemistry and may move.
+        let text = std::fs::read_to_string("tests/fixtures/reaction-diffusion.json").unwrap();
+        let saved: SavedWorld = serde_json::from_str(&text).unwrap();
+        let rd = world::resolve("reaction-diffusion").unwrap();
+        let mut value = serde_json::to_value(&saved.settings).unwrap();
+        value["params"]["ground"] = json!(0.25);
+        let settings: WorldSettings = serde_json::from_value(value.clone()).unwrap();
+        let mut rng = Rng::new(11);
+        let (mut changed, mut ground_moved) = (false, false);
+        for _ in 0..40 {
+            let child = serde_json::to_value(perturbed(&settings, &mut rng, 1.0).unwrap()).unwrap();
+            changed |= keeps_the_look(&value, &child, rd);
+            ground_moved |= child["params"]["ground"] != value["params"]["ground"];
+        }
+        assert!(changed && ground_moved);
+
+        // Particle Life: `ground` is the background colour, `color_shift` and `colors` pick the species' colours.
+        let pl = world::resolve("particle-life").unwrap();
+        let particles = json!({
+            "world": "particle-life",
+            "ground": 0x02050f,
+            "params": {
+                "kinds": 4, "force": 12.0, "substeps": 4, "count": 60000, "colors": { "Scheme": 3 },
+                "color_shift": 0, "sizes": [1.2, 1.0, 0.8, 1.0], "size": 1.5, "glow": 1.0, "speed_glow": 0.4,
+                "trail": 0.8, "trail_gain": 1.0, "trail_scale": 2.0, "knee": 2.0, "relief": 0.3,
+                "matrix": [[0.5, -0.2], [0.1, 0.3]]
+            },
+            "post": { "exposure": 1.0, "bloom": 0.6 }
+        });
+        let mut changed = false;
+        for seed in 0..40 {
+            let mut child = particles.clone();
+            perturb(&mut child, &mut Rng::new(seed), 1.0, WORLDS[pl].appearance);
+            changed |= keeps_the_look(&particles, &child, pl);
+        }
+        assert!(changed, "the dynamics still move");
+    }
+
+    /// Every world's appearance paths name real settings, in every preset and
+    /// in mutations, and refinement keeps them all.
+    #[test]
+    fn gpu_perturbed_recipes_keep_every_worlds_look() {
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
+        let mut rng = Rng::new(5);
+        for (index, entry) in WORLDS.iter().enumerate() {
+            let (_, mut world) = world::create(&gpu, entry.id, [96, 64], None, 3).unwrap();
+            let mut recipes = Vec::new();
+            for preset in 0..world.presets().len() {
+                world.load_preset(&gpu, preset, 3);
+                recipes.push(world.settings().unwrap());
+            }
+            for seed in [7, 8] {
+                world.mutate(&gpu, seed);
+                recipes.push(world.settings().unwrap());
+            }
+            let mut changed = false;
+            for settings in &recipes {
+                let parent = serde_json::to_value(settings).unwrap();
+                for _ in 0..4 {
+                    let child = serde_json::to_value(perturbed(settings, &mut rng, 0.5).unwrap()).unwrap();
+                    changed |= keeps_the_look(&parent, &child, index);
+                }
+            }
+            assert!(changed, "{}: nothing was perturbed", entry.id);
+            gpu.wait_idle();
+            assert!(gpu.fatal_error().is_none(), "{}: {:?}", entry.id, gpu.fatal_error());
+        }
     }
 
     #[test]
@@ -1243,10 +1413,11 @@ mod tests {
             ..job.clone()
         };
         let summary = explore_with(&gpu, &extreme).unwrap();
-        let mut covers: Vec<(f32, usize)> =
-            summary.candidates.iter().map(|c| (c.descriptor.as_ref().unwrap()[0], c.index)).collect();
+        // Inert candidates are left out of extremes too (a dead world has the smallest growth of all).
+        let alive = summary.candidates.iter().filter(|c| !c.inert);
+        let mut covers: Vec<(f32, usize)> = alive.map(|c| (c.descriptor.as_ref().unwrap()[0], c.index)).collect();
         covers.sort_by(|a, b| b.0.total_cmp(&a.0));
-        assert_eq!(summary.kept, vec![covers[0].1, covers[1].1]);
+        assert_eq!(summary.kept, covers.iter().take(2).map(|c| c.1).collect::<Vec<_>>());
         let bad = ExploreJob { select: Select::Max("nope".into()), ..extreme };
         let error = match explore_with(&gpu, &bad) {
             Ok(_) => panic!("an unknown metric must be rejected"),
