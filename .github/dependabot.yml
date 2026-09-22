@@ -1,0 +1,16 @@
+# Keeps the actions used in .github/workflows current, with at most one grouped pull request a month.
+#
+# Cargo dependencies are left out on purpose: wgpu, winit and egui are pinned to the newest releases that still
+# build on the MSRV (Rust 1.86), so they are upgraded by hand together with an MSRV bump.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # Its refs (1.86, stable, master) name the Rust toolchain to install, not versions of the action.
+      - dependency-name: dtolnay/rust-toolchain
