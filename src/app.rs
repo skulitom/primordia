@@ -16,6 +16,7 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Icon, Window, WindowAttributes, WindowId};
 
 use crate::capture::{self, Readback};
+use crate::failure::Failure;
 use crate::gpu::Gpu;
 use crate::headless::{self, Encode};
 use crate::library::{Library, SavedWorld};
@@ -414,7 +415,7 @@ impl State {
 
         let instance = Gpu::create_instance();
         let surface = instance.create_surface(window.clone()).context("creating surface")?;
-        let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))?;
+        let gpu = pollster::block_on(Gpu::new(instance, Some(&surface))).map_err(|e| Failure::Gpu.tag(e))?;
         let gpu_name = gpu.adapter_name();
         let adapter = gpu.adapter.get_info();
         // Unless told otherwise, a GPU that shares the CPU's memory starts smaller.

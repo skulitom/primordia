@@ -608,6 +608,7 @@ where
 }
 
 fn main() {
+    gpu::install_panic_hook();
     let args: Vec<OsString> = std::env::args_os().collect();
     let cli = match parse(&args) {
         Ok(cli) => cli,
@@ -616,6 +617,15 @@ fn main() {
     init_logging(cli.global.quiet, cli.global.verbose);
     let json = cli.global.json;
     let command = command_name(cli.command.as_ref());
+    if json {
+        // The panic hook ends the process, so a script would get no result object.
+        let earlier_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let error = Failure::Gpu.error(format!("internal failure: {}", gpu::panic_message(info)));
+            print_stdout(&failure::json(command, &error).to_string());
+            earlier_hook(info);
+        }));
+    }
     if let Err(e) = run(cli) {
         eprintln!("error: {e:#}");
         console::show_error(&format!("{e:#}"));

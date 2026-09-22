@@ -441,15 +441,9 @@ fn backend_env_warning(value: &str) -> Option<String> {
 /// happened, a hint to try another graphics backend and where to report it,
 /// then exits with status 3. `RUST_BACKTRACE=1` adds a backtrace. Call it
 /// first thing in `main`.
-#[allow(dead_code)] // until `main` calls it
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("unknown panic");
+        let message = panic_message(info);
         let in_use = ADAPTER_IN_USE.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let adapter = in_use.as_ref().map(|(backend, name)| (*backend, name.as_str()));
         let location = info.location().map(ToString::to_string);
@@ -460,6 +454,16 @@ pub fn install_panic_hook() {
         }
         std::process::exit(3);
     }));
+}
+
+/// The text a panic was raised with.
+pub fn panic_message<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
+    let payload = info.payload();
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
 }
 
 /// The panic hook's report for a panic with `message` at `location`, while
