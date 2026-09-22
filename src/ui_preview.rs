@@ -51,7 +51,7 @@ fn render_inspector_previews() {
             }
             let mut post = PostSettings::default();
             let mut selected_palette = 2;
-            let output = ctx.run(
+            let mut output = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, 900.0))),
                     ..Default::default()
@@ -106,6 +106,7 @@ fn render_inspector_previews() {
                     });
                 },
             );
+            highlight_checked_boxes(&ctx, &mut output.shapes);
             let format = wgpu::TextureFormat::Rgba8Unorm;
             let (texture, view) = gpu.texture_2d(
                 "UI preview",

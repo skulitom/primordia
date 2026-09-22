@@ -1048,7 +1048,8 @@ impl State {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
         let mut actions = Vec::new();
-        let full_output = ctx.run(raw_input, |ctx| self.draw_ui(ctx, &mut actions));
+        let mut full_output = ctx.run(raw_input, |ctx| self.draw_ui(ctx, &mut actions));
+        theme::highlight_checked_boxes(&ctx, &mut full_output.shapes);
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
         // egui expects every texture delta to be applied, even if this frame is
         // never presented, so upload them before anything can bail out.

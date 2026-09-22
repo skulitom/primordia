@@ -15,6 +15,10 @@ pub const BORDER: Color32 = Color32::from_rgb(43, 58, 63);
 pub const SELECTED: Color32 = Color32::from_rgb(30, 65, 59);
 pub const WARN: Color32 = Color32::from_rgb(255, 128, 130);
 pub const PANEL_WIDTH: f32 = 364.0;
+/// Corner radius of buttons, pickers, text fields and checkboxes. egui draws a
+/// checkbox's 14 px box with it too: much above 3 turns the box into a disc
+/// that reads as a radio button or a status dot.
+const WIDGET_RADIUS: u8 = 3;
 
 /// The app icon: a disc cut from a Physarum "Galaxy" render, as PNG images
 /// from 16 to 256 pixels. build.rs embeds the same file in the Windows exe.
@@ -91,7 +95,7 @@ pub fn configure(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        widget.corner_radius = 6.into();
+        widget.corner_radius = WIDGET_RADIUS.into();
         widget.bg_stroke = Stroke::new(1.0f32, BORDER);
         widget.fg_stroke = Stroke::new(1.0f32, TEXT);
         widget.expansion = 0.0;
@@ -465,6 +469,41 @@ pub fn measurements(
     toggle_log
 }
 
+/// Repaints the checked checkboxes of a finished frame as accent-filled boxes
+/// with a bold dark tick. egui paints every checkbox, the worlds' ones included,
+/// as a box in the colours of the widget's state followed, when checked, by a
+/// thin tick in the text colour, so on its own "on" differs from "off" only by
+/// that line. Call it on each frame's shapes before tessellating them.
+pub fn highlight_checked_boxes(ctx: &egui::Context, shapes: &mut [egui::epaint::ClippedShape]) {
+    use egui::epaint::{PathStroke, Shape};
+    let style = ctx.style();
+    let side = style.spacing.icon_width;
+    let widgets = &style.visuals.widgets;
+    for i in 1..shapes.len() {
+        let (before, after) = shapes.split_at_mut(i);
+        let (Shape::Rect(frame), Shape::Path(tick)) = (&mut before[i - 1].shape, &mut after[0].shape) else {
+            continue;
+        };
+        // The box is an icon-sized square and the tick an open three-point line inside it.
+        let square = (frame.rect.width() - side).abs() < 0.5 && (frame.rect.height() - side).abs() < 0.5;
+        if !square || tick.closed || tick.points.len() != 3 || !tick.points.iter().all(|p| frame.rect.contains(*p)) {
+            continue;
+        }
+        // Hovered and pressed boxes keep a hint of their state, a disabled one its fade.
+        let fill = if frame.fill == widgets.hovered.bg_fill {
+            ACCENT.lerp_to_gamma(Color32::WHITE, 0.3)
+        } else if frame.fill == widgets.active.bg_fill {
+            ACCENT.lerp_to_gamma(PANEL, 0.25)
+        } else {
+            ACCENT
+        };
+        let opacity = f32::from(frame.fill.a()) / 255.0;
+        frame.fill = fill.gamma_multiply(opacity);
+        frame.stroke = Stroke::new(1.0f32, frame.fill);
+        tick.stroke = PathStroke::new(2.0f32, PANEL.gamma_multiply(opacity));
+    }
+}
+
 /// RGBA pixels of a `size` x `size` icon taken from an `.ico` file whose images
 /// are PNG-compressed, as all of [`ICON`]'s are: the smallest image at least
 /// that large (else the largest), resized if it does not match exactly.
@@ -712,6 +751,60 @@ mod tests {
         assert!(ys.iter().all(|y| (y - ys[0]).abs() < 1e-3), "a flat trace stays level");
         assert_eq!(lines[1].points.len(), 3, "non-finite points are skipped");
         assert!(lines[1].points.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+    }
+
+    #[test]
+    fn checked_boxes_are_accent_squares_with_a_bold_tick() {
+        use egui::epaint::{ColorMode, Shape};
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.checkbox(&mut true, "Compare habitats");
+                    ui.checkbox(&mut false, "Revive / respawn life");
+                    ui.add_enabled(false, egui::Checkbox::new(&mut true, "Disabled"));
+                    // Not a checkbox: a collapsing header's arrow is a filled triangle.
+                    egui::CollapsingHeader::new("Fertility cycle").default_open(true).show(ui, |ui| ui.label("inside"));
+                });
+            },
+        );
+        highlight_checked_boxes(&ctx, &mut output.shapes);
+        let side = ctx.style().spacing.icon_width;
+        let boxes: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                Shape::Rect(rect) if rect.rect.width() == side && rect.rect.height() == side => Some(rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes.len(), 3, "one box per checkbox");
+        for b in &boxes {
+            // At the box's 14 px a radius near 7 would make it a disc.
+            assert!(b.corner_radius.nw <= 3 && b.corner_radius.se <= 3, "{:?}", b.corner_radius);
+        }
+        assert_eq!(boxes[0].fill, ACCENT, "checked");
+        assert_ne!(boxes[1].fill, ACCENT, "unchecked");
+        let faded = boxes[2].fill;
+        assert!(faded.a() < 255 && faded.g() > faded.r(), "disabled and checked: a faded accent, not {faded:?}");
+        let paths: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|c| if let Shape::Path(path) = &c.shape { Some(path) } else { None })
+            .collect();
+        let ticks: Vec<_> = paths.iter().filter(|p| p.points.len() == 3 && !p.closed).collect();
+        assert_eq!(ticks.len(), 2, "only checked boxes have a tick");
+        assert!(ticks.iter().all(|t| t.stroke.width >= 2.0));
+        assert_eq!(ticks[0].stroke.color, ColorMode::Solid(PANEL));
+        // The collapsing header's arrow keeps its colour.
+        let arrow = paths.iter().find(|p| p.closed).expect("the header's arrow");
+        assert_ne!(arrow.fill, PANEL);
+        assert_ne!(arrow.fill, ACCENT);
     }
 
     #[test]
