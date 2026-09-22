@@ -1,0 +1,66 @@
+cff-version: 1.2.0
+message: "If you use Primordia in research or teaching, please cite it as below."
+title: "Primordia: a GPU artificial-life laboratory"
+type: software
+authors:
+  - name: "The Primordia contributors"
+    alias: skulitom
+abstract: >-
+  Primordia is a GPU artificial-life laboratory written in Rust with wgpu. It runs five real-time simulations on
+  compute shaders: Physarum slime mould, Particle Life, Lenia, Gray-Scott reaction-diffusion and Symbiosis, which
+  couples agents with chemistry. It measures every world live on the GPU, renders stills, videos and galleries
+  headlessly, and searches each world's parameters for novel behaviour.
+version: "0.1.0"
+date-released: "2026-09-20"
+license: MIT
+repository-code: "https://github.com/skulitom/primordia"
+keywords:
+  - artificial life
+  - emergence
+  - physarum
+  - particle life
+  - lenia
+  - reaction-diffusion
+  - cellular automata
+  - agent-based model
+  - novelty search
+  - gpu
+  - wgpu
+references:
+  - type: article
+    title: "Characteristics of Pattern Formation and Evolution in Approximations of Physarum Transport Networks"
+    authors:
+      - family-names: Jones
+        given-names: Jeff
+    journal: "Artificial Life"
+    volume: 16
+    issue: "2"
+    start: 127
+    end: 153
+    year: 2010
+    doi: "10.1162/artl.2010.16.2.16202"
+  - type: article
+    title: "Lenia: Biology of Artificial Life"
+    authors:
+      - family-names: Chan
+        given-names: "Bert Wang-Chak"
+    journal: "Complex Systems"
+    volume: 28
+    issue: "3"
+    start: 251
+    end: 286
+    year: 2019
+    doi: "10.25088/ComplexSystems.28.3.251"
+    url: "https://arxiv.org/abs/1812.05433"
+  - type: article
+    title: "Complex Patterns in a Simple System"
+    authors:
+      - family-names: Pearson
+        given-names: "John E."
+    journal: Science
+    volume: 261
+    issue: "5118"
+    start: 189
+    end: 192
+    year: 1993
+    doi: "10.1126/science.261.5118.189"
