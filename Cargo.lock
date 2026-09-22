@@ -1985,6 +1985,7 @@ dependencies = [
  "env_logger",
  "image",
  "log",
+ "png",
  "pollster",
  "serde",
  "serde_json",

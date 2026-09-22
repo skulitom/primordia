@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::failure::Failure;
 use crate::post::PostSettings;
 use crate::world::{Camera, lenia, particle_life, physarum, reaction_diffusion, symbiosis};
 
 /// Recipes contain parameters, not snapshots or embedded images.
-const MAX_SAVE_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_SAVE_BYTES: u64 = 4 * 1024 * 1024;
 /// `SavedWorld::version` of the recipes this build reads and writes.
 pub const RECIPE_VERSION: u32 = 1;
 
@@ -90,12 +91,23 @@ impl SavedWorld {
     /// Build separately and contain GPU validation/allocation errors so the
     /// caller can retain its running world if a save cannot be restored.
     pub fn instantiate(&self, gpu: &crate::gpu::Gpu) -> Result<(usize, Box<dyn crate::world::World>)> {
-        self.validate()?;
+        self.instantiate_at(gpu, self.output_size)
+    }
+
+    /// [`SavedWorld::instantiate`] for an output of `output_size` pixels: the
+    /// recipe's own size reproduces it exactly, another size runs the same rules
+    /// on a larger or smaller world. A recipe the world rejects is invalid input
+    /// ([`Failure::Usage`]); running out of GPU memory is a [`Failure::Gpu`].
+    pub fn instantiate_at(
+        &self,
+        gpu: &crate::gpu::Gpu,
+        output_size: [u32; 2],
+    ) -> Result<(usize, Box<dyn crate::world::World>)> {
+        self.validate().map_err(|e| Failure::Usage.tag(e))?;
         gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let restored = (|| -> Result<_> {
-            let (index, mut world) =
-                crate::world::create(gpu, self.settings.world_id(), self.output_size, None, self.seed)?;
+            let (index, mut world) = crate::world::create(gpu, self.settings.world_id(), output_size, None, self.seed)?;
             ensure!(self.preset < world.presets().len(), "Unknown saved preset");
             world.load_preset(gpu, self.preset, self.seed);
             world.restore_settings(gpu, &self.settings, self.seed)?;
@@ -104,19 +116,20 @@ impl SavedWorld {
         let validation = pollster::block_on(gpu.device.pop_error_scope());
         let oom = pollster::block_on(gpu.device.pop_error_scope());
         if let Some(error) = oom {
-            bail!("Not enough GPU memory to load this world: {error}");
+            return Err(Failure::Gpu.error(format!("Not enough GPU memory to load this world: {error}")));
         }
         if let Some(error) = validation {
-            bail!("This save is incompatible with this GPU: {error}");
+            return Err(Failure::Usage.error(format!("This save is incompatible with this GPU: {error}")));
         }
-        restored
+        restored.map_err(|e| Failure::Usage.tag(e))
     }
 
     fn validate(&self) -> Result<()> {
         ensure!(self.version == RECIPE_VERSION, "This save requires a different version of Primordia");
         validate_name(&self.name)?;
         ensure!(self.output_size.iter().all(|n| (16..=16384).contains(n)), "Invalid saved world dimensions");
-        ensure!(self.camera.zoom.is_finite() && (0.5..=64.0).contains(&self.camera.zoom), "Invalid saved zoom");
+        let zoom = self.camera.zoom;
+        ensure!(zoom.is_finite() && crate::world::ZOOM_RANGE.contains(&zoom), "Invalid saved zoom");
         ensure!(self.camera.center.iter().all(|v| v.is_finite()), "Invalid saved camera position");
         Ok(())
     }
@@ -219,19 +232,44 @@ impl Library {
 fn read_save(path: &Path) -> Result<SavedWorld> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?.take(MAX_SAVE_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= MAX_SAVE_BYTES, "Saved settings file is too large");
-    let header: serde_json::Value = serde_json::from_slice(&bytes)?;
-    // JSON supports larger finite numbers than f32. Reject them before serde
-    // narrows them to infinities in camera, simulation or lighting parameters.
-    fn check_numbers(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Number(n) => n.as_f64().is_some_and(|n| n.abs() <= f64::from(f32::MAX)),
-            serde_json::Value::Array(values) => values.iter().all(check_numbers),
-            serde_json::Value::Object(fields) => fields.values().all(check_numbers),
-            _ => true,
+    parse_save(&bytes)
+}
+
+/// Reads the recipe in `path`: a library or explore `.json` file, or a PNG
+/// written by Primordia, which carries its recipe ([`crate::capture::read_recipe`]).
+/// It gets the same checks as the app's library. Every failure, a missing
+/// file included, is invalid input ([`Failure::Usage`]).
+pub fn load(path: &Path) -> Result<SavedWorld> {
+    let loaded = (|| -> Result<SavedWorld> {
+        let mut signature = [0u8; 8];
+        let png = std::fs::File::open(path)?.read_exact(&mut signature).is_ok()
+            && signature == crate::capture::PNG_SIGNATURE;
+        if !png {
+            return read_save(path);
         }
+        let text = crate::capture::read_recipe(path)?.context(
+            "this PNG carries no recipe (only images written by `primordia render`, `gallery` or `explore` do)",
+        )?;
+        parse_save(text.as_bytes())
+    })();
+    loaded.with_context(|| format!("cannot use the recipe {}", path.display())).map_err(|e| Failure::Usage.tag(e))
+}
+
+/// JSON supports larger finite numbers than f32. Reject them before serde
+/// narrows them to infinities in camera, simulation or lighting parameters.
+pub(crate) fn numbers_fit(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|n| n.abs() <= f64::from(f32::MAX)),
+        serde_json::Value::Array(values) => values.iter().all(numbers_fit),
+        serde_json::Value::Object(fields) => fields.values().all(numbers_fit),
+        _ => true,
     }
-    ensure!(check_numbers(&header), "Saved settings contain a number outside the supported range");
+}
+
+fn parse_save(bytes: &[u8]) -> Result<SavedWorld> {
+    ensure!(bytes.len() as u64 <= MAX_SAVE_BYTES, "Saved settings file is too large");
+    let header: serde_json::Value = serde_json::from_slice(bytes)?;
+    ensure!(numbers_fit(&header), "Saved settings contain a number outside the supported range");
     if header.get("version").and_then(|v| v.as_u64()) != Some(u64::from(RECIPE_VERSION)) {
         bail!("Unsupported save version");
     }
@@ -343,7 +381,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/reaction-diffusion.json")).unwrap();
         // The fixture predates quoted seeds and still loads, through the file loader too.
         let path = std::path::Path::new("tests/fixtures/reaction-diffusion.json");
-        assert_eq!(read_save(path).unwrap().seed, u64::MAX);
+        assert_eq!(load(path).unwrap().seed, u64::MAX);
         let with_seed = |seed: serde_json::Value| {
             let mut value = fixture.clone();
             value["seed"] = seed;

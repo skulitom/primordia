@@ -7,7 +7,11 @@
 //! against each other, and the archive keeps the ones that are most mutually
 //! different (or the extremes of one metric). The kept candidates are
 //! re-simulated from their recipes for their images, which also proves that
-//! the recipes round-trip; the recipes load through the app's Library tab.
+//! the recipes round-trip; the recipes load through the app's Library tab, and
+//! `render --recipe` renders them (or the images, which carry them) again.
+//!
+//! The search starts from a preset, or from a recipe (`--recipe`), and `--set`
+//! edits either before the first candidate is evaluated.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -18,15 +22,16 @@ use std::time::Instant;
 use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
-use crate::capture::{self, Readback};
+use crate::capture::{self, Provenance, Readback};
 use crate::failure::Failure;
 use crate::gpu::Gpu;
 use crate::headless::{self, contact_sheet, frame_deadline, OUTPUT_FORMAT};
 use crate::library::{Library, SavedWorld, WorldSettings};
 use crate::metrics::{MetricDesc, Sample, Sampler, MAX_METRICS};
 use crate::post::{Post, PostSettings};
+use crate::recipe::{self, Recipe, Setting, Source};
 use crate::rng::Rng;
-use crate::world::{self, Camera, Frame, ViewXform, World, WORLDS};
+use crate::world::{self, guarded, Camera, Frame, ViewXform, World, WORLDS};
 
 /// Stream of candidate seeds and perturbations, separate from the app's seeds.
 const SEED_SALT: u64 = 0x4558_504c_4f52_4521;
@@ -86,8 +91,15 @@ impl fmt::Display for Select {
 
 #[derive(Clone, Debug)]
 pub struct ExploreJob {
+    /// World and preset names; ignored when `recipe` is given.
     pub world: String,
     pub preset: Option<String>,
+    /// Start from this recipe (run from its own seed) instead of a preset.
+    pub recipe: Option<Recipe>,
+    /// `--set` edits of the recipe or preset the search starts from.
+    pub sets: Vec<Setting>,
+    /// Master seed: candidate seeds and perturbations follow from it, and the
+    /// base preset runs from it.
     pub seed: u64,
     /// Mutations evaluated in round 0 (the base preset is evaluated as well).
     pub runs: u32,
@@ -119,6 +131,8 @@ impl ExploreJob {
         Self {
             world: world.to_string(),
             preset: None,
+            recipe: None,
+            sets: Vec::new(),
             seed: 1,
             runs: 48,
             refine: 1,
@@ -142,18 +156,31 @@ impl ExploreJob {
 pub enum Origin {
     /// The base preset, unchanged.
     Preset,
+    /// The base recipe (`--recipe`), or the preset edited by `--set`.
+    Recipe,
     /// A `World::mutate` from a fresh seed.
     Mutation,
     /// A perturbed copy of the archive member `parent`'s recipe.
     Child { parent: usize },
 }
 
+impl Origin {
+    /// The `origin` column of candidates.csv and field of `--json`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Preset => "preset",
+            Self::Recipe => "recipe",
+            Self::Mutation => "mutation",
+            Self::Child { .. } => "child",
+        }
+    }
+}
+
 impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Preset => f.write_str("preset"),
-            Self::Mutation => f.write_str("mutation"),
             Self::Child { parent } => write!(f, "child of #{parent}"),
+            other => f.write_str(other.name()),
         }
     }
 }
@@ -457,23 +484,6 @@ struct Bench<'a> {
     max_fps: f32,
 }
 
-/// Runs `f` inside out-of-memory and validation error scopes, so a bad
-/// candidate is reported instead of poisoning the device.
-fn guarded<T>(gpu: &Gpu, f: impl FnOnce() -> T) -> Result<T> {
-    gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let result = f();
-    let validation = pollster::block_on(gpu.device.pop_error_scope());
-    let oom = pollster::block_on(gpu.device.pop_error_scope());
-    if let Some(e) = oom {
-        bail!("out of GPU memory: {e}");
-    }
-    if let Some(e) = validation {
-        bail!("GPU validation failed: {e}");
-    }
-    Ok(result)
-}
-
 impl Bench<'_> {
     fn new(gpu: &Gpu, world: Box<dyn World>, size: [u32; 2], frames: u32, max_fps: f32) -> Bench<'_> {
         let (out_texture, out_view) = gpu.texture_2d(
@@ -616,6 +626,14 @@ fn recipe(world_name: &str, candidate: &Candidate, rank: usize, size: [u32; 2]) 
     }
 }
 
+/// What an explore image says about itself: its recipe, and that `render
+/// --recipe <image> --frames <frames>` renders it again.
+fn image_provenance(saved: &SavedWorld, gpu: &Gpu, image: &Path, frames: u32) -> Provenance {
+    let name = image.file_name().map_or_else(|| image.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let command = format!("primordia render --recipe {} --frames {frames}", headless::shell_word(&name));
+    Provenance::of(saved, gpu).with_command(command)
+}
+
 /// `candidates.csv`: one row per candidate. `preset` is 1-based like `--preset`
 /// (recipes store it 0-based), followed by the preset's name.
 fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[&str]) -> Result<()> {
@@ -626,10 +644,10 @@ fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[
     }
     text.push('\n');
     for c in candidates {
-        let (origin, parent) = match c.origin {
-            Origin::Preset => ("preset", String::new()),
-            Origin::Mutation => ("mutation", String::new()),
-            Origin::Child { parent } => ("child", parent.to_string()),
+        let origin = c.origin.name();
+        let parent = match c.origin {
+            Origin::Child { parent } => parent.to_string(),
+            _ => String::new(),
         };
         let rank = c.rank.map(|r| r.to_string()).unwrap_or_default();
         let status = match (&c.descriptor, c.inert) {
@@ -666,19 +684,23 @@ fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[
 struct Plan {
     /// Index into `WORLDS`.
     world: usize,
-    /// 0-based base preset; `None` keeps the world's first.
-    preset: Option<usize>,
     /// Metric lane of a `max:`/`min:` selection.
     lane: Option<usize>,
+    /// The recipe (edited by `--set`) or the preset the search starts from.
+    source: Source,
+    /// Seed of the base candidate: the recipe's own, or the master seed.
+    base_seed: u64,
 }
 
 /// Resolves and checks `job` without a GPU: world, preset and metric names,
-/// size and pacing, and that the output (and library) folders can be written.
+/// the recipe and its `--set` edits, size and pacing, and that the output (and
+/// library) folders can be written.
 fn plan(job: &ExploreJob) -> Result<Plan> {
     frame_deadline(Instant::now(), job.frames.max(1), job.max_fps).map_err(|e| Failure::Usage.tag(e))?;
     headless::check_size(job.size)?;
-    let world = world::resolve(&job.world)?;
-    let preset = job.preset.as_deref().map(|p| world::resolve_preset(world, p)).transpose()?;
+    let base_seed = job.recipe.as_ref().map_or(job.seed, |r| r.saved.seed);
+    let source = Source::resolve(job.recipe.as_ref(), &job.world, job.preset.as_deref(), base_seed, &job.sets)?;
+    let world = source.world();
     let entry = &WORLDS[world];
     if entry.metrics.is_empty() {
         return Err(Failure::Usage.error(format!("{} does not publish measurements", entry.name)));
@@ -691,7 +713,7 @@ fn plan(job: &ExploreJob) -> Result<Plan> {
     if let Some(library) = &job.library {
         headless::check_writable_dir(library)?;
     }
-    Ok(Plan { world, preset, lane })
+    Ok(Plan { world, lane, source, base_seed })
 }
 
 pub fn explore(job: &ExploreJob) -> Result<Summary> {
@@ -712,7 +734,7 @@ pub fn explore(job: &ExploreJob) -> Result<Summary> {
 }
 
 pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
-    let Plan { world: world_index, preset, lane } = plan(job)?;
+    let Plan { world: world_index, lane, source, base_seed } = plan(job)?;
     let size = job.size;
     let max = gpu.device.limits().max_texture_dimension_2d;
     if size[0] > max || size[1] > max {
@@ -722,7 +744,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         )));
     }
     let keep = job.keep.max(1);
-    let world = world::create_at(gpu, world_index, size, preset, job.seed)?;
+    let world = source.create(gpu, size, base_seed, &job.sets)?;
     let entry = &WORLDS[world_index];
     let world_name = entry.name;
     let presets = world.presets();
@@ -735,19 +757,26 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     std::fs::create_dir_all(&job.out_dir).with_context(|| format!("creating {}", job.out_dir.display()))?;
     let started = Instant::now();
     let total = 1 + job.runs + job.refine * job.children;
-    log::info!(
-        "exploring {world_name} / {} at {}x{}: {} mutations, {} rounds of {} children, {} frames each, keeping {keep} by {}",
+    let frames = job.frames.max(1);
+    let base_origin = if job.recipe.is_some() || !job.sets.is_empty() { Origin::Recipe } else { Origin::Preset };
+    let recipe_path = job.recipe.as_ref().map(|r| format!(" from {}", r.path.display())).unwrap_or_default();
+    let base = format!(
+        "{}{recipe_path}{}",
         presets.get(base_preset).copied().unwrap_or("custom"),
+        recipe::changed(&job.sets)
+    );
+    log::info!(
+        "exploring {world_name} / {base} at {}x{}: {} mutations, {} rounds of {} children, {} frames each, keeping {keep} by {}",
         size[0],
         size[1],
         job.runs,
         job.refine,
         job.children,
-        job.frames.max(1),
+        frames,
         job.select
     );
 
-    let mut bench = Bench::new(gpu, world, size, job.frames.max(1), job.max_fps);
+    let mut bench = Bench::new(gpu, world, size, frames, job.max_fps);
     let mut rng = Rng::new(job.seed ^ SEED_SALT);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut all = Vec::new();
@@ -762,7 +791,18 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         let inert = descriptor.as_ref().is_some_and(|d| vital.iter().any(|&lane| d[lane * 3] < INERT));
         if let Some(pixels) = pixels {
             let path = job.out_dir.join("all").join(format!("{index:03}-r{round}-seed{seed}.png"));
-            capture::save_png(&path, size, pixels)?;
+            let saved = SavedWorld {
+                version: crate::library::RECIPE_VERSION,
+                name: format!("{world_name} explore candidate {index} (seed {seed})"),
+                seed,
+                output_size: size,
+                preset,
+                modified: true,
+                settings: settings.clone(),
+                look,
+                camera: Camera::default(),
+            };
+            capture::write_png(&path, size, &pixels, &image_provenance(&saved, gpu, &path, frames))?;
             all.push(path);
         }
         let secs = clock.elapsed().as_secs_f32();
@@ -791,8 +831,8 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         });
         Ok(())
     };
-    // Round 0: the base preset, then fresh mutations.
-    evaluate(&mut bench, &mut candidates, 0, Origin::Preset, job.seed)?;
+    // Round 0: the base preset (or recipe), then fresh mutations.
+    evaluate(&mut bench, &mut candidates, 0, base_origin, base_seed)?;
     for _ in 0..job.runs {
         let seed = rng.next_seed();
         match bench.mutate(seed) {
@@ -880,13 +920,10 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         bench.restore(&candidate.settings, candidate.seed).with_context(|| format!("restoring the recipe of #{i}"))?;
         let (_, pixels) = bench.run(true)?;
         let image = job.out_dir.join(format!("{stem}.png"));
-        capture::save_png(&image, size, pixels.expect("captured"))?;
         let saved = recipe(world_name, candidate, rank, size);
+        capture::write_png(&image, size, &pixels.expect("captured"), &image_provenance(&saved, gpu, &image, frames))?;
         let path = recipe_dir.join(format!("{stem}.json"));
-        std::fs::create_dir_all(&recipe_dir).with_context(|| format!("creating {}", recipe_dir.display()))?;
-        let mut json = serde_json::to_string_pretty(&saved).context("serialising the recipe")?;
-        json.push('\n');
-        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        recipe::write(&path, &saved)?;
         if let Some(library) = &mut library {
             installed.push(library.save_as_new(saved).with_context(|| format!("installing {}", path.display()))?);
         }
@@ -1216,7 +1253,39 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(error.contains("growth_cover"), "{error}");
+
+        // A search can start from a kept recipe, edited by --set: it is evaluated first, from its own seed.
+        let path = summary_recipe(&job);
+        let from_recipe = ExploreJob {
+            recipe: Some(Recipe::load(&path).unwrap()),
+            sets: vec!["params.steps=3".parse().unwrap()],
+            world: "ignored".into(),
+            runs: 1,
+            refine: 0,
+            keep: 1,
+            out_dir: dir.path().join("from-recipe"),
+            library: None,
+            all: false,
+            inert: true,
+            ..job.clone()
+        };
+        let summary = explore_with(&gpu, &from_recipe).unwrap();
+        let base = &summary.candidates[0];
+        let saved = crate::library::load(&path).unwrap();
+        assert_eq!((base.origin, base.seed, base.preset), (Origin::Recipe, saved.seed, saved.preset));
+        let WorldSettings::Symbiosis { params, .. } = &base.settings else { panic!("world changed") };
+        assert_eq!(params.steps, 3, "--set applies to the base");
+        let csv = std::fs::read_to_string(&summary.csv).unwrap();
+        assert!(csv.lines().nth(1).unwrap().starts_with(&format!("0,0,recipe,,{},", saved.seed)), "{csv}");
         assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+    }
+
+    /// The first recipe `job` kept.
+    fn summary_recipe(job: &ExploreJob) -> PathBuf {
+        let recipes = job.out_dir.join("recipes");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(recipes).unwrap().map(|f| f.unwrap().path()).collect();
+        files.sort();
+        files.remove(0)
     }
 
     #[test]
@@ -1225,7 +1294,7 @@ mod tests {
         let job = ExploreJob { out_dir: dir.path().join("out"), ..ExploreJob::new("symbiosis") };
         let select = Select::Max("growth_cover".into());
         let plan = plan(&ExploreJob { preset: Some("coral".into()), select, ..job.clone() }).unwrap();
-        assert_eq!((WORLDS[plan.world].id, plan.preset, plan.lane), ("symbiosis", Some(2), Some(0)));
+        assert_eq!((WORLDS[plan.world].id, plan.source.preset(), plan.lane), ("symbiosis", Some(2), Some(0)));
         assert!(job.out_dir.is_dir(), "the output folder is created and probed up front");
         let cases = [
             (ExploreJob { world: "symbiosys".into(), ..job.clone() }, "did you mean 'symbiosis'?"),
@@ -1239,5 +1308,16 @@ mod tests {
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert_eq!(crate::failure::exit_code(&error), 2, "{error:#}");
         }
+
+        // A recipe decides the world and the base seed; its --set edits are checked here too.
+        let recipe = Recipe::load(Path::new("tests/fixtures/reaction-diffusion.json")).unwrap();
+        let from_recipe = ExploreJob { recipe: Some(recipe), world: "symbiosis".into(), ..job.clone() };
+        let plan = super::plan(&from_recipe).unwrap();
+        let base = (WORLDS[plan.world].id, plan.base_seed, plan.source.preset());
+        assert_eq!(base, ("reaction-diffusion", u64::MAX, Some(0)));
+        let bad = ExploreJob { sets: vec!["params.fed=0.03".parse().unwrap()], ..from_recipe };
+        let error = super::plan(&bad).err().expect("an unknown setting");
+        assert!(error.to_string().contains("did you mean 'params.feed'?"), "{error}");
+        assert_eq!(crate::failure::exit_code(&error), 2);
     }
 }

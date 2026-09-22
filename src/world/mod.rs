@@ -67,6 +67,29 @@ impl Default for Camera {
     }
 }
 
+/// Zoom factors a camera may have in a render or a recipe (`render --zoom`).
+/// The app's wheel and slider stay within 0.5-64.
+pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.05..=256.0;
+
+/// Runs `f` inside out-of-memory and validation error scopes, so a bad
+/// parameter set is reported instead of poisoning the device. Running out of
+/// memory is a [`Failure::Gpu`], a validation error a [`Failure::Usage`] (the
+/// parameters asked for something this GPU cannot do).
+pub fn guarded<T>(gpu: &Gpu, f: impl FnOnce() -> T) -> Result<T> {
+    gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let result = f();
+    let validation = pollster::block_on(gpu.device.pop_error_scope());
+    let oom = pollster::block_on(gpu.device.pop_error_scope());
+    if let Some(e) = oom {
+        return Err(Failure::Gpu.error(format!("out of GPU memory: {e}")));
+    }
+    if let Some(e) = validation {
+        return Err(Failure::Usage.error(format!("GPU validation failed: {e}")));
+    }
+    Ok(result)
+}
+
 impl ViewXform {
     /// "Cover" fit of a `world`-sized domain onto a `target`-sized screen, then
     /// zoomed/panned by `camera`. Aspect ratio is always preserved.

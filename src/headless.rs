@@ -8,6 +8,10 @@
 //!
 //! Every name and output path is checked before the GPU is opened ([`plan`]),
 //! so a typo or an unwritable folder fails in milliseconds, not after the run.
+//!
+//! A render starts from a preset or a recipe (`--recipe`), edited by `--set`
+//! ([`crate::recipe`]). Every PNG it writes carries the recipe it shows and a
+//! command that renders it again ([`capture::write_png`]).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,11 +20,13 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 
-use crate::capture::{self, Readback};
+use crate::capture::{self, Provenance, Readback};
 use crate::failure::Failure;
 use crate::gpu::Gpu;
+use crate::library::SavedWorld;
 use crate::metrics::{CsvLog, Sample, Sampler};
 use crate::post::{Post, Tonemap};
+use crate::recipe::{self, Recipe, Setting, Source};
 use crate::world::{self, Camera, Frame, Pointer, ViewXform, WORLDS};
 
 /// Headless output format: 8-bit sRGB so readback bytes can be written straight to PNG.
@@ -28,15 +34,23 @@ pub(crate) const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8
 
 #[derive(Clone, Debug)]
 pub struct RenderJob {
+    /// World and preset names; ignored when `recipe` is given.
     pub world: String,
     pub preset: Option<String>,
+    /// Render this recipe (its seed replaced by `seed`) instead of a preset.
+    pub recipe: Option<Recipe>,
+    /// `--set` edits of the recipe or preset, in order.
+    pub sets: Vec<Setting>,
     pub seed: u64,
     pub size: [u32; 2],
     pub frames: u32,
     pub fps: u32,
-    /// PNG of the final frame. `None` means `renders/<world>-<preset>-s<seed>.png`,
-    /// unless a video is requested, in which case no PNG is written.
+    /// PNG of the final frame. `None` means `renders/<world>-<preset>-s<seed>.png`
+    /// (`renders/<recipe file name>.png` for a recipe), unless a video is
+    /// requested, in which case no PNG is written.
     pub out: Option<PathBuf>,
+    /// Also write the recipe that was rendered to this `.json` file.
+    pub save_recipe: Option<PathBuf>,
     /// Video of every frame, one of [`VIDEO_EXTENSIONS`] (.mp4/.mov/.mkv get H.264).
     pub video: Option<PathBuf>,
     /// Save a PNG every `every` frames into `frames_dir` (0 = never).
@@ -88,11 +102,14 @@ impl RenderJob {
         Self {
             world: world.to_string(),
             preset: None,
+            recipe: None,
+            sets: Vec::new(),
             seed: 1,
             size: [1920, 1080],
             frames: 600,
             fps: 60,
             out: None,
+            save_recipe: None,
             video: None,
             every: 0,
             frames_dir: PathBuf::from("frames"),
@@ -170,12 +187,12 @@ pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "gif"];
 pub struct Plan {
     /// Index into `WORLDS`.
     pub world: usize,
-    /// 0-based preset to load; `None` keeps the world's first.
-    pub preset: Option<usize>,
     /// Output size (rounded down to even numbers for a video).
     pub size: [u32; 2],
     /// Final-frame PNG, with the default name filled in.
     pub out: Option<PathBuf>,
+    /// The recipe (edited by `--set`) or the preset to render.
+    pub source: Source,
 }
 
 /// What a finished render wrote.
@@ -187,11 +204,15 @@ pub struct RenderSummary {
     pub preset: usize,
     pub size: [u32; 2],
     pub frames: u32,
+    /// The rendered recipe differs from its preset (a mutation or `--set`).
+    pub modified: bool,
     pub png: Option<PathBuf>,
     pub video: Option<PathBuf>,
     /// The `--every` frame PNGs, in order.
     pub frame_files: Vec<PathBuf>,
     pub metrics: Option<MetricsLog>,
+    /// The recipe written by `--save-recipe`.
+    pub recipe: Option<PathBuf>,
     pub secs: f32,
 }
 
@@ -214,6 +235,7 @@ impl RenderSummary {
         files.extend(self.png.as_deref());
         files.extend(self.video.as_deref());
         files.extend(self.metrics.as_ref().map(|m| m.path.as_path()));
+        files.extend(self.recipe.as_deref());
         files
     }
 }
@@ -287,15 +309,12 @@ pub fn plan(job: &RenderJob) -> Result<Plan> {
             job.size[1]
         );
     }
-    let world = world::resolve(&job.world)?;
-    let preset = job.preset.as_deref().map(|p| world::resolve_preset(world, p)).transpose()?;
+    let source = Source::resolve(job.recipe.as_ref(), &job.world, job.preset.as_deref(), job.seed, &job.sets)?;
+    let (world, preset) = (source.world(), source.preset());
     let entry = &WORLDS[world];
     let out = match (&job.out, &job.video) {
         (Some(path), _) => Some(path.clone()),
-        (None, None) => {
-            let name = (entry.presets)()[preset.unwrap_or(0)];
-            Some(PathBuf::from("renders").join(format!("{}-{}-s{}.png", entry.id, slug(name), job.seed)))
-        }
+        (None, None) => Some(default_png(job, world, preset)?),
         (None, Some(_)) => None,
     };
     if let Some(path) = &out {
@@ -324,7 +343,88 @@ pub fn plan(job: &RenderJob) -> Result<Plan> {
         }
         check_writable_file(path)?;
     }
-    Ok(Plan { world, preset, size, out })
+    if let Some(path) = &job.save_recipe {
+        recipe::check_recipe_path(path, "--save-recipe")?;
+    }
+    Ok(Plan { world, size, out, source })
+}
+
+/// `renders/<world>-<preset>-s<seed>.png`, or `renders/<recipe file name>.png`
+/// for a recipe (`-s<seed>` added when `--seed` replaced its seed).
+fn default_png(job: &RenderJob, world: usize, preset: Option<usize>) -> Result<PathBuf> {
+    let entry = &WORLDS[world];
+    let Some(recipe) = &job.recipe else {
+        let name = (entry.presets)()[preset.unwrap_or(0)];
+        return Ok(PathBuf::from("renders").join(format!("{}-{}-s{}.png", entry.id, slug(name), job.seed)));
+    };
+    let stem = recipe.path.file_stem().map_or_else(|| entry.id.to_string(), |s| s.to_string_lossy().into_owned());
+    let seed = if job.seed == recipe.saved.seed { String::new() } else { format!("-s{}", job.seed) };
+    let path = PathBuf::from("renders").join(format!("{stem}{seed}.png"));
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    if canonical(&path).is_some_and(|out| canonical(&recipe.path) == Some(out)) {
+        return Err(Failure::Usage.error(format!(
+            "the default output {} is the recipe itself: name the image with -o",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+/// Quotes `word` for a shell when it needs it.
+pub(crate) fn shell_word(word: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_.,:=/+@%".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_string()
+    } else {
+        format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// A command that renders `png` again after `frames` frames: the preset form
+/// when the render started from a preset without `--set`, otherwise
+/// `--recipe` with the PNG itself, which carries the recipe with its seed,
+/// size, look and camera.
+fn reproduce_command(job: &RenderJob, rendered: &SavedWorld, frames: u32, png: &Path) -> String {
+    let mut words: Vec<String> = vec!["primordia".into(), "render".into()];
+    if job.recipe.is_none() && job.sets.is_empty() {
+        let world = world::find(rendered.settings.world_id()).unwrap_or(0);
+        let preset = (WORLDS[world].presets)().get(rendered.preset).map_or_else(|| "1".to_string(), |name| slug(name));
+        let [width, height] = rendered.output_size;
+        words.extend(["-w", WORLDS[world].id, "-p", preset.as_str()].map(String::from));
+        words.extend(["--seed".into(), rendered.seed.to_string(), "--width".into(), width.to_string()]);
+        words.extend(["--height".into(), height.to_string()]);
+        let look = [("--exposure", job.exposure), ("--bloom", job.bloom), ("--bloom-threshold", job.bloom_threshold)];
+        for (flag, value) in look {
+            words.extend(value.map(|v| [flag.to_string(), v.to_string()]).into_iter().flatten());
+        }
+        if let Some(tonemap) = job.tonemap {
+            words.extend(["--tonemap".into(), format!("{tonemap:?}").to_lowercase()]);
+        }
+        let camera = rendered.camera;
+        if camera.zoom != 1.0 {
+            words.extend(["--zoom".into(), camera.zoom.to_string()]);
+        }
+        if camera.center != [0.5, 0.5] {
+            words.push(format!("--center={},{}", camera.center[0], camera.center[1]));
+        }
+    } else {
+        let name = png.file_name().map_or_else(|| png.display().to_string(), |n| n.to_string_lossy().into_owned());
+        words.extend(["--recipe".into(), name]);
+    }
+    words.extend(["--frames".into(), frames.to_string()]);
+    if job.fps != 60 {
+        words.extend(["--fps".into(), job.fps.to_string()]);
+    }
+    if let Some(brush) = job.brush {
+        words.extend(["--brush", if brush.secondary { "secondary" } else { "primary" }].map(String::from));
+        if brush.radius != 40.0 {
+            words.extend(["--brush-radius".into(), brush.radius.to_string()]);
+        }
+        if let Some([x, y]) = brush.at {
+            words.push(format!("--brush-at={x},{y}"));
+        }
+    }
+    words.iter().map(|w| shell_word(w)).collect::<Vec<_>>().join(" ")
 }
 
 fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
@@ -337,14 +437,16 @@ fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
         )));
     }
 
-    let mut world = world::create_at(gpu, plan.world, size, plan.preset, job.seed)?;
+    let mut world = plan.source.create(gpu, size, job.seed, &job.sets)?;
     let preset = world.preset();
     let preset_name = world.presets().get(preset).copied().unwrap_or("custom");
     let out = plan.out;
     let progress_level = if job.quiet { log::Level::Debug } else { log::Level::Info };
+    let recipe_path = job.recipe.as_ref().map(|r| format!(" from {}", r.path.display())).unwrap_or_default();
+    let from = format!("{recipe_path}{}", recipe::changed(&job.sets));
     log::log!(
         progress_level,
-        "rendering {} / {} at {}x{} for {} frames (seed {})",
+        "rendering {} / {}{from} at {}x{} for {} frames (seed {})",
         world.name(),
         preset_name,
         size[0],
@@ -364,7 +466,7 @@ fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
     };
     let mut last_sample: Option<Sample> = None;
 
-    let mut look = world.post_settings();
+    let mut look = plan.source.look(&*world);
     if let Some(e) = job.exposure {
         look.exposure = e;
     }
@@ -377,6 +479,19 @@ fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
     if let Some(t) = job.tonemap {
         look.tonemap = t;
     }
+    // What is rendered, as a recipe: every PNG carries it and --save-recipe writes it.
+    let rendered = match plan.source.snapshot(&*world, job.seed, size, look, job.camera, &job.sets) {
+        Ok(saved) => Some(saved),
+        Err(e) if job.save_recipe.is_none() => {
+            log::debug!("the images carry no recipe: {e:#}");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let provenance = |frames: u32, png: &Path| match &rendered {
+        Some(saved) => Provenance::of(saved, gpu).with_command(reproduce_command(job, saved, frames, png)),
+        None => Provenance::default(),
+    };
 
     let post = Post::new(gpu, size, OUTPUT_FORMAT);
     let (out_texture, out_view) = gpu.texture_2d(
@@ -444,12 +559,12 @@ fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
             }
             if save_frame {
                 let path = job.frames_dir.join(format!("{}_{:05}.png", world.id(), f + 1));
-                capture::save_png(&path, size, pixels.clone())?;
+                capture::write_png(&path, size, &pixels, &provenance(f + 1, &path))?;
                 frame_files.push(path);
             }
             if last {
                 if let Some(path) = &out {
-                    capture::save_png(path, size, pixels)?;
+                    capture::write_png(path, size, &pixels, &provenance(frames, path))?;
                     log::log!(progress_level, "wrote {}", path.display());
                 }
             }
@@ -500,9 +615,29 @@ fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
         }
         None => None,
     };
+    let recipe = match (&job.save_recipe, &rendered) {
+        (Some(path), Some(saved)) => {
+            recipe::write(path, saved)?;
+            log::log!(progress_level, "wrote {}", path.display());
+            Some(path.clone())
+        }
+        _ => None,
+    };
     let secs = started.elapsed().as_secs_f32();
     log::log!(progress_level, "done: {frames} frames in {secs:.1}s ({:.1} fps)", frames as f32 / secs.max(1e-3));
-    Ok(RenderSummary { world: plan.world, preset, size, frames, png: out, video: job.video.clone(), frame_files, metrics, secs })
+    Ok(RenderSummary {
+        world: plan.world,
+        preset,
+        size,
+        frames,
+        modified: rendered.as_ref().is_some_and(|saved| saved.modified),
+        png: out,
+        video: job.video.clone(),
+        frame_files,
+        metrics,
+        recipe,
+        secs,
+    })
 }
 
 pub(crate) fn frame_deadline(started: Instant, frames: u32, max_fps: f32) -> Result<Instant> {
@@ -748,7 +883,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let job = RenderJob { out: Some(dir.path().join("a").join("b").join("final.png")), ..RenderJob::new("rd") };
         let plan = plan(&RenderJob { preset: Some("mito".into()), ..job.clone() }).unwrap();
-        assert_eq!((WORLDS[plan.world].id, plan.preset, plan.size), ("reaction-diffusion", Some(1), [1920, 1080]));
+        let resolved = (WORLDS[plan.world].id, plan.source.preset(), plan.size);
+        assert_eq!(resolved, ("reaction-diffusion", Some(1), [1920, 1080]));
         let folder = dir.path().join("a").join("b");
         assert!(folder.is_dir(), "output folders are created up front");
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "the write probe leaves nothing behind");
@@ -783,6 +919,57 @@ mod tests {
         let missing = missing_ffmpeg("no-such-ffmpeg", &std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(crate::failure::exit_code(&missing), 4);
         assert!(missing.to_string().contains("'no-such-ffmpeg'") && missing.to_string().contains("PRIMORDIA_FFMPEG"));
+    }
+
+    #[test]
+    fn recipes_name_their_image_and_their_settings_are_checked_before_the_gpu() {
+        let recipe = Recipe::load(Path::new("tests/fixtures/reaction-diffusion.json")).unwrap();
+        let job = RenderJob { recipe: Some(recipe), seed: u64::MAX, ..RenderJob::new("ignored") };
+        let renders = Path::new("renders");
+        assert_eq!(default_png(&job, 3, Some(0)).unwrap(), renders.join("reaction-diffusion.png"));
+        let reseeded = RenderJob { seed: 5, ..job.clone() };
+        assert_eq!(default_png(&reseeded, 3, Some(0)).unwrap(), renders.join("reaction-diffusion-s5.png"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let sets = vec!["params.kill=0.05".parse().unwrap(), "post.bloom=0.2".parse().unwrap()];
+        let job = RenderJob { out: Some(dir.path().join("r.png")), sets, ..job };
+        let plan = plan(&job).unwrap();
+        let Source::Recipe(saved) = &plan.source else { panic!("expected the recipe") };
+        let crate::library::WorldSettings::ReactionDiffusion { params, .. } = &saved.settings else { panic!() };
+        assert_eq!((params.kill, saved.look.bloom, saved.modified), (0.05, 0.2, true));
+        let resolved = (WORLDS[plan.world].id, plan.source.preset(), saved.seed);
+        assert_eq!(resolved, ("reaction-diffusion", Some(0), u64::MAX));
+        let cases = [
+            (RenderJob { save_recipe: Some(dir.path().join("r.txt")), ..job.clone() }, "--save-recipe must name"),
+            (RenderJob { sets: vec!["params.kil=1".parse().unwrap()], ..job.clone() }, "did you mean 'params.kill'?"),
+            (RenderJob { sets: vec!["palette=Frost".parse().unwrap()], ..job.clone() }, "unknown palette 'Frost'"),
+        ];
+        for (bad, expected) in cases {
+            let error = super::plan(&bad).expect_err("the plan must fail");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(crate::failure::exit_code(&error), 2, "{error:#}");
+        }
+    }
+
+    #[test]
+    fn png_comments_hold_a_command_that_renders_the_image_again() {
+        let saved = Recipe::load(Path::new("tests/fixtures/reaction-diffusion.json")).unwrap().saved;
+        let brush = Brush { secondary: true, at: Some([0.25, -0.5]), radius: 12.0 };
+        let job = RenderJob { fps: 30, exposure: Some(1.5), brush: Some(brush), ..RenderJob::new("rd") };
+        assert_eq!(
+            reproduce_command(&job, &saved, 90, Path::new("out/shot.png")),
+            "primordia render -w reaction-diffusion -p coral-reef --seed 18446744073709551615 --width 1920 \
+             --height 1008 --exposure 1.5 --zoom 0.575 --center=0.4186335,0.944689 --frames 90 --fps 30 --brush secondary \
+             --brush-radius 12 --brush-at=0.25,-0.5"
+        );
+        let edited = RenderJob { sets: vec!["params.feed=0.03".parse().unwrap()], brush: None, ..job };
+        assert_eq!(
+            reproduce_command(&edited, &saved, 90, Path::new("out/my shot.png")),
+            "primordia render --recipe \"my shot.png\" --frames 90 --fps 30"
+        );
+        assert_eq!(shell_word("C:\\renders\\a.png"), "\"C:\\\\renders\\\\a.png\"");
+        assert_eq!(shell_word(""), "\"\"");
+        assert_eq!(shell_word("--center=-0.5,1"), "--center=-0.5,1");
     }
 
     #[test]

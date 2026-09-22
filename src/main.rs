@@ -10,6 +10,7 @@ mod library;
 mod metrics;
 mod palette;
 mod post;
+mod recipe;
 mod report;
 mod rng;
 mod selftest;
@@ -33,8 +34,8 @@ const LONG_ABOUT: &str = "\
 GPU artificial-life laboratory: slime moulds, particle life, Lenia, reaction-diffusion and Symbiosis.
 
 Without a command, primordia opens the interactive window and blocks until it is closed; add --exit-after SECS \
-to quit on its own (smoke tests, scripts). The commands list, render, gallery, explore and selftest run headless \
-and exit when they are done.";
+to quit on its own (smoke tests, scripts). The commands list, render, gallery, explore, recipe and selftest run \
+headless and exit when they are done.";
 
 const EXAMPLES: &str = "\
 Examples:
@@ -43,7 +44,11 @@ Examples:
   primordia render -w rd -p mitosis -o mitosis.png     render a still
   primordia render -w physarum --video network.mp4     render a video (needs ffmpeg)
   primordia gallery -o gallery                         every preset of every world, plus a contact sheet
-  primordia explore -w symbiosis --runs 24 --json      search for novel behaviour and keep recipes";
+  primordia explore -w symbiosis --runs 24 --json      search for novel behaviour and keep recipes
+  primordia render --recipe explore/recipes/01-seed1.json --width 3840 --height 2160
+                                                       render a kept recipe (or a PNG Primordia wrote) again
+  primordia recipe -w rd -p mitosis --set params.feed=0.031 -o mito.json
+                                                       a preset's complete recipe, with one setting changed";
 
 const OUTPUT: &str = "\
 Output:
@@ -56,8 +61,9 @@ const EXIT_STATUS: &str = "\
 Exit status:
   0  success
   1  another failure (for example reading or writing a file)
-  2  invalid input: bad arguments, an unknown or ambiguous world, preset or measurement, a size out of
-     range, an output path that cannot be written or has the wrong extension
+  2  invalid input: bad arguments, an unknown or ambiguous world, preset, measurement or setting, a
+     recipe that cannot be read or that the world rejects, a size out of range, an output path that
+     cannot be written or has the wrong extension
   3  no usable GPU, or the GPU failed during the run
   4  ffmpeg is missing or failed";
 
@@ -75,6 +81,17 @@ with it (\"re\" = reaction-diffusion).
   5  symbiosis           coupled, hybrid, ecosystem";
 
 const PRESET_HELP: &str = "Preset: a name, a unique prefix or a number from 1 (see `primordia list --world W`)";
+
+const RECIPE_HELP: &str = "Start from this recipe instead of a preset: a library or explore .json file, or a PNG \
+    written by Primordia (it carries its recipe)";
+
+const SET_HELP: &str = "Change one setting of the preset or recipe (repeatable), e.g. params.feed=0.031 or \
+    palette=Frost; `primordia recipe` shows every KEY";
+
+const SET_LONG_HELP: &str = "Change one setting of the preset or recipe; repeat it for several, applied in order. \
+KEY is a path into the recipe's settings, with dots between keys and list indices: params.feed, palette, \
+post.exposure, params.kernels.0.mu. VALUE is JSON, or text when it is not JSON (palette=Frost). Keys under post \
+also change the look. `primordia recipe -w W -p P` prints every setting a preset has.";
 
 /// Every subcommand's long help ends with this pointer.
 const MORE_HELP: &str = "Output, environment variables and exit status: see `primordia --help`.";
@@ -149,19 +166,29 @@ enum Command {
         "Examples:\n",
         "  primordia render -w rd -p mitosis -o mitosis.png\n",
         "  primordia render -w lenia -p 5 --frames 1200 --video necklaces.mp4 --metrics necklaces.csv\n",
-        "  primordia render -w physarum --zoom 3 --center 0.25,0.5 --json\n\n",
+        "  primordia render -w physarum --zoom 3 --center 0.25,0.5 --json\n",
+        "  primordia render --recipe explore/recipes/01-seed1.json --width 3840 --height 2160\n",
+        "  primordia render -w rd -p mitosis --set params.feed=0.031 --save-recipe mito.json\n",
+        "  primordia render --recipe mito.png -o mito-again.png\n\n",
+        "--recipe reproduces a recipe exactly at its own size, seed, look and camera; --width and --height run the ",
+        "same rules on a larger or smaller world, and the other options override the recipe's. Every PNG written ",
+        "carries its recipe, the command that renders it again and the GPU that rendered it (runs repeat exactly ",
+        "only on the same GPU, driver and backend).\n\n",
         "Output, environment variables and exit status: see `primordia --help`."
     ))]
     Render(RenderArgs),
     /// Render the final frame of every preset into a folder
     #[command(after_long_help = MORE_HELP)]
     Gallery(GalleryArgs),
+    /// Print the complete recipe of a preset or recipe file, after --set: every setting there is (needs a GPU)
+    #[command(after_long_help = RECIPE_LONG_HELP)]
+    Recipe(RecipeArgs),
     /// Search a world's mutations for the most novel behaviour and keep them as recipes
     #[command(after_long_help = concat!(
-        "candidates.csv has one row per candidate: index, round, origin, parent, seed, preset (from 1, like --preset), ",
-        "preset_name, rank, novelty, status, secs, then three columns per measurement: <id>_mean (mean of the last ",
-        "40% of the frames), <id>_std (its standard deviation) and <id>_drift (that mean minus the mean of the first ",
-        "20%).\n\n",
+        "candidates.csv has one row per candidate: index, round, origin (preset, recipe, mutation or child), parent, ",
+        "seed, preset (from 1, like --preset), preset_name, rank, novelty, status, secs, then three columns per ",
+        "measurement: <id>_mean (mean of the last 40% of the frames), <id>_std (its standard deviation) and ",
+        "<id>_drift (that mean minus the mean of the first 20%).\n\n",
         "Output, environment variables and exit status: see `primordia --help`."
     ))]
     Explore(ExploreArgs),
@@ -173,7 +200,24 @@ enum Command {
 const RENDER_EXAMPLES: &str = "\
 Examples:
   primordia render -w rd -p mitosis -o mitosis.png
-  primordia render -w lenia -p 5 --frames 1200 --video necklaces.mp4 --metrics necklaces.csv";
+  primordia render -w lenia -p 5 --frames 1200 --video necklaces.mp4 --metrics necklaces.csv
+  primordia render --recipe explore/recipes/01-seed1.json --width 3840 --height 2160";
+
+const RECIPE_LONG_HELP: &str = "\
+Examples:
+  primordia recipe -w rd -p mitosis
+  primordia recipe -w rd -p mitosis --set params.feed=0.031 -o mito.json
+  primordia render --recipe mito.json --video mito.mp4
+
+A recipe is the JSON that the app's library and explore write: version (1), name, seed (a number, or a string of \
+digits), output_size, preset (numbered from 0), modified, settings (the world's parameters, which --set \
+changes), look and camera. A PNG written by Primordia carries the recipe of its image in an iTXt chunk named \
+primordia:recipe, and --recipe reads it back.
+
+Without -o the recipe is printed on stdout; with --json it is the \"recipe\" field of the result, with its seed \
+as a string.
+
+Output, environment variables and exit status: see `primordia --help`.";
 
 #[derive(Args)]
 struct RunArgs {
@@ -267,25 +311,34 @@ struct RenderArgs {
     /// Preset: a name, a unique prefix or a number from 1 [default: the world's first preset]
     #[arg(short, long)]
     preset: Option<String>,
-    /// Random seed (the same seed always gives the same image on the same GPU)
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
-    /// Output width in pixels (16-16384; a video rounds it down to an even number)
-    #[arg(long, default_value_t = 1920, value_parser = image_side())]
-    width: u32,
-    /// Output height in pixels (16-16384; a video rounds it down to an even number)
-    #[arg(long, default_value_t = 1080, value_parser = image_side())]
-    height: u32,
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["world", "preset"], help = RECIPE_HELP)]
+    recipe: Option<PathBuf>,
+    #[arg(long = "set", value_name = "KEY=VALUE", help = SET_HELP, long_help = SET_LONG_HELP)]
+    set: Vec<recipe::Setting>,
+    /// Random seed (the same seed always gives the same image on the same GPU) [default: 1, or the recipe's]
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Output width in pixels (16-16384; a video rounds it down to an even number) [default: 1920, or the
+    /// recipe's]
+    #[arg(long, value_parser = image_side())]
+    width: Option<u32>,
+    /// Output height in pixels (16-16384; a video rounds it down to an even number) [default: 1080, or the
+    /// recipe's]
+    #[arg(long, value_parser = image_side())]
+    height: Option<u32>,
     /// Frames to simulate before the final image
     #[arg(short, long, default_value_t = 600, value_parser = at_least_one)]
     frames: u32,
     /// Frames per simulated second: sets the time step (1/fps) and the video frame rate
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=1000))]
     fps: u32,
-    /// Output PNG of the final frame [default: renders/<world>-<preset>-s<seed>.png;
-    /// skipped when only --video is given]
+    /// Output PNG of the final frame [default: renders/<world>-<preset>-s<seed>.png, or
+    /// renders/<recipe file name>.png; skipped when only --video is given]
     #[arg(short, long)]
     out: Option<PathBuf>,
+    /// Also write the recipe that was rendered (after --set and the look and camera options) to this .json file
+    #[arg(long, value_name = "PATH")]
+    save_recipe: Option<PathBuf>,
     /// Encode every frame into a video with ffmpeg: .mp4, .mov, .mkv (H.264), .webm or .gif
     #[arg(long)]
     video: Option<PathBuf>,
@@ -295,23 +348,24 @@ struct RenderArgs {
     /// Folder for the --every frame PNGs
     #[arg(long, default_value = "frames")]
     frames_dir: PathBuf,
-    /// Override the preset's exposure
+    /// Override the preset's (or recipe's) exposure
     #[arg(long, value_parser = finite_float)]
     exposure: Option<f32>,
-    /// Override the preset's bloom strength (0 disables bloom)
+    /// Override the preset's (or recipe's) bloom strength (0 disables bloom)
     #[arg(long, value_parser = finite_float)]
     bloom: Option<f32>,
-    /// Override the preset's bloom threshold
+    /// Override the preset's (or recipe's) bloom threshold
     #[arg(long, value_parser = finite_float)]
     bloom_threshold: Option<f32>,
-    /// Override the preset's tonemapper
+    /// Override the preset's (or recipe's) tonemapper
     #[arg(long, value_enum)]
     tonemap: Option<TonemapArg>,
-    /// Camera zoom, 0.05-256 (1 = whole world, >1 = close-up, <1 = show the torus tiling)
-    #[arg(long, default_value_t = 1.0, value_parser = zoom_factor)]
-    zoom: f32,
-    /// Camera centre in world uv, as X,Y
-    #[arg(long, value_name = "X,Y", value_delimiter = ',', default_value = "0.5,0.5", allow_negative_numbers = true, value_parser = finite_float)]
+    /// Camera zoom, 0.05-256 (1 = whole world, >1 = close-up, <1 = show the torus tiling) [default: 1, or the
+    /// recipe's]
+    #[arg(long, value_parser = zoom_factor)]
+    zoom: Option<f32>,
+    /// Camera centre in world uv, as X,Y [default: 0.5,0.5, or the recipe's]
+    #[arg(long, value_name = "X,Y", value_delimiter = ',', allow_negative_numbers = true, value_parser = finite_float)]
     center: Vec<f32>,
     /// Hold a scripted mouse button for the whole render (tests interaction)
     #[arg(long, value_enum)]
@@ -366,7 +420,13 @@ struct ExploreArgs {
     /// Preset to start from, a name or a number from 1 (mutations of some worlds keep parts of it)
     #[arg(short, long)]
     preset: Option<String>,
-    /// Master seed: every candidate seed and perturbation follows from it
+    /// Start from this recipe instead of a preset (a library or explore .json file, or a PNG written by
+    /// Primordia); it is evaluated first, from its own seed, at --width x --height
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["world", "preset"])]
+    recipe: Option<PathBuf>,
+    #[arg(long = "set", value_name = "KEY=VALUE", help = SET_HELP, long_help = SET_LONG_HELP)]
+    set: Vec<recipe::Setting>,
+    /// Master seed: every candidate seed and perturbation follows from it (and the preset runs from it)
     #[arg(long, default_value_t = 1)]
     seed: u64,
     /// Mutations to evaluate in the first round (the preset itself is evaluated too)
@@ -416,6 +476,31 @@ struct ExploreArgs {
     keep_inert: bool,
 }
 
+#[derive(Args)]
+struct RecipeArgs {
+    #[arg(short, long, default_value = "physarum", help = WORLD_HELP, long_help = WORLD_LONG_HELP)]
+    world: String,
+    /// Preset: a name, a unique prefix or a number from 1 [default: the world's first preset]
+    #[arg(short, long)]
+    preset: Option<String>,
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["world", "preset"], help = RECIPE_HELP)]
+    recipe: Option<PathBuf>,
+    #[arg(long = "set", value_name = "KEY=VALUE", help = SET_HELP, long_help = SET_LONG_HELP)]
+    set: Vec<recipe::Setting>,
+    /// Seed the recipe runs from [default: 1, or the recipe's]
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Output width the recipe is for, in pixels (16-16384) [default: 1920, or the recipe's]
+    #[arg(long, value_parser = image_side())]
+    width: Option<u32>,
+    /// Output height the recipe is for, in pixels (16-16384) [default: 1080, or the recipe's]
+    #[arg(long, value_parser = image_side())]
+    height: Option<u32>,
+    /// Write the recipe to this .json file instead of printing it
+    #[arg(short, long, value_name = "PATH")]
+    out: Option<PathBuf>,
+}
+
 fn finite_float(value: &str) -> std::result::Result<f32, String> {
     let number = value.parse::<f32>().map_err(|e| e.to_string())?;
     if !number.is_finite() {
@@ -434,7 +519,7 @@ fn at_least_one(value: &str) -> std::result::Result<u32, String> {
 
 fn zoom_factor(value: &str) -> std::result::Result<f32, String> {
     let zoom = finite_float(value)?;
-    if !(0.05..=256.0).contains(&zoom) {
+    if !world::ZOOM_RANGE.contains(&zoom) {
         return Err(format!("{zoom} is not in 0.05..=256"));
     }
     Ok(zoom)
@@ -531,6 +616,7 @@ fn command_name(command: Option<&Command>) -> &'static str {
         Some(Command::Render(_)) => "render",
         Some(Command::Gallery(_)) => "gallery",
         Some(Command::Explore(_)) => "explore",
+        Some(Command::Recipe(_)) => "recipe",
         Some(Command::Selftest) => "selftest",
     }
 }
@@ -557,7 +643,7 @@ fn clap_failure(error: clap::Error, args: &[OsString]) -> ! {
             .map(|block| block.trim().trim_start_matches("error: "))
             .collect();
         let command = args.iter().skip(1).filter_map(|a| a.to_str()).find(|a| {
-            ["list", "render", "gallery", "explore", "selftest"].contains(a)
+            ["list", "render", "gallery", "explore", "recipe", "selftest"].contains(a)
         });
         let value = serde_json::json!({
             "ok": false,
@@ -586,13 +672,71 @@ fn emit(json: bool, value: serde_json::Value, files: &[&Path]) {
     }
 }
 
+/// The seed and size a command runs with: the options given, else the
+/// recipe's, else seed 1 at 1920x1080.
+fn recipe_defaults(recipe: Option<&recipe::Recipe>, seed: Option<u64>, size: [Option<u32>; 2]) -> (u64, [u32; 2]) {
+    let saved = recipe.map(|r| &r.saved);
+    let [width, height] = saved.map_or([1920, 1080], |s| s.output_size);
+    (seed.or(saved.map(|s| s.seed)).unwrap_or(1), [size[0].unwrap_or(width), size[1].unwrap_or(height)])
+}
+
+/// The render job for `r`, reading its `--recipe`: the recipe's seed, size and
+/// camera apply unless the options replace them.
+fn render_job(r: RenderArgs) -> Result<headless::RenderJob> {
+    if !r.center.is_empty() && r.center.len() != 2 {
+        return Err(Failure::Usage.error("--center expects two comma-separated numbers, e.g. --center 0.25,0.5"));
+    }
+    if !r.brush_at.is_empty() && r.brush_at.len() != 2 {
+        return Err(Failure::Usage.error("--brush-at expects two comma-separated numbers, e.g. --brush-at 0.3,0.6"));
+    }
+    let brush = r.brush.map(|b| headless::Brush {
+        secondary: matches!(b, BrushArg::Secondary),
+        at: (r.brush_at.len() == 2).then(|| [r.brush_at[0], r.brush_at[1]]),
+        radius: r.brush_radius.max(1.0),
+    });
+    let source = r.recipe.as_deref().map(recipe::Recipe::load).transpose()?;
+    let (seed, size) = recipe_defaults(source.as_ref(), r.seed, [r.width, r.height]);
+    let mut camera = source.as_ref().map_or_else(world::Camera::default, |s| s.saved.camera);
+    if let Some(zoom) = r.zoom {
+        camera.zoom = zoom;
+    }
+    if let [x, y] = r.center[..] {
+        camera.center = [x, y];
+    }
+    Ok(headless::RenderJob {
+        world: r.world,
+        preset: r.preset,
+        recipe: source,
+        sets: r.set,
+        seed,
+        size,
+        frames: r.frames,
+        fps: r.fps,
+        out: r.out,
+        save_recipe: r.save_recipe,
+        video: r.video,
+        every: r.every,
+        frames_dir: r.frames_dir,
+        exposure: r.exposure,
+        bloom: r.bloom,
+        bloom_threshold: r.bloom_threshold,
+        tonemap: r.tonemap.map(Into::into),
+        camera,
+        brush,
+        max_fps: r.max_fps,
+        quiet: false,
+        metrics: r.metrics,
+    })
+}
+
 fn run(cli: Cli) -> Result<()> {
     let json = cli.global.json;
     match cli.command {
         None => {
             if json {
                 return Err(Failure::Usage.error(
-                    "--json needs a command (list, render, gallery or explore); without one primordia opens its window",
+                    "--json needs a command (list, render, gallery, explore or recipe); without one primordia opens \
+                     its window",
                 ));
             }
             let r = cli.run;
@@ -622,38 +766,7 @@ fn run(cli: Cli) -> Result<()> {
             })
         }
         Some(Command::Render(r)) => {
-            if r.center.len() != 2 {
-                return Err(Failure::Usage.error("--center expects two comma-separated numbers, e.g. --center 0.25,0.5"));
-            }
-            if !r.brush_at.is_empty() && r.brush_at.len() != 2 {
-                return Err(Failure::Usage.error("--brush-at expects two comma-separated numbers, e.g. --brush-at 0.3,0.6"));
-            }
-            let brush = r.brush.map(|b| headless::Brush {
-                secondary: matches!(b, BrushArg::Secondary),
-                at: (r.brush_at.len() == 2).then(|| [r.brush_at[0], r.brush_at[1]]),
-                radius: r.brush_radius.max(1.0),
-            });
-            let job = headless::RenderJob {
-                world: r.world,
-                preset: r.preset,
-                seed: r.seed,
-                size: [r.width, r.height],
-                frames: r.frames,
-                fps: r.fps,
-                out: r.out,
-                video: r.video,
-                every: r.every,
-                frames_dir: r.frames_dir,
-                exposure: r.exposure,
-                bloom: r.bloom,
-                bloom_threshold: r.bloom_threshold,
-                tonemap: r.tonemap.map(Into::into),
-                camera: world::Camera { center: [r.center[0], r.center[1]], zoom: r.zoom },
-                brush,
-                max_fps: r.max_fps,
-                quiet: false,
-                metrics: r.metrics,
-            };
+            let job = render_job(r)?;
             let summary = headless::render(&job)?;
             emit(json, report::render(&summary, &job), &summary.files());
             Ok(())
@@ -675,6 +788,8 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Explore(e)) => {
             let mut job = explore::ExploreJob::new(&e.world);
             job.preset = e.preset;
+            job.recipe = e.recipe.as_deref().map(recipe::Recipe::load).transpose()?;
+            job.sets = e.set;
             job.seed = e.seed;
             job.runs = e.runs;
             job.refine = e.refine;
@@ -692,6 +807,28 @@ fn run(cli: Cli) -> Result<()> {
             job.inert = e.keep_inert;
             let summary = explore::explore(&job)?;
             emit(json, report::explore(&summary, &job), &summary.files());
+            Ok(())
+        }
+        Some(Command::Recipe(a)) => {
+            let source = a.recipe.as_deref().map(recipe::Recipe::load).transpose()?;
+            let (seed, size) = recipe_defaults(source.as_ref(), a.seed, [a.width, a.height]);
+            let job = recipe::RecipeJob {
+                world: a.world,
+                preset: a.preset,
+                seed,
+                size,
+                recipe: source,
+                sets: a.set,
+                out: a.out,
+            };
+            let summary = recipe::build(&job)?;
+            if json {
+                print_stdout(&report::recipe(&summary, &job).to_string());
+            } else if let Some(file) = &summary.file {
+                print_stdout(&file.display().to_string());
+            } else {
+                print_stdout(&serde_json::to_string_pretty(&summary.saved)?);
+            }
             Ok(())
         }
         Some(Command::List(l)) => {
@@ -770,13 +907,15 @@ mod tests {
         assert_eq!(args.max_fps, 0.0);
         assert_eq!(args.bloom, Some(0.0));
         assert_eq!(args.metrics, None);
-        // The default centre is shown, and parsed, in the syntax the option takes.
+        // The default centre is shown in the syntax the option takes; not giving it keeps the recipe's.
         let Some(Command::Render(args)) = parse(["primordia", "render"]).unwrap().command else {
             panic!("expected render")
         };
-        assert_eq!(args.center, [0.5, 0.5]);
+        assert!(args.center.is_empty() && args.zoom.is_none() && args.seed.is_none());
+        let job = render_job(args).unwrap();
+        assert_eq!((job.camera, job.seed, job.size), (world::Camera::default(), 1, [1920, 1080]));
         let help = Cli::command().find_subcommand_mut("render").unwrap().render_long_help().to_string();
-        assert!(help.contains("[default: 0.5,0.5]"), "{help}");
+        assert!(help.contains("[default: 0.5,0.5, or the recipe's]"), "{help}");
     }
 
     #[test]
@@ -803,7 +942,7 @@ mod tests {
         else {
             panic!("expected render")
         };
-        assert_eq!(args.zoom, 256.0);
+        assert_eq!(args.zoom, Some(256.0));
     }
 
     #[test]
@@ -862,5 +1001,195 @@ mod tests {
     #[test]
     fn tonemap_names_match_the_option_values() {
         assert_eq!(tonemap_names(), ["agx", "aces", "reinhard", "linear"]);
+    }
+
+    fn render_args(argv: &[&str]) -> RenderArgs {
+        let argv = ["primordia", "render"].iter().chain(argv);
+        match parse(argv).unwrap_or_else(|e| panic!("{e}")).command {
+            Some(Command::Render(args)) => args,
+            _ => panic!("expected render"),
+        }
+    }
+
+    #[test]
+    fn render_takes_a_recipe_whose_seed_size_and_camera_apply_unless_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reef.json");
+        std::fs::copy("tests/fixtures/reaction-diffusion.json", &path).unwrap();
+        let reef = path.to_str().unwrap();
+        let saved = library::load(&path).unwrap();
+
+        let args = render_args(&["--recipe", reef, "--set", "params.feed=0.031", "--set", "palette=Frost"]);
+        assert_eq!(args.set.iter().map(|s| s.to_string()).collect::<Vec<_>>(), ["params.feed=0.031", "palette=Frost"]);
+        let job = render_job(args).unwrap();
+        assert_eq!((job.seed, job.size, job.camera), (u64::MAX, [1920, 1008], saved.camera));
+        assert_eq!(job.recipe.as_ref().map(|r| r.path.as_path()), Some(path.as_path()));
+
+        let args = render_args(&["--recipe", reef, "--seed", "3", "--width", "640", "--zoom", "2", "--center=0.1,0.2"]);
+        let job = render_job(args).unwrap();
+        assert_eq!((job.seed, job.size), (3, [640, 1008]), "each side the options leave out is the recipe's");
+        assert_eq!(job.camera, world::Camera { center: [0.1, 0.2], zoom: 2.0 });
+        let args = render_args(&["--recipe", reef, "--zoom", "4"]);
+        assert_eq!(render_job(args).unwrap().camera, world::Camera { zoom: 4.0, ..saved.camera });
+
+        // A recipe replaces --world and --preset; --set and --save-recipe work without one.
+        for conflict in [&["-w", "rd"][..], &["--preset", "2"], &["--world=lenia"]] {
+            let argv: Vec<&str> = ["primordia", "render", "--recipe", reef].iter().chain(conflict).copied().collect();
+            assert!(parse(&argv).is_err(), "{conflict:?}");
+        }
+        let args = render_args(&["-w", "rd", "--set", "params.kill=0.06", "--save-recipe", "out/mito.json"]);
+        assert_eq!((args.set.len(), args.save_recipe.as_deref()), (1, Some(Path::new("out/mito.json"))));
+        for bad in [&["--set", "feed"][..], &["--set", "=1"], &["--set"]] {
+            let argv: Vec<&str> = ["primordia", "render"].iter().chain(bad).copied().collect();
+            assert!(parse(&argv).is_err(), "{bad:?}");
+        }
+        let error = render_job(render_args(&["--recipe", "no/such/recipe.json"])).unwrap_err();
+        assert!(error.to_string().contains("cannot use the recipe no/such/recipe.json"), "{error}");
+        assert_eq!(failure::exit_code(&error), 2);
+
+        // explore and recipe take a recipe and settings too.
+        let cli = parse(["primordia", "explore", "--recipe", reef, "--set", "params.kill=0.06"]).unwrap();
+        let Some(Command::Explore(args)) = cli.command else { panic!("expected explore") };
+        assert_eq!((args.recipe.as_deref(), args.set.len()), (Some(path.as_path()), 1));
+        assert!(parse(["primordia", "explore", "--recipe", reef, "-p", "1"]).is_err());
+        let argv = ["primordia", "recipe", "-w", "rd", "-p", "mitosis", "--set", "params.feed=0.031", "-o", "m.json"];
+        let cli = parse(argv).unwrap();
+        let Some(Command::Recipe(args)) = cli.command else { panic!("expected recipe") };
+        assert_eq!((args.world.as_str(), args.preset.as_deref(), args.set.len()), ("rd", Some("mitosis"), 1));
+        assert_eq!(recipe_defaults(None, args.seed, [args.width, args.height]), (1, [1920, 1080]));
+        let loaded = recipe::Recipe::load(&path).unwrap();
+        assert_eq!(recipe_defaults(Some(&loaded), None, [None, Some(200)]), (u64::MAX, [1920, 200]));
+        assert!(parse(["primordia", "recipe", "--recipe", reef, "-w", "rd"]).is_err());
+
+        let mut cli = Cli::command();
+        let help = cli.find_subcommand_mut("recipe").unwrap().render_long_help().to_string();
+        for text in ["primordia:recipe", "--set <KEY=VALUE>", "params.kernels.0.mu", "seed as a string"] {
+            assert!(help.contains(text), "missing {text:?}: {help}");
+        }
+        let help = cli.find_subcommand_mut("render").unwrap().render_long_help().to_string();
+        assert!(help.contains("--save-recipe") && help.contains("same GPU, driver and backend"), "{help}");
+    }
+
+    /// The PNG an image path holds, as RGBA bytes.
+    fn pixels(path: &Path) -> Vec<u8> {
+        image::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())).to_rgba8().into_raw()
+    }
+
+    fn render_cli(gpu: &gpu::Gpu, argv: &[&str]) -> headless::RenderSummary {
+        let mut args = render_args(argv);
+        args.max_fps = 0.0;
+        headless::render_with(gpu, &render_job(args).unwrap()).unwrap()
+    }
+
+    /// `render --recipe` with a recipe that explore kept reproduces explore's
+    /// image bit for bit, in every world and for mutated recipes too; so does
+    /// the explore PNG itself, which carries the same recipe.
+    #[test]
+    fn gpu_explore_recipes_render_again_bit_for_bit() {
+        let Some((_guard, gpu)) = gpu::test_gpu() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        for entry in WORLDS {
+            let job = explore::ExploreJob {
+                seed: 5,
+                runs: 2,
+                refine: 1,
+                children: 1,
+                keep: 2,
+                frames: 12,
+                size: [96, 64],
+                max_fps: 0.0,
+                out_dir: dir.path().join(entry.id),
+                sheet: false,
+                inert: true,
+                ..explore::ExploreJob::new(entry.id)
+            };
+            let summary = explore::explore_with(&gpu, &job).unwrap();
+            assert!(!summary.images.is_empty(), "{}", entry.id);
+            let origins: Vec<String> = summary.kept.iter().map(|&i| summary.candidates[i].origin.to_string()).collect();
+            assert!(origins.iter().any(|o| o != "preset"), "{}: a mutated recipe is among {origins:?}", entry.id);
+            let mut colours = 0;
+            for (rank, (image, recipe)) in summary.images.iter().zip(&summary.recipes).enumerate() {
+                let original = pixels(image);
+                colours = colours.max(original.chunks(4).collect::<std::collections::HashSet<_>>().len());
+                for (source, name) in [(recipe, "from-json.png"), (image, "from-png.png")] {
+                    let out = dir.path().join(format!("{}-{rank}-{name}", entry.id));
+                    let args = [
+                        "--recipe", source.to_str().unwrap(), "--frames", "12", "-o", out.to_str().unwrap(),
+                    ];
+                    let rendered = render_cli(&gpu, &args);
+                    assert_eq!(rendered.size, [96, 64], "the recipe's own size");
+                    assert!(
+                        pixels(&out) == original,
+                        "{} #{} ({}): {} does not reproduce {}",
+                        entry.id,
+                        rank + 1,
+                        origins[rank],
+                        source.display(),
+                        image.display()
+                    );
+                }
+            }
+            assert!(colours > 16, "{}: every kept image is almost blank, which would prove nothing", entry.id);
+        }
+        assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+    }
+
+    /// A PNG written by render carries a recipe (and a command) that renders
+    /// the same image again: the final frame, an --every frame and the
+    /// --save-recipe file all reproduce, --set, look and camera included.
+    #[test]
+    fn gpu_rendered_pngs_render_again_from_their_own_recipe() {
+        let Some((_guard, gpu)) = gpu::test_gpu() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let (first, saved, frames) = (file("first.png"), file("first.json"), file("frames"));
+        let summary = render_cli(&gpu, &[
+            "-w", "rd", "-p", "mitosis", "--seed", "7", "--width", "90", "--height", "60", "--frames", "9",
+            "--set", "params.feed=0.031", "--exposure", "1.3", "--zoom", "1.5", "--center=0.4,0.6", "--every", "3",
+            "--frames-dir", &frames, "--save-recipe", &saved, "-o", &first,
+        ]);
+        assert!(summary.modified);
+        assert_eq!(summary.recipe.as_deref(), Some(Path::new(&saved)));
+        let embedded = library::load(Path::new(&first)).unwrap();
+        let written = library::load(Path::new(&saved)).unwrap();
+        assert_eq!(serde_json::to_value(&embedded).unwrap(), serde_json::to_value(&written).unwrap());
+        assert_eq!((embedded.seed, embedded.output_size, embedded.preset), (7, [90, 60], 1));
+        assert_eq!(embedded.camera, world::Camera { center: [0.4, 0.6], zoom: 1.5 });
+        assert_eq!((embedded.look.exposure, embedded.name.as_str()), (1.3, "Reaction-Diffusion · Mitosis (seed 7)"));
+        let comment = |png: &str| {
+            let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(png).unwrap()));
+            let reader = decoder.read_info().unwrap();
+            let chunk = reader.info().uncompressed_latin1_text.iter().find(|c| c.keyword == "Comment").cloned();
+            chunk.expect("a Comment chunk").text
+        };
+        assert_eq!(comment(&first), "primordia render --recipe first.png --frames 9");
+
+        for (source, frames_arg, expected) in [
+            (first.clone(), "9", first.clone()),
+            (saved.clone(), "9", first.clone()),
+            (file("frames/reaction-diffusion_00006.png"), "6", file("frames/reaction-diffusion_00006.png")),
+        ] {
+            let again = file(&format!("again-{frames_arg}.png"));
+            render_cli(&gpu, &["--recipe", &source, "--frames", frames_arg, "-o", &again]);
+            let same = pixels(Path::new(&again)) == pixels(Path::new(&expected));
+            assert!(same, "{source} does not render {expected} again");
+        }
+        let frame = comment(&file("frames/reaction-diffusion_00006.png"));
+        assert!(frame.ends_with("--recipe reaction-diffusion_00006.png --frames 6"), "{frame}");
+
+        // An unedited preset's PNG names the preset instead, and that command renders it again.
+        let plain = file("plain.png");
+        let args = ["-w", "lenia", "-p", "2", "--seed", "3", "--width", "64", "--height", "48", "--frames", "5"];
+        render_cli(&gpu, &[&args[..], &["--zoom", "2", "--tonemap", "reinhard", "-o", &plain]].concat());
+        let command = comment(&plain);
+        let expected = "primordia render -w lenia -p leviathans --seed 3 --width 64 --height 48 --tonemap reinhard \
+                        --zoom 2 --frames 5";
+        assert_eq!(command, expected);
+        assert!(!library::load(Path::new(&plain)).unwrap().modified);
+        let words: Vec<&str> = command.split_whitespace().skip(2).collect();
+        let again = file("plain-again.png");
+        render_cli(&gpu, &[&words[..], &["-o", &again]].concat());
+        assert!(pixels(Path::new(&again)) == pixels(Path::new(&plain)), "the Comment command renders the image again");
+        assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
     }
 }

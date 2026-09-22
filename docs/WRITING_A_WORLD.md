@@ -72,6 +72,11 @@ is a complete, full-featured reference that uses every convention below.
    with the supplied seed. Recipes restart a simulation; they do not contain its
    evolving GPU buffers. Use serde defaults when adding optional fields to keep
    existing saves readable. The library tests exercise every registered preset.
+   The same recipes drive `primordia render --recipe`, `--set KEY=VALUE` and
+   `primordia recipe`, so `restore_settings()` is also where values typed on the
+   command line are checked: reject unsafe ones with a message that names the
+   problem. A restored recipe must replay its run exactly, down to the pixel; a
+   test renders every world's explore recipes again and compares the images.
 9. **Measurements** (optional). Publish a `const METRICS: &[MetricDesc]` table
    from `metrics()` and implement `measure()`, which the app calls right after
    `step` (never while paused). Embed a `crate::metrics::Reduction` sized for

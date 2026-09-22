@@ -2,10 +2,10 @@
 //! of each headless command, as text or as one JSON object (`--json`).
 //!
 //! Conventions of every JSON object: seeds are strings (a `u64` does not fit a
-//! JSON number exactly), presets are `{"index", "name", "slug"}` with the
-//! 1-based index `--preset` takes (recipes store it 0-based), paths are
-//! printed as given, and `"ok"` says whether the command succeeded (failures
-//! come from [`crate::failure::json`]).
+//! JSON number exactly), including the seed of a recipe object; presets are
+//! `{"index", "name", "slug"}` with the 1-based index `--preset` takes
+//! (recipes store it 0-based), paths are printed as given, and `"ok"` says
+//! whether the command succeeded (failures come from [`crate::failure::json`]).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -14,8 +14,9 @@ use serde_json::{json, Value};
 
 use crate::explore::{self, Origin};
 use crate::headless::{self, GallerySummary, RenderJob, RenderSummary};
-use crate::library;
+use crate::library::{self, SavedWorld};
 use crate::metrics::MetricDesc;
+use crate::recipe::{RecipeJob, RecipeSummary, Setting};
 use crate::world::WORLDS;
 
 /// Version of the `list --json` layout; bumped only when fields change meaning or go away.
@@ -127,6 +128,37 @@ pub fn list_text(only: Option<usize>, tonemaps: &[&str]) -> String {
     text
 }
 
+/// The `--set` arguments as given.
+fn settings(sets: &[Setting]) -> Value {
+    Value::Array(sets.iter().map(|s| Value::String(s.to_string())).collect())
+}
+
+/// A recipe as JSON, with its seed as a string like every other seed here
+/// (a recipe file keeps it a number; both load).
+pub fn recipe_json(saved: &SavedWorld) -> Value {
+    let mut value = serde_json::to_value(saved).unwrap_or(Value::Null);
+    value["seed"] = Value::String(saved.seed.to_string());
+    value
+}
+
+/// `recipe --json`: the complete recipe and the file it was written to.
+pub fn recipe(summary: &RecipeSummary, job: &RecipeJob) -> Value {
+    let saved = &summary.saved;
+    json!({
+        "ok": true,
+        "command": "recipe",
+        "world": WORLDS[summary.world].id,
+        "preset": preset(summary.world, saved.preset),
+        "source": optional_path(job.recipe.as_ref().map(|r| r.path.as_path())),
+        "set": settings(&job.sets),
+        "modified": saved.modified,
+        "seed": saved.seed.to_string(),
+        "size": saved.output_size,
+        "file": optional_path(summary.file.as_deref()),
+        "recipe": recipe_json(saved),
+    })
+}
+
 /// `render --json`.
 pub fn render(summary: &RenderSummary, job: &RenderJob) -> Value {
     let world = summary.world;
@@ -148,6 +180,9 @@ pub fn render(summary: &RenderSummary, job: &RenderJob) -> Value {
         "command": "render",
         "world": WORLDS[world].id,
         "preset": preset(world, summary.preset),
+        "source": optional_path(job.recipe.as_ref().map(|r| r.path.as_path())),
+        "set": settings(&job.sets),
+        "modified": summary.modified,
         "seed": job.seed.to_string(),
         "size": summary.size,
         "frames": summary.frames,
@@ -157,6 +192,7 @@ pub fn render(summary: &RenderSummary, job: &RenderJob) -> Value {
             "video": optional_path(summary.video.as_deref()),
             "frames": summary.frame_files.iter().map(|p| path(p)).collect::<Vec<_>>(),
             "metrics": optional_path(summary.metrics.as_ref().map(|m| m.path.as_path())),
+            "recipe": optional_path(summary.recipe.as_deref()),
         },
         "metrics": metrics,
         "secs": number(summary.secs),
@@ -192,9 +228,8 @@ pub fn explore(summary: &explore::Summary, job: &explore::ExploreJob) -> Value {
         .map(|(rank, &i)| {
             let c = &summary.candidates[i];
             let (origin, parent) = match c.origin {
-                Origin::Preset => ("preset", None),
-                Origin::Mutation => ("mutation", None),
-                Origin::Child { parent } => ("child", Some(parent)),
+                Origin::Child { parent } => (c.origin.name(), Some(parent)),
+                other => (other.name(), None),
             };
             json!({
                 "rank": rank + 1,
@@ -215,7 +250,11 @@ pub fn explore(summary: &explore::Summary, job: &explore::ExploreJob) -> Value {
         "ok": true,
         "command": "explore",
         "world": WORLDS[world].id,
-        "base": { "preset": preset(world, summary.preset) },
+        "base": {
+            "preset": preset(world, summary.preset),
+            "source": optional_path(job.recipe.as_ref().map(|r| r.path.as_path())),
+            "set": settings(&job.sets),
+        },
         "seed": job.seed.to_string(),
         "select": job.select.to_string(),
         "evaluated": summary.candidates.len(),
@@ -311,6 +350,7 @@ mod tests {
             preset: 1,
             size: [320, 180],
             frames: 60,
+            modified: true,
             png: Some(PathBuf::from("r/mitosis.png")),
             video: None,
             frame_files: vec![PathBuf::from("frames/reaction-diffusion_00030.png")],
@@ -320,9 +360,11 @@ mod tests {
                 series: None,
                 last: Some(Sample { frame: 59, time: 59.0 / 60.0, series: 1, values }),
             }),
+            recipe: Some(PathBuf::from("r/mitosis.json")),
             secs: 0.5,
         };
-        let job = RenderJob { seed: u64::MAX, fps: 30, ..RenderJob::new("rd") };
+        let sets = vec!["params.feed=0.031".parse().unwrap(), "palette=Frost".parse().unwrap()];
+        let job = RenderJob { seed: u64::MAX, fps: 30, sets, ..RenderJob::new("rd") };
         let value = render(&summary, &job);
         assert_eq!(value["ok"], true);
         assert_eq!(value["command"], "render");
@@ -334,6 +376,9 @@ mod tests {
         assert!(value["files"]["video"].is_null());
         assert_eq!(value["files"]["frames"][0], "frames/reaction-diffusion_00030.png");
         assert_eq!(value["files"]["metrics"], "r/mitosis.csv");
+        assert_eq!(value["files"]["recipe"], "r/mitosis.json");
+        assert_eq!((value["modified"].clone(), value["source"].clone()), (json!(true), Value::Null));
+        assert_eq!(value["set"], json!(["params.feed=0.031", "palette=Frost"]));
         assert_eq!(value["metrics"]["rows"], 60);
         let last = &value["metrics"]["last"][0];
         assert_eq!(last["alive"], 0.25);
@@ -342,6 +387,7 @@ mod tests {
         assert!(last["body"].is_null(), "non-finite measurements become null");
         assert_eq!(last.as_object().unwrap().len(), WORLDS[3].metrics.len());
         let files: Vec<&Path> = summary.files();
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[3], Path::new("r/mitosis.json"), "the recipe is written last");
     }
 }
