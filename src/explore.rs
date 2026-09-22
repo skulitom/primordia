@@ -794,7 +794,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     // Round 0: the base preset, then fresh mutations.
     evaluate(&mut bench, &mut candidates, 0, Origin::Preset, job.seed)?;
     for _ in 0..job.runs {
-        let seed = rng.next_u64();
+        let seed = rng.next_seed();
         match bench.mutate(seed) {
             Ok(()) => evaluate(&mut bench, &mut candidates, 0, Origin::Mutation, seed)?,
             Err(e) => log::warn!("mutation with seed {seed} skipped: {e:#}"),

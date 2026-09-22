@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::post::PostSettings;
 use crate::world::{Camera, lenia, particle_life, physarum, reaction_diffusion, symbiosis};
@@ -40,6 +40,9 @@ impl WorldSettings {
 pub struct SavedWorld {
     pub version: u32,
     pub name: String,
+    /// Written as a JSON number; read from a number or a string of digits, so
+    /// tools that round large numbers through doubles can quote it.
+    #[serde(deserialize_with = "seed_from_number_or_string")]
     pub seed: u64,
     /// Original creation size, independent of later window resizing.
     pub output_size: [u32; 2],
@@ -48,6 +51,39 @@ pub struct SavedWorld {
     pub settings: WorldSettings,
     pub look: PostSettings,
     pub camera: Camera,
+}
+
+/// Accepts a seed as a JSON number or as a string of digits.
+fn seed_from_number_or_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    struct Seed;
+    impl serde::de::Visitor<'_> for Seed {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a seed: a whole number from 0 to {}, as a JSON number or string", u64::MAX)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<u64, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<u64, E> {
+            u64::try_from(value).map_err(|_| E::custom(format!("seed {value} is negative")))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<u64, E> {
+            Err(E::custom(format!(
+                "seed {value} is not a whole number that fits 64 bits (a tool that reads numbers as doubles may \
+                 have rounded it: write seeds as strings)"
+            )))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<u64, E> {
+            let error = || E::custom(format!("seed '{value}' is not a whole number from 0 to {}", u64::MAX));
+            value.trim().parse().map_err(|_| error())
+        }
+    }
+    deserializer.deserialize_any(Seed)
 }
 
 impl SavedWorld {
@@ -299,6 +335,40 @@ mod tests {
         assert!(read_save(&path).unwrap_err().to_string().contains("supported range"));
         std::fs::File::create(&path).unwrap().set_len(MAX_SAVE_BYTES + 1).unwrap();
         assert!(read_save(&path).unwrap_err().to_string().contains("too large"));
+    }
+
+    #[test]
+    fn seeds_load_from_numbers_or_strings_and_stay_numbers() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/reaction-diffusion.json")).unwrap();
+        // The fixture predates quoted seeds and still loads, through the file loader too.
+        let path = std::path::Path::new("tests/fixtures/reaction-diffusion.json");
+        assert_eq!(read_save(path).unwrap().seed, u64::MAX);
+        let with_seed = |seed: serde_json::Value| {
+            let mut value = fixture.clone();
+            value["seed"] = seed;
+            serde_json::from_value::<SavedWorld>(value).map(|saved| saved.seed).map_err(|e| e.to_string())
+        };
+        assert_eq!(with_seed(serde_json::json!(7)), Ok(7));
+        assert_eq!(with_seed(serde_json::json!("8010643033089386035")), Ok(8010643033089386035));
+        assert_eq!(with_seed(serde_json::json!(" 18446744073709551615 ")), Ok(u64::MAX));
+        let cases = [
+            (serde_json::json!(-1), "seed -1 is negative"),
+            (serde_json::json!(8.010643033089386e18), "write seeds as strings"),
+            (serde_json::json!("0x10"), "seed '0x10' is not a whole number from 0 to 18446744073709551615"),
+            (serde_json::json!("18446744073709551616"), "is not a whole number"),
+            (serde_json::json!(null), "a seed: a whole number"),
+        ];
+        for (seed, expected) in cases {
+            let error = with_seed(seed.clone()).expect_err("an invalid seed");
+            assert!(error.contains(expected), "{seed}: {error}");
+        }
+        // Parsed from text as JSON, a large seed keeps every digit, and it is written back as a number.
+        let text = include_str!("../tests/fixtures/reaction-diffusion.json")
+            .replace("18446744073709551615", "\"9007199254740993\"");
+        let saved: SavedWorld = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved.seed, 9007199254740993);
+        assert!(serde_json::to_string(&saved).unwrap().contains("\"seed\":9007199254740993,"));
     }
 
     fn recipe(world: &dyn crate::world::World, seed: u64) -> SavedWorld {

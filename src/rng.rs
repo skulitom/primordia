@@ -20,6 +20,12 @@ impl Rng {
         z ^ (z >> 31)
     }
 
+    /// A seed for a new run, below 2^53 so that it survives tools that read
+    /// JSON numbers as doubles (JavaScript, jq) unchanged.
+    pub fn next_seed(&mut self) -> u64 {
+        self.next_u64() >> (64 - SEED_BITS)
+    }
+
     pub fn next_u32(&mut self) -> u32 {
         (self.next_u64() >> 32) as u32
     }
@@ -55,10 +61,32 @@ impl Rng {
     }
 }
 
-/// A seed derived from the wall clock, for "surprise me" resets.
+/// Bits of the seeds Primordia draws itself ([`Rng::next_seed`], [`time_seed`]):
+/// every integer below 2^53 is exact as a double, so recipes stay reproducible
+/// after a round trip through JavaScript or jq. Seeds typed by hand may be any `u64`.
+pub const SEED_BITS: u32 = 53;
+
+/// A seed derived from the wall clock, for "surprise me" resets (below 2^53, see [`SEED_BITS`]).
 pub fn time_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x1234_5678)
+        & ((1 << SEED_BITS) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drawn_seeds_are_exact_as_doubles() {
+        let limit = 1u64 << SEED_BITS;
+        let mut rng = Rng::new(7);
+        let seeds: Vec<u64> = (0..1000).map(|_| rng.next_seed()).collect();
+        assert!(seeds.iter().all(|&s| s < limit && s as f64 as u64 == s));
+        assert!(seeds.iter().any(|&s| s >= limit / 2), "the whole 53-bit range is used");
+        assert!(time_seed() < limit);
+        assert_ne!(Rng::new(7).next_seed(), Rng::new(8).next_seed());
+    }
 }
