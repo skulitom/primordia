@@ -294,6 +294,10 @@ struct State {
     window: Arc<Window>,
     gpu: Gpu,
     gpu_name: String,
+    /// Name, backend and kind of the GPU, for the About section.
+    gpu_detail: String,
+    /// How to run this exe from a terminal, for the suggested commands.
+    program: String,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     minimized: bool,
@@ -475,6 +479,8 @@ impl State {
             window,
             gpu,
             gpu_name,
+            gpu_detail: describe_adapter(&adapter),
+            program: program_name(),
             surface,
             config,
             minimized: false,
@@ -1723,7 +1729,10 @@ impl State {
             }
         });
         if self.library.entries.is_empty() {
-            ui.label("Your favourite worlds will appear here.");
+            let command = format!("{} explore -w {} --install", self.program, self.world.id());
+            if theme::empty_library(ui, &command) {
+                self.toast("Copied".to_string());
+            }
         }
         for (index, entry) in self.library.entries.iter().enumerate() {
             ui.push_id(&entry.path, |ui| {
@@ -1839,6 +1848,18 @@ impl State {
         });
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("Capture folder\n{}", self.output_dir.display())).small().weak());
+        ui.add_space(8.0);
+        ui.separator();
+        let commands = command_examples(&self.program, self.world.id(), self.preset_name());
+        if theme::about(ui, &self.gpu_detail, &commands) {
+            self.toast("Copied".to_string());
+        }
+        let hint = if self.program.starts_with('.') {
+            "Run them in a terminal opened in Primordia's folder; add --help to any of them to see its options."
+        } else {
+            "Add --help to any of them to see its options."
+        };
+        ui.label(egui::RichText::new(hint).small().weak());
     }
 
     fn draw_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -2003,6 +2024,51 @@ fn adapter_kind(device: wgpu::DeviceType) -> &'static str {
     }
 }
 
+/// "NVIDIA GeForce RTX 4090 · Vulkan · discrete GPU".
+fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
+    let backend = match info.backend {
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Dx12 => "Direct3D 12",
+        wgpu::Backend::Gl => "OpenGL",
+        other => other.to_str(),
+    };
+    let kind = adapter_kind(info.device_type);
+    let kind = kind.split_once(' ').map_or(kind, |(_article, rest)| rest);
+    format!("{} · {backend} · {kind}", info.name)
+}
+
+/// Commands to try in a terminal, for the world on screen. `program` is how
+/// the exe is called there (its file name without `.exe`).
+fn command_examples(program: &str, world: &str, preset: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let preset = if preset.chars().all(plain) { preset.to_string() } else { format!("\"{preset}\"") };
+    format!("{program} list\n{program} render -w {world} -p {preset}\n{program} explore -w {world} --install")
+}
+
+/// How to run this exe from a terminal: its name when its folder is on the
+/// PATH (e.g. after `cargo install`), else `.\name` (`./name`) for a terminal
+/// opened in that folder. The name is the file's own, as downloaded or renamed,
+/// unless it would need quoting; then it is `primordia`.
+fn program_name() -> String {
+    let exe = std::env::current_exe().ok();
+    let plain = |name: &String| name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    let name = exe
+        .as_deref()
+        .and_then(Path::file_stem)
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(plain)
+        .unwrap_or_else(|| "primordia".to_string());
+    let folder = exe.as_deref().and_then(Path::parent);
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| Some(dir.as_path()) == folder));
+    match (on_path, cfg!(windows)) {
+        (true, _) => name,
+        (false, true) => format!(".\\{name}"),
+        (false, false) => format!("./{name}"),
+    }
+}
+
 /// Title-bar and taskbar icons for a window on a display with this scale factor.
 fn with_icons(mut attrs: WindowAttributes, scale_factor: f64) -> WindowAttributes {
     let icon = |points: f64| {
@@ -2120,6 +2186,59 @@ mod tests {
         let note = SlowGpu::Overloaded { ms: 330.4 }.title_note();
         assert!(note.contains("330 ms per frame") && !note.contains("another program"), "{note}");
         assert!(!SlowGpu::Unknown.title_note().contains("another program"));
+    }
+
+    #[test]
+    fn about_describes_the_gpu_and_suggests_commands_for_the_world_on_screen() {
+        let info = wgpu::AdapterInfo {
+            name: "AMD Radeon(TM) Graphics".to_string(),
+            vendor: 0x1002,
+            device: 0x164e,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Vulkan,
+        };
+        assert_eq!(describe_adapter(&info), "AMD Radeon(TM) Graphics · Vulkan · integrated GPU");
+        let info = wgpu::AdapterInfo { device_type: wgpu::DeviceType::Cpu, backend: wgpu::Backend::Dx12, ..info };
+        assert_eq!(describe_adapter(&info), "AMD Radeon(TM) Graphics · Direct3D 12 · software renderer");
+
+        let commands = command_examples(".\\primordia", "lenia", "Pearl Reef");
+        assert_eq!(
+            commands,
+            ".\\primordia list\n.\\primordia render -w lenia -p \"Pearl Reef\"\n.\\primordia explore -w lenia --install"
+        );
+        assert!(command_examples("primordia", "physarum", "Dendrites").contains("render -w physarum -p Dendrites\n"));
+        // Every world id and preset name the commands can show must parse back.
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct Render {
+            #[arg(short, long)]
+            world: String,
+            #[arg(short, long)]
+            preset: String,
+        }
+        let examples = [("lenia", "Pearl Reef"), ("particle-life", "Predator & Prey"), ("physarum", "Dendrites")];
+        for (world, preset) in examples {
+            let line = command_examples("primordia", world, preset).lines().nth(1).unwrap().to_string();
+            // A shell's word splitting, for the double quotes the commands use.
+            let mut words = vec![String::new()];
+            let mut quoted = false;
+            for c in line.chars() {
+                match c {
+                    '"' => quoted = !quoted,
+                    ' ' if !quoted => words.push(String::new()),
+                    c => words.last_mut().unwrap().push(c),
+                }
+            }
+            let parsed = Render::try_parse_from(&words[1..]).unwrap();
+            assert_eq!((parsed.world.as_str(), parsed.preset.as_str()), (world, preset));
+        }
+        // The test binary's own name, bare or relative depending on whether cargo
+        // put its folder on the PATH (it does on Windows, to find DLLs).
+        let program = program_name();
+        let stem = std::env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().into_owned();
+        assert!([format!(".\\{stem}"), format!("./{stem}"), stem].contains(&program), "{program}");
     }
 
     #[test]

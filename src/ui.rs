@@ -24,6 +24,9 @@ const WIDGET_RADIUS: u8 = 3;
 /// from 16 to 256 pixels. build.rs embeds the same file in the Windows exe.
 pub const ICON: &[u8] = include_bytes!("../assets/primordia.ico");
 
+/// Where to find Primordia on the web (from Cargo.toml).
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
 pub fn control_panel(ctx: &egui::Context) -> egui::SidePanel {
     let frame = egui::Frame::side_top_panel(&ctx.style())
         .fill(PANEL)
@@ -232,7 +235,7 @@ pub fn inspector_tabs(ui: &mut egui::Ui, selected: &mut Inspector) {
     let tabs = [
         (Inspector::World, "World", "Simulation parameters, colours and materials"),
         (Inspector::Look, "Appearance", "Bloom, exposure and colour grading"),
-        (Inspector::Tools, "Tools", "Brush, camera, tour and shortcuts"),
+        (Inspector::Tools, "Tools", "Brush, camera, resolution, tour, shortcuts and about"),
         (Inspector::Library, "Library", "Save and reload your favourite worlds"),
     ];
     let frame = egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0f32, BORDER)).corner_radius(8).inner_margin(3);
@@ -499,6 +502,71 @@ pub fn resolution_picker(ui: &mut egui::Ui, current: f32) -> Option<f32> {
         }
     });
     picked
+}
+
+/// A few terminal commands under an eyebrow `title`, in a monospace box whose
+/// text can be selected, with a Copy button beside the title. Returns true when
+/// the button put them on the clipboard.
+pub fn command_box(ui: &mut egui::Ui, title: &str, commands: &str) -> bool {
+    let mut copied = false;
+    ui.horizontal(|ui| {
+        eyebrow(ui, title);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Copy").on_hover_text("Copy these commands to the clipboard").clicked() {
+                ui.ctx().copy_text(commands.to_string());
+                copied = true;
+            }
+        });
+    });
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0f32, BORDER))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+            // A prompt before each command, so a long one that wraps is still visibly one command.
+            for command in commands.lines() {
+                ui.horizontal_top(|ui| {
+                    ui.label(RichText::new("›").monospace().color(MUTED));
+                    ui.add(egui::Label::new(RichText::new(command).monospace().color(TEXT)).selectable(true).wrap());
+                });
+            }
+        });
+    copied
+}
+
+/// What the Library tab shows before anything is saved: the two ways to fill
+/// it, with `command` (an `explore --install` run) ready to copy. Returns true
+/// when the command was copied.
+pub fn empty_library(ui: &mut egui::Ui, command: &str) -> bool {
+    ui.label("Nothing saved yet.");
+    ui.label(
+        RichText::new(
+            "Name the world on screen above and press Save current world. Or let Primordia search this world's \
+             mutations for the most novel ones: run the command below in a terminal, then press Refresh to find \
+             its discoveries here.",
+        )
+        .small()
+        .weak(),
+    );
+    command_box(ui, "FILL YOUR LIBRARY", command)
+}
+
+/// The Tools tab's "About" section: version, GPU, links to the project and
+/// `commands` to try in a terminal. Returns true when the commands were copied.
+pub fn about(ui: &mut egui::Ui, gpu: &str, commands: &str) -> bool {
+    section(ui, "About", "Primordia is open source: read the guide, share a discovery or report a problem.");
+    ui.label(RichText::new(format!("Primordia {}", env!("CARGO_PKG_VERSION"))).strong().color(TEXT));
+    ui.label(RichText::new(format!("GPU: {gpu}")).small().color(MUTED));
+    ui.horizontal_wrapped(|ui| {
+        ui.hyperlink_to("Repository", REPOSITORY);
+        ui.hyperlink_to("README", format!("{REPOSITORY}#readme"));
+        ui.hyperlink_to("Report an issue", format!("{REPOSITORY}/issues"));
+    });
+    ui.add_space(4.0);
+    command_box(ui, "FROM THE COMMAND LINE", commands)
 }
 
 /// Repaints the checked checkboxes of a finished frame as accent-filled boxes
@@ -866,6 +934,58 @@ mod tests {
         garbled[first..first + 8].fill(0);
         assert!(icon_rgba(&garbled, 16).is_err(), "not a PNG");
         assert!(icon_rgba(ICON, 0).is_err());
+    }
+
+    #[test]
+    fn tools_and_library_sections_fit_the_narrowest_panel() {
+        let commands = ".\\primordia list\n.\\primordia render -w reaction-diffusion -p \"Crescent Gliders\"\n\
+                        .\\primordia explore -w reaction-diffusion --install";
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut picked = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                control_panel(ctx).show(ctx, |ui| {
+                    picked = resolution_picker(ui, 0.5);
+                    assert!(!about(ui, "NVIDIA GeForce RTX 4090 · Vulkan · discrete GPU", commands));
+                    assert!(!empty_library(ui, ".\\primordia explore -w reaction-diffusion --install"));
+                });
+            },
+        );
+        assert_eq!(picked, None);
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| if let egui::epaint::Shape::Text(text) = &clipped.shape { Some(text) } else { None })
+            .collect();
+        for label in ["25%", "50%", "75%", "100%", "Repository", "README", "Report an issue", "Copy"] {
+            let text = texts.iter().find(|t| t.galley.job.text == label).unwrap_or_else(|| panic!("{label} missing"));
+            assert_eq!(text.galley.rows.len(), 1, "{label} wrapped");
+        }
+        let version = format!("Primordia {}", env!("CARGO_PKG_VERSION"));
+        assert!(texts.iter().any(|t| t.galley.job.text == version));
+        let selected = texts.iter().find(|t| t.galley.job.text == "50%").unwrap();
+        assert_eq!(selected.galley.job.sections[0].format.color, ACCENT, "the current scale is highlighted");
+        for text in &texts {
+            let right = text.pos.x + text.galley.size().x;
+            assert!(right <= 320.0, "{} extends outside the panel", text.galley.job.text);
+        }
+        // Each command is a label of its own behind a prompt: a long one wraps
+        // under itself, clear of the prompt, rather than under the next one.
+        for command in commands.lines().chain([".\\primordia explore -w reaction-diffusion --install"]) {
+            let text = texts.iter().find(|t| t.galley.job.text == command).unwrap_or_else(|| panic!("{command} missing"));
+            let prompt = texts
+                .iter()
+                .find(|t| t.galley.job.text == "›" && (t.pos.y - text.pos.y).abs() < 1.0)
+                .unwrap_or_else(|| panic!("no prompt before {command}"));
+            assert!(prompt.pos.x + prompt.galley.size().x < text.pos.x);
+        }
+        let render = texts.iter().find(|t| t.galley.job.text.contains("render")).unwrap();
+        assert!(render.galley.rows.len() > 1, "at 320 px the render command wraps");
     }
 
     #[test]

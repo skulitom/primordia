@@ -9,7 +9,7 @@ use crate::{capture, palette, post::PostSettings, world};
 fn render_inspector_previews() {
     let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
     for width in [320, 364] {
-        for tab in ["world", "appearance", "symbiosis", "comparison", "fertility", "measurements"] {
+        for tab in ["world", "appearance", "symbiosis", "comparison", "fertility", "measurements", "tools", "library"] {
             let appearance = tab == "appearance";
             let measurements = tab == "measurements";
             let size = [width, 900];
@@ -73,11 +73,36 @@ fn render_inspector_previews() {
                                 ui.add_sized([width, 30.0], egui::Button::new(title));
                             }
                         });
-                        inspector_tabs(ui, &mut if appearance { Inspector::Look } else { Inspector::World });
+                        let mut inspector = match tab {
+                            "appearance" => Inspector::Look,
+                            "tools" => Inspector::Tools,
+                            "library" => Inspector::Library,
+                            _ => Inspector::World,
+                        };
+                        inspector_tabs(ui, &mut inspector);
                         ui.add_space(8.0);
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             ui.set_width(ui.available_width() - 6.0);
-                            if appearance {
+                            if tab == "tools" {
+                                // The app's Tools tab from the resolution down, minus what needs a window.
+                                section(ui, "Simulation resolution", SIM_SCALE_HINT);
+                                resolution_picker(ui, 0.5);
+                                let note = "50% · simulating 800×450 for a 1600×900 window · 58 fps";
+                                ui.label(RichText::new(note).small().weak());
+                                ui.separator();
+                                section(ui, "Take a tour", "Fade through every preset of every world.");
+                                ui.checkbox(&mut true, "Enable tour");
+                                ui.checkbox(&mut false, "A checkbox that is off");
+                                ui.separator();
+                                let commands = ".\\primordia list\n.\\primordia render -w reaction-diffusion -p \
+                                                \"Crescent Gliders\"\n.\\primordia explore -w reaction-diffusion --install";
+                                about(ui, "NVIDIA GeForce RTX 4090 · Vulkan · discrete GPU", commands);
+                            } else if tab == "library" {
+                                section(ui, "Saved worlds", "Keep a discovery. Return to it whenever you like.");
+                                ui.separator();
+                                eyebrow(ui, "YOUR LIBRARY · 0");
+                                empty_library(ui, ".\\primordia explore -w physarum --install");
+                            } else if appearance {
                                 section(ui, "Shape the light", "Finish the image with bloom, colour and film effects.");
                                 post.ui(ui);
                                 ui.separator();
