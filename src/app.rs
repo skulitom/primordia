@@ -35,6 +35,9 @@ const TOUR_RANGE: std::ops::RangeInclusive<f32> = 3.0..=600.0;
 const RECORD_FPS: f32 = 60.0;
 /// A second Esc within this many seconds quits.
 const QUIT_CONFIRM_SECS: f32 = 1.5;
+/// Simulation scale on integrated, virtual and software GPUs when `--sim-scale`
+/// is not given: the heaviest presets run at a few frames per second at full size.
+const WEAK_GPU_SIM_SCALE: f32 = 0.5;
 
 pub struct AppOptions {
     pub world: String,
@@ -44,7 +47,8 @@ pub struct AppOptions {
     pub window_size: Option<[u32; 2]>,
     pub fullscreen: bool,
     pub vsync: bool,
-    pub sim_scale: f32,
+    /// Simulation resolution relative to the window; `None` picks one for the GPU.
+    pub sim_scale: Option<f32>,
     pub hide_ui: bool,
     pub exit_after: Option<f32>,
     pub screenshot_dir: PathBuf,
@@ -138,6 +142,8 @@ enum Action {
     LoadWorld(usize),
     RenameWorld(usize, String),
     DeleteWorld(usize),
+    /// Rebuild the current world at this simulation scale.
+    SetSimScale(f32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +239,40 @@ struct Toast {
     secs: f32,
 }
 
+/// Why the GPU is slow to finish frames, as the log and the title bar tell it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SlowGpu {
+    /// Too early in the run to compare with earlier frames.
+    Unknown,
+    /// A frame suddenly took far longer than the ones before it: most likely
+    /// another program is competing for the GPU.
+    Contended,
+    /// Frames have been about this slow all along: the GPU needs this many
+    /// milliseconds per frame at the current simulation size.
+    Overloaded { ms: f32 },
+}
+
+impl SlowGpu {
+    /// A frame just kept us waiting `waited`; `typical` is the average frame
+    /// time before it (`None` in the first frames of a run).
+    fn classify(waited: Duration, typical: Option<Duration>) -> Self {
+        match typical {
+            None => SlowGpu::Unknown,
+            Some(typical) if waited > typical * 3 => SlowGpu::Contended,
+            Some(typical) => SlowGpu::Overloaded { ms: waited.max(typical).as_secs_f32() * 1000.0 },
+        }
+    }
+
+    /// Suffix for the window title.
+    fn title_note(self) -> String {
+        match self {
+            SlowGpu::Unknown => " · GPU busy".to_string(),
+            SlowGpu::Contended => " · GPU busy (another program may be using it heavily)".to_string(),
+            SlowGpu::Overloaded { ms } => format!(" · GPU needs ~{ms:.0} ms per frame at this size"),
+        }
+    }
+}
+
 /// Live H.264 capture of the composited frame (without UI). Frames are read
 /// back on the render thread and handed to a writer thread that feeds ffmpeg.
 struct Recorder {
@@ -291,6 +331,9 @@ struct State {
     last_instant: Instant,
     started: Instant,
     frames_since_start: u64,
+    /// Frames drawn since the scene last changed (world, preset, resolution),
+    /// when the frame-rate average started over.
+    frames_in_scene: u64,
     fps: f32,
     last_title: Instant,
     exit_after: Option<f32>,
@@ -318,10 +361,13 @@ struct State {
     frame_done: Arc<AtomicBool>,
     /// When we started waiting for a busy GPU.
     gpu_wait_since: Option<Instant>,
-    /// Until when the title shows "GPU busy" (extended by every slow frame).
+    /// Until when the title shows why the GPU is slow (extended by every slow frame).
     gpu_busy_until: Option<Instant>,
+    gpu_slow: SlowGpu,
     /// Last time a slow-GPU warning was logged (they are rate-limited).
     gpu_warned_at: Option<Instant>,
+    /// Whether the toast suggesting a lower simulation resolution was shown.
+    suggested_lower_resolution: bool,
     /// Development aid: extra GPU work per frame (`PRIMORDIA_DEBUG_GPU_STALL_MS`).
     stall: Option<crate::stall::Stall>,
 
@@ -366,6 +412,19 @@ impl State {
         let surface = instance.create_surface(window.clone()).context("creating surface")?;
         let gpu = pollster::block_on(Gpu::new(instance, Some(&surface)))?;
         let gpu_name = gpu.adapter_name();
+        let adapter = gpu.adapter.get_info();
+        // Unless told otherwise, a GPU that shares the CPU's memory starts smaller.
+        let sim_scale = opts.sim_scale.unwrap_or_else(|| default_sim_scale(adapter.device_type));
+        let reduced = opts.sim_scale.is_none() && sim_scale < 1.0;
+        if reduced {
+            log::info!(
+                "{} is {}: simulating at {:.0}% of the window's resolution \
+                 (Tools > Simulation resolution, or --sim-scale 1 for full)",
+                adapter.name,
+                adapter_kind(adapter.device_type),
+                sim_scale * 100.0
+            );
+        }
 
         let inner = window.inner_size();
         let (w, h) = (inner.width.max(1), inner.height.max(1));
@@ -391,7 +450,7 @@ impl State {
 
         let post = Post::new(&gpu, [w, h], format);
         let seed = opts.seed.unwrap_or_else(rng::time_seed);
-        let sim_size = scaled([w, h], opts.sim_scale);
+        let sim_size = scaled([w, h], sim_scale);
         let (world_index, world) = world::create(&gpu, &opts.world, sim_size, opts.preset.as_deref(), seed)?;
         let look = world.post_settings();
 
@@ -424,7 +483,7 @@ impl State {
             world_index,
             look,
             camera: Camera::default(),
-            sim_scale: opts.sim_scale,
+            sim_scale,
             modified: false,
             seed,
             world_output_size: sim_size,
@@ -448,6 +507,7 @@ impl State {
             last_instant: now,
             started: now,
             frames_since_start: 0,
+            frames_in_scene: 0,
             fps: 0.0,
             last_title: now,
             exit_after: opts.exit_after,
@@ -464,16 +524,24 @@ impl State {
             frame_done: Arc::new(AtomicBool::new(true)),
             gpu_wait_since: None,
             gpu_busy_until: None,
+            gpu_slow: SlowGpu::Unknown,
             gpu_warned_at: None,
+            suggested_lower_resolution: reduced,
             stall,
             sampler,
             history: metrics::History::default(),
             metrics_log: None,
         };
-        state.toast_for(
-            "Drag to interact · wheel zooms · middle-drag pans · H hides the panel · Space pauses".to_string(),
-            6.0,
-        );
+        let mut hint =
+            "Drag to interact · wheel zooms · middle-drag pans · H hides the panel · Space pauses".to_string();
+        if reduced {
+            hint.push_str(&format!(
+                "\nThis is {}, so worlds run at {:.0}% resolution. Tools › Simulation resolution changes it.",
+                adapter_kind(adapter.device_type),
+                sim_scale * 100.0
+            ));
+        }
+        state.toast_for(hint, if reduced { 10.0 } else { 6.0 });
         Ok(state)
     }
 
@@ -799,6 +867,19 @@ impl State {
                     Err(e) => self.toast_for(format!("Could not remove save: {e:#}"), 6.0),
                 }
             }
+            Action::SetSimScale(scale) => {
+                let previous = std::mem::replace(&mut self.sim_scale, scale);
+                match self.rebuild_world() {
+                    Ok(()) => {
+                        let [w, h] = self.world_output_size;
+                        self.toast(format!("Simulating at {:.0}% resolution ({w}×{h})", scale * 100.0));
+                    }
+                    Err(e) => {
+                        self.sim_scale = previous;
+                        self.toast_for(format!("Could not change the resolution: {e:#}"), 6.0);
+                    }
+                }
+            }
             Action::ToggleRecording => {
                 // A manual choice overrides a pending --record startup request.
                 self.record_start_in = None;
@@ -810,6 +891,29 @@ impl State {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Rebuilds the current world for the current window and simulation scale,
+    /// keeping its preset, parameters, seed, appearance and camera. The
+    /// simulation restarts; the current world stays if the new one fails.
+    fn rebuild_world(&mut self) -> Result<()> {
+        let size = scaled(self.target_size(), self.sim_scale);
+        self.gpu.wait_idle();
+        self.gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let created = rebuilt(&self.gpu, self.world_index, &*self.world, size, self.seed);
+        let oom = pollster::block_on(self.gpu.device.pop_error_scope());
+        let world = created?;
+        if let Some(err) = oom {
+            drop(world);
+            log::error!("out of GPU memory: {err}");
+            return Err(anyhow!("not enough GPU memory for {}×{}", size[0], size[1]));
+        }
+        self.world = world;
+        self.world_output_size = size;
+        self.reset_measurements(false);
+        let percent = self.sim_scale * 100.0;
+        log::info!("rebuilt {} at {}x{} ({percent:.0}% resolution)", self.world.name(), size[0], size[1]);
         Ok(())
     }
 
@@ -860,11 +964,13 @@ impl State {
         }
     }
 
-    /// The run restarted: forget its traces. A world change also closes the
-    /// log, because the columns (and the frame counter) would no longer match.
+    /// The run restarted: forget its traces and its frame-rate average. A world
+    /// change also closes the log, because the columns (and the frame counter)
+    /// would no longer match.
     fn reset_measurements(&mut self, world_changed: bool) {
         self.history.clear();
         self.sampler.discard();
+        self.restart_frame_clock();
         if world_changed {
             self.stop_metrics_log(Some("the world changed"));
         }
@@ -907,7 +1013,9 @@ impl State {
     fn report_oom(&mut self, err: &wgpu::Error) {
         log::error!("out of GPU memory: {err}");
         self.toast_for(
-            "Out of GPU memory. Close other GPU-heavy programs, or make the window smaller.".to_string(),
+            "Out of GPU memory. Close other GPU-heavy programs, make the window smaller \
+             or lower Tools › Simulation resolution."
+                .to_string(),
             6.0,
         );
     }
@@ -974,7 +1082,7 @@ impl State {
 
     /// True when the GPU has finished the previous frame, so a new frame may
     /// acquire the next swapchain image. Notes (in the log and the title bar)
-    /// when another program keeps the GPU busy for a long time.
+    /// when frames keep the GPU busy for a long time, and why that seems to be.
     fn gpu_ready(&mut self) -> bool {
         let _ = self.gpu.device.poll(wgpu::PollType::Poll);
         let now = Instant::now();
@@ -983,6 +1091,7 @@ impl State {
                 let waited = now - since;
                 if waited > Duration::from_millis(250) {
                     self.gpu_busy_until = Some(now + Duration::from_secs(5));
+                    self.gpu_slow = SlowGpu::classify(waited, self.typical_frame_time());
                     self.warn_gpu_busy(&format!("waited {:.1}s for the GPU to finish a frame", waited.as_secs_f32()));
                 }
             }
@@ -991,6 +1100,7 @@ impl State {
         let since = *self.gpu_wait_since.get_or_insert(now);
         if now - since > Duration::from_millis(1500) && self.gpu_busy_until.is_none_or(|t| t <= now) {
             self.gpu_busy_until = Some(now + Duration::from_secs(5));
+            self.gpu_slow = SlowGpu::classify(now - since, self.typical_frame_time());
             self.warn_gpu_busy("the GPU is taking very long to finish frames");
             let title = self.title();
             self.window.set_title(&title);
@@ -998,21 +1108,60 @@ impl State {
         false
     }
 
-    /// Logs a slow-GPU warning, at most once every 10 seconds.
+    /// The average time between frames so far, once there are enough of them
+    /// to compare a slow frame with.
+    fn typical_frame_time(&self) -> Option<Duration> {
+        (self.frames_in_scene >= 10 && self.fps > 0.0).then(|| Duration::from_secs_f32(1.0 / self.fps))
+    }
+
+    /// Starts the frame-rate average over after the scene changed, so a
+    /// heavier world is not compared with the lighter one before it (and the
+    /// time spent building it does not count as a frame).
+    fn restart_frame_clock(&mut self) {
+        self.fps = 0.0;
+        self.frames_in_scene = 0;
+        self.last_instant = Instant::now();
+    }
+
+    /// Logs a slow-GPU warning, at most once every 10 seconds, with its likely
+    /// cause. The first time the simulation itself is too big for the GPU, a
+    /// toast suggests a lower resolution.
     fn warn_gpu_busy(&mut self, what: &str) {
+        if self.gpu_slow == SlowGpu::Unknown {
+            // Often a new world's setup work; the next slow frame will say more.
+            log::debug!("{what}");
+            return;
+        }
         let now = Instant::now();
         if self.gpu_warned_at.is_none_or(|t| now - t > Duration::from_secs(10)) {
             self.gpu_warned_at = Some(now);
-            log::warn!("{what}; another program may be using the GPU heavily");
+            let [w, h] = self.world_output_size;
+            match self.gpu_slow {
+                SlowGpu::Unknown => {}
+                SlowGpu::Contended => log::warn!("{what}; another program may be using the GPU heavily"),
+                SlowGpu::Overloaded { ms } => log::warn!(
+                    "{what}; this GPU needs about {ms:.0} ms per frame to simulate {w}x{h} \
+                     (lower Tools > Simulation resolution, or start with --sim-scale 0.5)"
+                ),
+            }
+        }
+        if let SlowGpu::Overloaded { ms } = self.gpu_slow {
+            if !self.suggested_lower_resolution && self.sim_scale > theme::SIM_SCALES[0] {
+                self.suggested_lower_resolution = true;
+                let text = format!(
+                    "This GPU needs about {ms:.0} ms per frame here. Tools › Simulation resolution speeds it up."
+                );
+                self.toast_for(text, 8.0);
+            }
         }
     }
 
     fn title(&self) -> String {
         let paused = if self.paused { " · paused" } else { "" };
         let busy = if self.gpu_busy_until.is_some_and(|t| Instant::now() < t) {
-            " · GPU busy (another program may be using it heavily)"
+            self.gpu_slow.title_note()
         } else {
-            ""
+            String::new()
         };
         format!("Primordia — {} · {} — {:.0} fps{paused}{busy}", self.world.name(), self.preset_label(), self.fps)
     }
@@ -1032,6 +1181,7 @@ impl State {
             self.fps = if self.fps == 0.0 { 1.0 / elapsed } else { self.fps * 0.95 + 0.05 / elapsed };
         }
         self.frames_since_start += 1;
+        self.frames_in_scene += 1;
         if let Some(n) = self.record_start_in {
             if n == 0 {
                 self.record_start_in = None;
@@ -1548,7 +1698,7 @@ impl State {
                     egui::RichText::new("World-specific colours and materials are in the World tab.").small().weak(),
                 );
             }
-            Inspector::Tools => self.draw_tools(ui),
+            Inspector::Tools => self.draw_tools(ui, actions),
             Inspector::Library => self.draw_library(ui, actions),
         }
         ui.add_space(12.0);
@@ -1617,7 +1767,7 @@ impl State {
         ui.label(egui::RichText::new(format!("Library folder\n{}", self.library.directory.display())).small().weak());
     }
 
-    fn draw_tools(&mut self, ui: &mut egui::Ui) {
+    fn draw_tools(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         theme::section(ui, "Interact & explore", self.world.controls_hint());
         ui.add(crate::ui::Slider::new(&mut self.brush_pts, 2.0..=400.0).logarithmic(true).text("Brush radius"));
         ui.add(crate::ui::Slider::new(&mut self.camera.zoom, 0.5..=64.0).logarithmic(true).suffix("×").text("Zoom"));
@@ -1631,6 +1781,23 @@ impl State {
             }
         });
         ui.label(egui::RichText::new("Scroll to zoom · Middle-drag to pan").small().weak());
+        ui.add_space(8.0);
+        ui.separator();
+        theme::section(ui, "Simulation resolution", theme::SIM_SCALE_HINT);
+        if let Some(scale) = theme::resolution_picker(ui, self.sim_scale) {
+            actions.push(Action::SetSimScale(scale));
+        }
+        let [w, h] = self.world_output_size;
+        let [tw, th] = self.target_size();
+        ui.label(
+            egui::RichText::new(format!(
+                "{:.0}% · simulating {w}×{h} for a {tw}×{th} window · {:.0} fps",
+                self.sim_scale * 100.0,
+                self.fps
+            ))
+            .small()
+            .weak(),
+        );
         ui.add_space(8.0);
         ui.separator();
         theme::section(ui, "Take a tour", "Fade through every preset of every world.");
@@ -1804,6 +1971,38 @@ fn capture_stem(world: &str, preset: &str, mutated: bool, seed: u64, timestamp: 
     format!("{world}_{}{mutated}_s{seed}_{timestamp}", headless::slug(preset))
 }
 
+/// A fresh copy of `world` (`WORLDS[index]`) for an output of `size`, with the
+/// same preset and parameters, started from `seed`. Worlds without a
+/// saved-settings recipe come back as their preset.
+fn rebuilt(gpu: &Gpu, index: usize, world: &dyn World, size: [u32; 2], seed: u64) -> Result<Box<dyn World>> {
+    let settings = world.settings().ok();
+    let mut copy = world::create_at(gpu, index, size, Some(world.preset()), seed)?;
+    if let Some(settings) = &settings {
+        copy.restore_settings(gpu, settings, seed)?;
+    }
+    Ok(copy)
+}
+
+/// Simulation scale when `--sim-scale` is not given: integrated, virtual and
+/// software GPUs start at [`WEAK_GPU_SIM_SCALE`].
+fn default_sim_scale(device: wgpu::DeviceType) -> f32 {
+    match device {
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Cpu => WEAK_GPU_SIM_SCALE,
+        wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::Other => 1.0,
+    }
+}
+
+/// "an integrated GPU", "a discrete GPU", ... for messages.
+fn adapter_kind(device: wgpu::DeviceType) -> &'static str {
+    match device {
+        wgpu::DeviceType::IntegratedGpu => "an integrated GPU",
+        wgpu::DeviceType::DiscreteGpu => "a discrete GPU",
+        wgpu::DeviceType::VirtualGpu => "a virtual GPU",
+        wgpu::DeviceType::Cpu => "a software renderer",
+        wgpu::DeviceType::Other => "a GPU of unknown type",
+    }
+}
+
 /// Title-bar and taskbar icons for a window on a display with this scale factor.
 fn with_icons(mut attrs: WindowAttributes, scale_factor: f64) -> WindowAttributes {
     let icon = |points: f64| {
@@ -1872,6 +2071,55 @@ mod tests {
         let stem = capture_stem("physarum", "Dendrites", false, 7, &utc_timestamp());
         assert!(stem.starts_with("physarum_dendrites_s7_20"), "{stem}");
         assert!(stem.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)), "{stem}");
+    }
+
+    #[test]
+    fn a_resolution_change_keeps_every_worlds_preset_and_parameters() {
+        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
+        let mut shrunk = 0;
+        for (index, entry) in WORLDS.iter().enumerate() {
+            let mut world = world::create_at(&gpu, index, [320, 180], Some(1), 7).unwrap();
+            world.mutate(&gpu, 8);
+            let copy = rebuilt(&gpu, index, &*world, [160, 90], 9).unwrap();
+            // (Lenia's mutation may start from another preset.)
+            assert_eq!(copy.preset(), world.preset(), "{}", entry.id);
+            let json = |w: &dyn World| w.settings().map(|s| serde_json::to_value(s).unwrap()).ok();
+            assert_eq!(json(&*copy), json(&*world), "{} lost its parameters", entry.id);
+            // Particle Life's domain does not follow the output size; the grid worlds' does.
+            assert!(copy.size()[0] <= world.size()[0], "{} grew", entry.id);
+            shrunk += usize::from(copy.size()[0] < world.size()[0]);
+        }
+        assert!(shrunk >= 3, "only {shrunk} worlds simulate fewer cells at a lower resolution");
+    }
+
+    #[test]
+    fn weak_gpus_start_at_half_resolution() {
+        use wgpu::DeviceType as D;
+        assert_eq!(default_sim_scale(D::DiscreteGpu), 1.0);
+        assert_eq!(default_sim_scale(D::Other), 1.0);
+        for weak in [D::IntegratedGpu, D::VirtualGpu, D::Cpu] {
+            assert_eq!(default_sim_scale(weak), WEAK_GPU_SIM_SCALE);
+        }
+        // Every picker option is a scale `scaled` accepts unchanged.
+        for scale in theme::SIM_SCALES {
+            assert_eq!(scaled([1600, 900], scale), [(1600.0 * scale) as u32, (900.0 * scale) as u32]);
+        }
+    }
+
+    #[test]
+    fn slow_frames_blame_another_program_only_when_they_are_sudden() {
+        let ms = Duration::from_millis;
+        // Nothing to compare with yet.
+        assert_eq!(SlowGpu::classify(ms(900), None), SlowGpu::Unknown);
+        // 16 ms frames, then one takes 1.5 s: something else wants the GPU.
+        assert_eq!(SlowGpu::classify(ms(1500), Some(ms(16))), SlowGpu::Contended);
+        // Frames have taken about a third of a second all along: the simulation is too big.
+        assert_eq!(SlowGpu::classify(ms(320), Some(ms(330))), SlowGpu::Overloaded { ms: 330.0 });
+        assert_eq!(SlowGpu::classify(ms(600), Some(ms(330))), SlowGpu::Overloaded { ms: 600.0 });
+        assert!(SlowGpu::Contended.title_note().contains("another program"));
+        let note = SlowGpu::Overloaded { ms: 330.4 }.title_note();
+        assert!(note.contains("330 ms per frame") && !note.contains("another program"), "{note}");
+        assert!(!SlowGpu::Unknown.title_note().contains("another program"));
     }
 
     #[test]

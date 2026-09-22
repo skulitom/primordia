@@ -469,6 +469,38 @@ pub fn measurements(
     toggle_log
 }
 
+/// Simulation resolutions offered in the Tools tab, as fractions of the
+/// window's pixel size.
+pub const SIM_SCALES: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+
+/// Description of the Tools tab's "Simulation resolution" section.
+pub const SIM_SCALE_HINT: &str =
+    "Lower is faster on laptops and integrated GPUs. Changing it restarts this world from its seed.";
+
+/// One button per entry of [`SIM_SCALES`], the one equal to `current`
+/// highlighted (none, after `--sim-scale` chose another value). Returns the
+/// scale clicked.
+pub fn resolution_picker(ui: &mut egui::Ui, current: f32) -> Option<f32> {
+    let labels = SIM_SCALES.map(|scale| format!("{:.0}%", scale * 100.0));
+    let widths = button_widths(ui, labels.each_ref().map(String::as_str));
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        for ((scale, label), width) in SIM_SCALES.into_iter().zip(&labels).zip(widths) {
+            let active = (scale - current).abs() < 1e-3;
+            let text = RichText::new(label.as_str()).color(if active { ACCENT } else { TEXT });
+            if ui
+                .add_sized([width, 30.0], egui::Button::new(text).selected(active))
+                .on_hover_text(format!("Simulate at {label} of the window's pixel size"))
+                .clicked()
+                && !active
+            {
+                picked = Some(scale);
+            }
+        }
+    });
+    picked
+}
+
 /// Repaints the checked checkboxes of a finished frame as accent-filled boxes
 /// with a bold dark tick. egui paints every checkbox, the worlds' ones included,
 /// as a box in the colours of the widget's state followed, when checked, by a

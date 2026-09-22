@@ -250,9 +250,9 @@ struct RunArgs {
     /// Disable vsync (uncapped frame rate)
     #[arg(long)]
     no_vsync: bool,
-    /// Simulation resolution relative to the window's pixel size
-    #[arg(long, default_value_t = 1.0, value_parser = finite_float)]
-    sim_scale: f32,
+    /// Simulation resolution relative to the window's pixel size [default: 1; 0.5 on integrated and software GPUs]
+    #[arg(long, value_parser = finite_float)]
+    sim_scale: Option<f32>,
     /// Start with the control panel hidden (H or Tab shows it)
     #[arg(long)]
     hide_ui: bool,
