@@ -18,6 +18,8 @@ pub const BACKEND_ENV: &str = "WGPU_BACKEND";
 pub const ADAPTER_NAME_ENV: &str = "WGPU_ADAPTER_NAME";
 /// The values of [`BACKEND_ENV`] worth suggesting.
 const BACKEND_VALUES: &str = "vulkan, dx12, metal, gl";
+/// Where the panic hook asks people to report internal failures.
+pub const ISSUES_URL: &str = "https://github.com/skulitom/primordia/issues";
 
 /// What wgpu needs on this platform, for the no-GPU message.
 const GRAPHICS_APIS: &str = if cfg!(target_os = "macos") {
@@ -27,6 +29,9 @@ const GRAPHICS_APIS: &str = if cfg!(target_os = "macos") {
 } else {
     "Vulkan"
 };
+
+/// Backend and name of the adapter the last [`Gpu::new`] opened, for the panic hook.
+static ADAPTER_IN_USE: Mutex<Option<(wgpu::Backend, String)>> = Mutex::new(None);
 
 /// Hold this before creating an instance and until its GPU is dropped. The
 /// Windows Vulkan loader can crash during concurrent instance creation/drop
@@ -102,6 +107,7 @@ impl Gpu {
 
         let info = adapter.get_info();
         log::info!("GPU: {}", describe_adapter(&info));
+        *ADAPTER_IN_USE.lock().unwrap_or_else(PoisonError::into_inner) = Some((info.backend, info.name.clone()));
         if info.backend == wgpu::Backend::Dx12 {
             log::info!(
                 "DirectX 12 compiles shaders slowly: each world takes a minute or two to start, Lenia several \
@@ -430,6 +436,55 @@ fn backend_env_warning(value: &str) -> Option<String> {
     }
 }
 
+/// Turns a panic into a short report instead of Rust's default message:
+/// "error: internal failure on <backend> (<adapter>): <message>", where it
+/// happened, a hint to try another graphics backend and where to report it,
+/// then exits with status 3. `RUST_BACKTRACE=1` adds a backtrace. Call it
+/// first thing in `main`.
+#[allow(dead_code)] // until `main` calls it
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        let in_use = ADAPTER_IN_USE.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let adapter = in_use.as_ref().map(|(backend, name)| (*backend, name.as_str()));
+        let location = info.location().map(ToString::to_string);
+        eprintln!("{}", panic_report(adapter, message, location.as_deref()));
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            eprintln!("{backtrace}");
+        }
+        std::process::exit(3);
+    }));
+}
+
+/// The panic hook's report for a panic with `message` at `location`, while
+/// `adapter` (backend and name) was in use.
+fn panic_report(adapter: Option<(wgpu::Backend, &str)>, message: &str, location: Option<&str>) -> String {
+    let mut report = match adapter {
+        Some((backend, name)) => format!("error: internal failure on {backend:?} ({name}): {message}"),
+        None => format!("error: internal failure: {message}"),
+    };
+    if let Some(location) = location {
+        report += &format!("\n  at {location}");
+    }
+    let backend = adapter.map(|(backend, _)| backend);
+    if backend != Some(wgpu::Backend::Vulkan) {
+        report += &format!("\nAnother graphics backend may avoid it: run again with {BACKEND_ENV}=vulkan.");
+    } else if cfg!(windows) {
+        report += &format!("\nAnother graphics backend may avoid it: run again with {BACKEND_ENV}=dx12.");
+    }
+    report += &format!(
+        "\nThis is a bug in Primordia or in the graphics driver. Please report it at {ISSUES_URL} \
+         with this message and the output of `primordia selftest`."
+    );
+    report
+}
+
 /// Records a render pass that draws the fullscreen triangle once into `target`.
 /// `clear = None` keeps (loads) the existing contents, e.g. for additive blending.
 pub fn fullscreen_pass(
@@ -636,5 +691,24 @@ mod tests {
         assert!(backend_env_warning("").is_some(), "an empty value disables every backend");
         let partly = backend_env_warning("vulkan,bogus,dx13").unwrap();
         assert!(partly.starts_with("WGPU_BACKEND: ignoring unknown backend 'bogus', 'dx13'"), "{partly}");
+    }
+
+    #[test]
+    fn panic_reports_name_the_backend_and_where_to_report() {
+        let location = Some("src/world/lenia.rs:1:1");
+        let dx12 = panic_report(Some((Backend::Dx12, "NVIDIA GeForce RTX 4090")), "boom", location);
+        let lines: Vec<&str> = dx12.lines().collect();
+        assert_eq!(lines[0], "error: internal failure on Dx12 (NVIDIA GeForce RTX 4090): boom");
+        assert_eq!(lines[1], "  at src/world/lenia.rs:1:1");
+        assert!(lines[2].contains("WGPU_BACKEND=vulkan"), "{dx12}");
+        assert!(lines[3].contains(ISSUES_URL), "{dx12}");
+        // Before any GPU is open there is no backend to name.
+        let early = panic_report(None, "boom", None);
+        assert!(early.starts_with("error: internal failure: boom\n"), "{early}");
+        assert!(early.contains("WGPU_BACKEND=vulkan") && early.contains(ISSUES_URL), "{early}");
+        // On Vulkan the hint points elsewhere (DirectX 12 on Windows).
+        let vulkan = panic_report(Some((Backend::Vulkan, "GPU")), "boom", None);
+        assert!(!vulkan.contains("WGPU_BACKEND=vulkan"), "{vulkan}");
+        assert_eq!(vulkan.contains("WGPU_BACKEND=dx12"), cfg!(windows), "{vulkan}");
     }
 }
