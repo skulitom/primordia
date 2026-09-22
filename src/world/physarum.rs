@@ -69,7 +69,7 @@ const VEIN_X: f32 = 4.0;
 const TRAVELLED_G: f32 = 0.25;
 
 /// Lane order of `physarum_measure.wgsl`.
-const METRICS: &[MetricDesc] = &[
+pub(crate) const METRICS: &[MetricDesc] = &[
     MetricDesc {
         id: "ground",
         label: "Marked ground",
@@ -333,6 +333,11 @@ static OWN_PALETTES: [Palette; 6] = [
 
 fn palette_count() -> usize {
     OWN_PALETTES.len() + PALETTES.len()
+}
+
+/// Every palette a recipe can name: this world's own, then the shared ones.
+pub(crate) fn palette_names() -> Vec<&'static str> {
+    (0..palette_count()).map(|i| palette_at(i).name).collect()
 }
 
 /// Palette `i` of this world's list: its own palettes, then the shared ones.
@@ -871,7 +876,7 @@ const PRESETS: &[Preset] = &[
     },
 ];
 
-fn preset_names() -> &'static [&'static str] {
+pub(crate) fn preset_names() -> &'static [&'static str] {
     static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
     NAMES.get_or_init(|| PRESETS.iter().map(|p| p.name).collect())
 }

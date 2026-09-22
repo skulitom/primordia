@@ -1988,6 +1988,7 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "strsim",
  "tempfile",
  "wgpu",
  "winit",

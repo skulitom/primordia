@@ -51,6 +51,22 @@ pub enum Unit {
 }
 
 impl Unit {
+    /// Name in `primordia list` and its JSON.
+    pub fn name(self) -> &'static str {
+        match self {
+            Unit::Fraction => "fraction",
+            Unit::Scalar => "scalar",
+        }
+    }
+
+    /// Bounds every value of this unit stays within, if any.
+    pub fn range(self) -> Option<[f32; 2]> {
+        match self {
+            Unit::Fraction => Some([0.0, 1.0]),
+            Unit::Scalar => None,
+        }
+    }
+
     /// Compact text for the panel; non-finite values show as a dash.
     pub fn format(self, value: f32) -> String {
         if !value.is_finite() {
@@ -767,8 +783,10 @@ mod tests {
         assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
     }
 
+    /// The tables themselves are checked without a GPU in `world::tests`; this
+    /// checks that the worlds publish exactly the registered tables.
     #[test]
-    fn every_world_publishes_a_valid_metric_table_and_finite_measurements() {
+    fn every_world_publishes_its_registered_tables_and_finite_measurements() {
         use crate::world::{Frame, ViewXform, WORLDS};
         let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let mut sampler = Sampler::new(&gpu, 2);
@@ -776,18 +794,10 @@ mod tests {
             let size = [96, 64];
             let (_, mut world) = crate::world::create(&gpu, entry.id, size, None, 1).unwrap();
             let metrics = world.metrics();
-            assert!(metrics.len() <= MAX_METRICS, "{}: too many metrics", entry.id);
-            for (i, metric) in metrics.iter().enumerate() {
-                assert!(
-                    !metric.id.is_empty()
-                        && metric.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-                    "{}: metric id '{}' is not a CSV-friendly identifier",
-                    entry.id,
-                    metric.id
-                );
-                assert!(metrics[..i].iter().all(|m| m.id != metric.id), "{}: duplicate id '{}'", entry.id, metric.id);
-                assert!(!metric.label.is_empty() && !metric.hint.is_empty(), "{}: {} lacks a label or hint", entry.id, metric.id);
-            }
+            let ids = |table: &[MetricDesc]| table.iter().map(|m| m.id).collect::<Vec<_>>();
+            assert_eq!(ids(metrics), ids(entry.metrics), "{}: metric table differs from the registry", entry.id);
+            assert_eq!(world.presets(), (entry.presets)(), "{}: presets differ from the registry", entry.id);
+            assert_eq!(world.id(), entry.id);
             let view = ViewXform::fit(world.size(), size, &crate::world::Camera::default());
             for frame in 0..3u64 {
                 let frame = Frame {

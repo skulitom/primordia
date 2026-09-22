@@ -26,6 +26,9 @@
 //!   scalars of its state on the GPU right after `step`, and the engine reads
 //!   them back asynchronously for the panel's sparklines and CSV logs
 //!   ([`crate::metrics`]).
+//! * The static facts about a world (presets, measurements, palettes) are also
+//!   registered in [`WORLDS`], so names resolve and `primordia list` works
+//!   before (or without) a GPU.
 
 pub mod lenia;
 pub mod particle_life;
@@ -34,9 +37,12 @@ pub mod placeholder;
 pub mod reaction_diffusion;
 pub mod symbiosis;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
+use crate::failure::Failure;
 use crate::gpu::Gpu;
+use crate::metrics::MetricDesc;
+use crate::palette;
 use crate::post::PostSettings;
 
 /// Maps screen uv (0..1, y down) to world uv: `world = screen * scale + offset`.
@@ -123,7 +129,7 @@ pub trait World {
     /// Simulation domain size in cells (used for aspect ratio and brush size).
     fn size(&self) -> [u32; 2];
 
-    /// Names of the built-in presets.
+    /// Names of the built-in presets (the same table as [`WorldEntry::presets`]).
     fn presets(&self) -> &'static [&'static str];
     /// Index of the active preset (or of the preset the current parameters came from).
     fn preset(&self) -> usize;
@@ -160,6 +166,7 @@ pub trait World {
     /// Scalar measurements this world computes on the GPU every frame
     /// (`&[]` = none). The order is the lane order of the totals record the
     /// world pushes in [`World::measure`] and the column order of CSV logs.
+    /// It is the table registered as [`WorldEntry::metrics`].
     fn metrics(&self) -> &'static [crate::metrics::MetricDesc] {
         &[]
     }
@@ -190,11 +197,28 @@ pub trait World {
     }
 }
 
+/// A registered world: everything the app, the CLI and `primordia list` know
+/// about it without a GPU, plus its constructor.
 pub struct WorldEntry {
     pub id: &'static str,
     pub name: &'static str,
+    /// Other names `--world` accepts (whole, ignoring case and punctuation).
     pub aliases: &'static [&'static str],
     pub tagline: &'static str,
+    /// Names of the built-in presets: the table [`World::presets`] returns.
+    pub presets: fn() -> &'static [&'static str],
+    /// The measurement table [`World::metrics`] returns.
+    pub metrics: &'static [MetricDesc],
+    /// Measurements that must stay above zero for an explore candidate to count
+    /// as alive: a dead, empty or frozen world is novel in behaviour space but
+    /// never worth an archive slot (`--keep-inert` lifts the rule).
+    pub vital: &'static [&'static str],
+    /// Colour palettes the world's recipes can name, in menu order.
+    pub palettes: fn() -> Vec<&'static str>,
+    /// Where a recipe (`library::WorldSettings`) picks from `palettes`: `palette`
+    /// holds one name, Lenia's `palettes` one name per channel, and Particle
+    /// Life's `params.colors` a colour scheme by 0-based index.
+    pub palette_setting: &'static str,
     /// Creates the world sized for an output of `output_size` pixels.
     pub create: fn(&Gpu, [u32; 2], u64) -> Box<dyn World>,
 }
@@ -205,6 +229,11 @@ pub const WORLDS: &[WorldEntry] = &[
         name: "Physarum",
         aliases: &["slime", "slime-mold", "slime-mould", "mold", "mould"],
         tagline: "Millions of slime-mould agents weaving living transport networks",
+        presets: physarum::preset_names,
+        metrics: physarum::METRICS,
+        vital: &["ground"],
+        palettes: physarum::palette_names,
+        palette_setting: "palette",
         create: physarum::create,
     },
     WorldEntry {
@@ -212,6 +241,11 @@ pub const WORLDS: &[WorldEntry] = &[
         name: "Particle Life",
         aliases: &["particles", "particlelife", "pl", "life"],
         tagline: "Species with asymmetric attractions self-assemble into cells and creatures",
+        presets: particle_life::preset_names,
+        metrics: particle_life::METRICS,
+        vital: &["speed"],
+        palettes: particle_life::scheme_names,
+        palette_setting: "params.colors",
         create: particle_life::create,
     },
     WorldEntry {
@@ -219,6 +253,11 @@ pub const WORLDS: &[WorldEntry] = &[
         name: "Lenia",
         aliases: &["smoothlife", "continuous-ca"],
         tagline: "Continuous cellular automata that grow soft, gliding organisms",
+        presets: lenia::preset_names,
+        metrics: lenia::METRICS,
+        vital: &["mass", "active"],
+        palettes: palette::names,
+        palette_setting: "palettes",
         create: lenia::create,
     },
     WorldEntry {
@@ -226,6 +265,11 @@ pub const WORLDS: &[WorldEntry] = &[
         name: "Reaction-Diffusion",
         aliases: &["rd", "gray-scott", "grayscott", "turing", "coral"],
         tagline: "Gray-Scott chemistry painting coral, mitosis and fingerprints",
+        presets: reaction_diffusion::preset_names,
+        metrics: reaction_diffusion::METRICS,
+        vital: &["alive", "active"],
+        palettes: palette::names,
+        palette_setting: "palette",
         create: reaction_diffusion::create,
     },
     WorldEntry {
@@ -233,46 +277,168 @@ pub const WORLDS: &[WorldEntry] = &[
         name: "Symbiosis",
         aliases: &["coupled", "hybrid", "ecosystem"],
         tagline: "Trail-following agents and living chemistry shape each other",
+        presets: symbiosis::preset_names,
+        metrics: symbiosis::METRICS,
+        vital: &["growth_cover", "growth_active"],
+        palettes: palette::names,
+        palette_setting: "palette",
         create: symbiosis::create,
     },
 ];
+
+// --- name lookup -------------------------------------------------------------------
 
 fn normalize(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
 }
 
-/// Finds a world by id, name, alias, 1-based index or unambiguous prefix.
+/// Why a name did not pick exactly one entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Miss {
+    /// Nothing matches; `suggestion` is a close spelling, when there is one.
+    Unknown { suggestion: Option<&'static str> },
+    /// The name is a prefix of several entries.
+    Ambiguous(Vec<&'static str>),
+    /// A number outside `1..=count`.
+    OutOfRange,
+}
+
+/// A world, preset or measurement name that did not resolve. It is invalid
+/// input (exit status 2, see [`crate::failure`]); the message names the choices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameError {
+    /// `"world"`, `"preset"` or `"measurement"`.
+    pub what: &'static str,
+    /// The world a preset or measurement was looked up in.
+    pub world: Option<usize>,
+    pub query: String,
+    pub miss: Miss,
+    /// Every valid name in order; worlds and presets also take their 1-based number.
+    pub available: Vec<&'static str>,
+}
+
+/// "a, b or c".
+fn either(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+impl std::fmt::Display for NameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (what, query, count) = (self.what, &self.query, self.available.len());
+        let owner = self.world.map(|w| format!(" for {}", WORLDS[w].name)).unwrap_or_default();
+        let list = match self.world {
+            Some(w) => format!("`primordia list --world {}`", WORLDS[w].id),
+            None => "`primordia list`".to_string(),
+        };
+        match &self.miss {
+            Miss::Unknown { suggestion } => {
+                write!(f, "unknown {what} '{query}'{owner}")?;
+                if let Some(s) = suggestion {
+                    write!(f, "; did you mean '{s}'?")?;
+                }
+                let numbers = if what == "measurement" { String::new() } else { format!(", or 1-{count}") };
+                write!(f, " (available: {}{numbers}; see {list})", self.available.join(", "))
+            }
+            Miss::Ambiguous(candidates) => write!(f, "ambiguous {what} '{query}'{owner}: it could be {}", either(candidates)),
+            Miss::OutOfRange => {
+                let range = match self.world {
+                    Some(w) => format!("{} has {what}s 1-{count}", WORLDS[w].name),
+                    None => format!("there are {what}s 1-{count}"),
+                };
+                write!(f, "{what} {query} is out of range: {range} ({})", self.available.join(", "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
+
+/// The spelling in `names` closest to `query`, if `query` looks like a typo of it.
+fn suggest(query: &str, names: impl IntoIterator<Item = &'static str>) -> Option<&'static str> {
+    let q = normalize(query);
+    if q.is_empty() {
+        return None;
+    }
+    names
+        .into_iter()
+        .map(|name| (name, strsim::jaro_winkler(&q, &normalize(name))))
+        .filter(|(_, score)| *score >= 0.8)
+        // The first of equally close spellings: an id before its display name or aliases.
+        .min_by(|a, b| b.1.total_cmp(&a.1))
+        .map(|(name, _)| name)
+}
+
+/// Resolves `query` among `names`: a 1-based number, a name or one of the
+/// `aliases(i)` of entry `i` (whole, ignoring case and punctuation), or a
+/// prefix of exactly one name.
+fn lookup(names: &[&'static str], aliases: impl Fn(usize) -> Vec<&'static str>, query: &str) -> Result<usize, Miss> {
+    let q = normalize(query);
+    if !q.is_empty() && q.bytes().all(|b| b.is_ascii_digit()) {
+        return match q.parse::<usize>() {
+            Ok(n) if (1..=names.len()).contains(&n) => Ok(n - 1),
+            _ => Err(Miss::OutOfRange),
+        };
+    }
+    let exact = |i: usize| normalize(names[i]) == q || aliases(i).iter().any(|a| normalize(a) == q);
+    if let Some(i) = (0..names.len()).find(|&i| exact(i)) {
+        return Ok(i);
+    }
+    let prefixed: Vec<usize> =
+        (0..names.len()).filter(|&i| !q.is_empty() && normalize(names[i]).starts_with(&q)).collect();
+    match prefixed[..] {
+        [i] => Ok(i),
+        [] => {
+            let spellings = (0..names.len()).flat_map(|i| std::iter::once(names[i]).chain(aliases(i)));
+            Err(Miss::Unknown { suggestion: suggest(query, spellings) })
+        }
+        _ => Err(Miss::Ambiguous(prefixed.iter().map(|&i| names[i]).collect())),
+    }
+}
+
+/// Resolves a world by id, name, alias, 1-based number or a prefix of one id.
+pub fn resolve(query: &str) -> Result<usize, NameError> {
+    let ids: Vec<&'static str> = WORLDS.iter().map(|w| w.id).collect();
+    let aliases = |i: usize| std::iter::once(WORLDS[i].name).chain(WORLDS[i].aliases.iter().copied()).collect();
+    lookup(&ids, aliases, query)
+        .map_err(|miss| NameError { what: "world", world: None, query: query.to_string(), miss, available: ids.clone() })
+}
+
+/// Resolves a preset of world `world` by name, 1-based number or a prefix of one name.
+pub fn resolve_preset(world: usize, query: &str) -> Result<usize, NameError> {
+    let names = (WORLDS[world].presets)();
+    lookup(names, |_| Vec::new(), query).map_err(|miss| NameError {
+        what: "preset",
+        world: Some(world),
+        query: query.to_string(),
+        miss,
+        available: names.to_vec(),
+    })
+}
+
+/// Resolves a measurement id of world `world` (exactly: ids are CSV column names).
+pub fn resolve_metric(world: usize, id: &str) -> Result<usize, NameError> {
+    let metrics = WORLDS[world].metrics;
+    let ids: Vec<&'static str> = metrics.iter().map(|m| m.id).collect();
+    ids.iter().position(|m| *m == id).ok_or_else(|| NameError {
+        what: "measurement",
+        world: Some(world),
+        query: id.to_string(),
+        miss: Miss::Unknown { suggestion: suggest(id, ids.iter().copied()) },
+        available: ids.clone(),
+    })
+}
+
+/// Finds a world by id, name, alias, 1-based number or unambiguous prefix.
 pub fn find(query: &str) -> Option<usize> {
-    let q = normalize(query);
-    if let Ok(n) = q.parse::<usize>() {
-        return (1..=WORLDS.len()).contains(&n).then(|| n - 1);
-    }
-    let exact = WORLDS.iter().position(|w| {
-        normalize(w.id) == q || normalize(w.name) == q || w.aliases.iter().any(|a| normalize(a) == q)
-    });
-    if exact.is_some() {
-        return exact;
-    }
-    let prefixed: Vec<usize> =
-        (0..WORLDS.len()).filter(|&i| !q.is_empty() && normalize(WORLDS[i].id).starts_with(&q)).collect();
-    (prefixed.len() == 1).then(|| prefixed[0])
+    resolve(query).ok()
 }
 
-/// Finds a preset by 1-based index, name, or unambiguous prefix (case/punctuation-insensitive).
-pub fn find_preset(presets: &[&str], query: &str) -> Option<usize> {
-    let q = normalize(query);
-    if let Ok(n) = q.parse::<usize>() {
-        return (1..=presets.len()).contains(&n).then(|| n - 1);
-    }
-    if let Some(i) = presets.iter().position(|p| normalize(p) == q) {
-        return Some(i);
-    }
-    let prefixed: Vec<usize> =
-        (0..presets.len()).filter(|&i| !q.is_empty() && normalize(presets[i]).starts_with(&q)).collect();
-    (prefixed.len() == 1).then(|| prefixed[0])
-}
-
-/// Creates world `query` for an `output_size` target, optionally loading a preset.
+/// Creates world `query` for an `output_size` target, optionally loading a
+/// preset. Names are resolved before anything touches the GPU.
 pub fn create(
     gpu: &Gpu,
     query: &str,
@@ -280,27 +446,136 @@ pub fn create(
     preset: Option<&str>,
     seed: u64,
 ) -> Result<(usize, Box<dyn World>)> {
-    let index = find(query).ok_or_else(|| {
-        let ids: Vec<&str> = WORLDS.iter().map(|w| w.id).collect();
-        anyhow!("unknown world '{query}' (available: {})", ids.join(", "))
-    })?;
+    let index = resolve(query)?;
+    let preset = preset.map(|p| resolve_preset(index, p)).transpose()?;
+    Ok((index, create_at(gpu, index, output_size, preset, seed)?))
+}
+
+/// Creates `WORLDS[index]` for an `output_size` target, optionally loading preset `preset` (0-based).
+pub fn create_at(gpu: &Gpu, index: usize, output_size: [u32; 2], preset: Option<usize>, seed: u64) -> Result<Box<dyn World>> {
     if WORLDS[index].id == "reaction-diffusion" {
-        reaction_diffusion::validate_output_size(gpu, output_size)?;
+        reaction_diffusion::validate_output_size(gpu, output_size).map_err(|e| Failure::Usage.tag(e))?;
     }
     let mut world = (WORLDS[index].create)(gpu, output_size, seed);
-    if let Some(p) = preset {
-        let presets = world.presets();
-        let i = find_preset(presets, p).ok_or_else(|| {
-            anyhow!("unknown preset '{p}' for {} (available: {})", WORLDS[index].name, presets.join(", "))
-        })?;
+    if let Some(i) = preset {
+        let count = world.presets().len();
+        if i >= count {
+            return Err(Failure::Usage.error(format!("{} has presets 1-{count}, not {}", WORLDS[index].name, i + 1)));
+        }
         world.load_preset(gpu, i, seed);
     }
-    Ok((index, world))
+    Ok(world)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::MAX_METRICS;
+
+    #[test]
+    fn registry_tables_are_complete_and_every_name_resolves_to_its_world() {
+        let mut spellings = std::collections::HashMap::new();
+        for (index, entry) in WORLDS.iter().enumerate() {
+            for name in [entry.id, entry.name].into_iter().chain(entry.aliases.iter().copied()) {
+                assert_eq!(resolve(name), Ok(index), "{name}");
+                let other = spellings.insert(normalize(name), index);
+                assert!(other.is_none_or(|o| o == index), "'{name}' names two worlds");
+            }
+
+            let presets = (entry.presets)();
+            assert!(!presets.is_empty(), "{}: no presets", entry.id);
+            for (i, name) in presets.iter().enumerate() {
+                assert_eq!(resolve_preset(index, name), Ok(i), "{} / {name}", entry.id);
+                // Names go into candidates.csv unquoted and slugs into file names.
+                assert!(!name.contains([',', '"']), "{}: preset '{name}' needs CSV quoting", entry.id);
+                let slug = crate::headless::slug(name);
+                assert!(!slug.is_empty(), "{} / {name}: empty slug", entry.id);
+                assert!(presets[..i].iter().all(|p| crate::headless::slug(p) != slug), "{}: duplicate slug {slug}", entry.id);
+            }
+
+            let metrics = entry.metrics;
+            assert!(!metrics.is_empty() && metrics.len() <= MAX_METRICS, "{}: {} metrics", entry.id, metrics.len());
+            for (i, metric) in metrics.iter().enumerate() {
+                assert!(
+                    !metric.id.is_empty()
+                        && metric.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                    "{}: metric id '{}' is not a CSV-friendly identifier",
+                    entry.id,
+                    metric.id
+                );
+                assert!(metrics[..i].iter().all(|m| m.id != metric.id), "{}: duplicate id '{}'", entry.id, metric.id);
+                assert!(!metric.label.is_empty() && !metric.hint.is_empty(), "{}: {} lacks a label or hint", entry.id, metric.id);
+                assert!(!metric.hint.contains('\n'), "{}: {}'s hint must be one line", entry.id, metric.id);
+                assert_eq!(resolve_metric(index, metric.id), Ok(i));
+            }
+            assert!(!entry.vital.is_empty(), "{}: no vital measurement", entry.id);
+            for id in entry.vital {
+                assert!(metrics.iter().any(|m| m.id == *id), "{}: unknown vital measurement {id}", entry.id);
+            }
+
+            let palettes = (entry.palettes)();
+            assert!(!palettes.is_empty(), "{}: no palettes", entry.id);
+            for (i, name) in palettes.iter().enumerate() {
+                assert!(!palettes[..i].contains(name), "{}: palette {name} is listed twice", entry.id);
+            }
+        }
+    }
+
+    #[test]
+    fn names_resolve_by_number_alias_and_prefix_and_misses_explain_themselves() {
+        assert_eq!(resolve("5"), Ok(4));
+        assert_eq!(resolve("Gray Scott"), Ok(3));
+        assert_eq!(resolve("REAC"), Ok(3));
+        assert_eq!(resolve("l"), Ok(2), "prefixes match ids only, never aliases such as 'life'");
+        assert_eq!(find("slime-mould"), Some(0));
+        assert_eq!(find("p"), None);
+
+        let typo = resolve("physarm").unwrap_err();
+        assert_eq!(typo.miss, Miss::Unknown { suggestion: Some("physarum") });
+        assert_eq!(
+            typo.to_string(),
+            "unknown world 'physarm'; did you mean 'physarum'? (available: physarum, particle-life, lenia, \
+             reaction-diffusion, symbiosis, or 1-5; see `primordia list`)"
+        );
+        assert_eq!(resolve("greyscott").unwrap_err().miss, Miss::Unknown { suggestion: Some("gray-scott") });
+        let ambiguous = resolve("p").unwrap_err();
+        assert_eq!(ambiguous.miss, Miss::Ambiguous(vec!["physarum", "particle-life"]));
+        assert_eq!(ambiguous.to_string(), "ambiguous world 'p': it could be physarum or particle-life");
+        for number in ["0", "6", "123456789012345678901234567890"] {
+            assert_eq!(resolve(number).unwrap_err().miss, Miss::OutOfRange, "{number}");
+        }
+        assert!(resolve("9").unwrap_err().to_string().starts_with("world 9 is out of range: there are worlds 1-5"));
+        for nothing in ["zzz", "", "--"] {
+            assert_eq!(resolve(nothing).unwrap_err().miss, Miss::Unknown { suggestion: None }, "{nothing:?}");
+        }
+
+        let lenia = resolve("lenia").unwrap();
+        assert_eq!(resolve_preset(lenia, "neck"), Ok(4));
+        assert_eq!(resolve_preset(lenia, "pearl-reef"), Ok(3));
+        assert_eq!(resolve_preset(lenia, "7"), Ok(6));
+        assert_eq!(
+            resolve_preset(lenia, "99").unwrap_err().to_string(),
+            "preset 99 is out of range: Lenia has presets 1-7 (Orbium, Leviathans, Menagerie, Pearl Reef, Necklaces, \
+             Hydrogeminium, Tessellatium)"
+        );
+        let typo = resolve_preset(lenia, "orbum").unwrap_err();
+        assert_eq!(typo.miss, Miss::Unknown { suggestion: Some("Orbium") });
+        assert!(typo.to_string().contains("for Lenia; did you mean 'Orbium'?"), "{typo}");
+        assert!(typo.to_string().contains("or 1-7; see `primordia list --world lenia`"), "{typo}");
+        let physarum = resolve("physarum").unwrap();
+        assert_eq!(
+            resolve_preset(physarum, "s").unwrap_err().to_string(),
+            "ambiguous preset 's' for Physarum: it could be Symbiosis or Synapses"
+        );
+
+        let symbiosis = resolve("symbiosis").unwrap();
+        assert_eq!(resolve_metric(symbiosis, "growth_cover"), Ok(0));
+        let typo = resolve_metric(symbiosis, "growth_cove").unwrap_err();
+        assert_eq!(typo.miss, Miss::Unknown { suggestion: Some("growth_cover") });
+        assert!(typo.to_string().starts_with("unknown measurement 'growth_cove' for Symbiosis; did you mean"), "{typo}");
+        assert!(!typo.to_string().contains("1-"), "measurements are not numbered: {typo}");
+        assert!(resolve_metric(symbiosis, "growth").is_err(), "measurement ids never match by prefix");
+    }
 
     /// The template is not registered in `WORLDS`, so nothing else compiles its
     /// inline WGSL: build it, then step and render one small frame through post.

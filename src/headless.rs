@@ -1,9 +1,13 @@
 //! Offscreen rendering: final-frame PNGs, frame sequences, videos (via ffmpeg)
 //! and a gallery of every preset.
 //!
-//! Headless renders call `step` and `render` for every frame at a fixed 60 fps
-//! timestep, exactly like the interactive app, so worlds that accumulate
-//! display-only state in `render` (e.g. motion trails) look the same.
+//! Headless renders call `step` and `render` for every frame at a fixed
+//! timestep of `1 / fps` seconds (1/60 unless `--fps` says otherwise; explore
+//! always uses 1/60), exactly like the interactive app, so worlds that
+//! accumulate display-only state in `render` (e.g. motion trails) look the same.
+//!
+//! Every name and output path is checked before the GPU is opened ([`plan`]),
+//! so a typo or an unwritable folder fails in milliseconds, not after the run.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,8 +17,9 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context as _, Result};
 
 use crate::capture::{self, Readback};
+use crate::failure::Failure;
 use crate::gpu::Gpu;
-use crate::metrics::{CsvLog, Sampler};
+use crate::metrics::{CsvLog, Sample, Sampler};
 use crate::post::{Post, Tonemap};
 use crate::world::{self, Camera, Frame, Pointer, ViewXform, WORLDS};
 
@@ -32,7 +37,7 @@ pub struct RenderJob {
     /// PNG of the final frame. `None` means `renders/<world>-<preset>-s<seed>.png`,
     /// unless a video is requested, in which case no PNG is written.
     pub out: Option<PathBuf>,
-    /// Video (anything ffmpeg understands; .mp4/.mov/.mkv get H.264) of every frame.
+    /// Video of every frame, one of [`VIDEO_EXTENSIONS`] (.mp4/.mov/.mkv get H.264).
     pub video: Option<PathBuf>,
     /// Save a PNG every `every` frames into `frames_dir` (0 = never).
     pub every: u32,
@@ -134,10 +139,10 @@ impl VideoEncoder {
     fn finish(mut self) -> Result<()> {
         let child = self.child.as_mut().expect("encoder is running");
         drop(child.stdin.take());
-        let status = child.wait().context("waiting for ffmpeg")?;
+        let status = child.wait().context("waiting for ffmpeg").map_err(|e| Failure::Ffmpeg.tag(e))?;
         self.child.take();
         if !status.success() {
-            bail!("ffmpeg exited with {status}");
+            return Err(Failure::Ffmpeg.error(format!("ffmpeg exited with {status}")));
         }
         Ok(())
     }
@@ -153,40 +158,189 @@ impl Drop for VideoEncoder {
     }
 }
 
-pub fn render(job: &RenderJob) -> Result<()> {
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))?;
-    render_with(&gpu, job).map(|_| ())
+/// The smallest image side any command renders.
+pub const MIN_SIZE: u32 = 16;
+/// The largest image side any command renders (and a saved recipe may ask for).
+pub const MAX_SIZE: u32 = 16384;
+/// File types `--video` accepts.
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "gif"];
+
+/// A render job with its names resolved and its outputs checked, before any GPU work.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    /// Index into `WORLDS`.
+    pub world: usize,
+    /// 0-based preset to load; `None` keeps the world's first.
+    pub preset: Option<usize>,
+    /// Output size (rounded down to even numbers for a video).
+    pub size: [u32; 2],
+    /// Final-frame PNG, with the default name filled in.
+    pub out: Option<PathBuf>,
 }
 
-/// Renders `job`; returns the path of the PNG written, if any.
-pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
-    // Validate the entire pacing interval before rendering or writing any files.
-    frame_deadline(Instant::now(), job.frames.max(1), job.max_fps)?;
-    // yuv420p video needs even dimensions; stills keep the exact size.
-    let size = if job.video.is_some() {
-        [job.size[0].max(2) & !1, job.size[1].max(2) & !1]
-    } else {
-        [job.size[0].max(1), job.size[1].max(1)]
-    };
-    let max = gpu.device.limits().max_texture_dimension_2d;
-    if size[0] > max || size[1] > max {
-        bail!("{}x{} exceeds this GPU's maximum texture size of {max}", size[0], size[1]);
-    }
+/// What a finished render wrote.
+#[derive(Clone, Debug)]
+pub struct RenderSummary {
+    /// Index into `WORLDS`.
+    pub world: usize,
+    /// 0-based index of the preset rendered.
+    pub preset: usize,
+    pub size: [u32; 2],
+    pub frames: u32,
+    pub png: Option<PathBuf>,
+    pub video: Option<PathBuf>,
+    /// The `--every` frame PNGs, in order.
+    pub frame_files: Vec<PathBuf>,
+    pub metrics: Option<MetricsLog>,
+    pub secs: f32,
+}
 
-    let (_, mut world) = world::create(gpu, &job.world, size, job.preset.as_deref(), job.seed)?;
-    let preset_name = world.presets().get(world.preset()).copied().unwrap_or("custom");
+/// The measurement log a render wrote.
+#[derive(Clone, Debug)]
+pub struct MetricsLog {
+    pub path: PathBuf,
+    /// Data rows: one per frame and series.
+    pub rows: u64,
+    /// Labels of series 0 and 1 when the world compares two habitats.
+    pub series: Option<[String; 2]>,
+    /// The final frame's measurements.
+    pub last: Option<Sample>,
+}
+
+impl RenderSummary {
+    /// Every file written, in the order they were written.
+    pub fn files(&self) -> Vec<&Path> {
+        let mut files: Vec<&Path> = self.frame_files.iter().map(PathBuf::as_path).collect();
+        files.extend(self.png.as_deref());
+        files.extend(self.video.as_deref());
+        files.extend(self.metrics.as_ref().map(|m| m.path.as_path()));
+        files
+    }
+}
+
+/// Opens the GPU for a headless command; failing to is a [`Failure::Gpu`].
+pub fn open_gpu() -> Result<Gpu> {
+    pollster::block_on(Gpu::new(Gpu::create_instance(), None)).map_err(|e| Failure::Gpu.tag(e))
+}
+
+pub fn render(job: &RenderJob) -> Result<RenderSummary> {
+    let plan = plan(job)?;
+    if job.video.is_some() {
+        probe_ffmpeg()?;
+    }
+    let gpu = open_gpu()?;
+    execute(&gpu, job, plan)
+}
+
+/// Renders `job` on `gpu`.
+pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<RenderSummary> {
+    let plan = plan(job)?;
+    execute(gpu, job, plan)
+}
+
+/// An image size outside `MIN_SIZE..=MAX_SIZE` is invalid input.
+pub fn check_size(size: [u32; 2]) -> Result<()> {
+    if size.iter().any(|n| !(MIN_SIZE..=MAX_SIZE).contains(n)) {
+        return Err(Failure::Usage.error(format!(
+            "{}x{} is not a supported size: each side must be {MIN_SIZE}-{MAX_SIZE} pixels",
+            size[0], size[1]
+        )));
+    }
+    Ok(())
+}
+
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// Creates `dir` if needed and proves that a file can be written into it, so a
+/// bad output path fails before the simulation instead of after it.
+pub fn check_writable_dir(dir: &Path) -> Result<()> {
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let probe = std::fs::create_dir_all(dir).and_then(|()| tempfile::NamedTempFile::new_in(dir).map(drop));
+    probe.map_err(|e| Failure::Usage.tag(anyhow!("cannot write to {}: {e}", dir.display())))
+}
+
+/// [`check_writable_dir`] for the folder of the file `path`, which must not be a folder itself.
+pub fn check_writable_file(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Err(Failure::Usage.error(format!("{} is a folder, not a file name", path.display())));
+    }
+    check_writable_dir(path.parent().unwrap_or(Path::new("")))
+}
+
+/// Resolves and checks `job` without a GPU: the world and preset names, the
+/// size and pacing, the output file types and that every output folder can be
+/// written. Every failure here is invalid input.
+pub fn plan(job: &RenderJob) -> Result<Plan> {
+    // Validate the entire pacing interval before rendering or writing any files.
+    frame_deadline(Instant::now(), job.frames.max(1), job.max_fps).map_err(|e| Failure::Usage.tag(e))?;
+    check_size(job.size)?;
+    // yuv420p video needs even dimensions; stills keep the exact size.
+    let size = if job.video.is_some() { [job.size[0] & !1, job.size[1] & !1] } else { job.size };
+    if size != job.size {
+        log::warn!(
+            "a video needs even dimensions: rendering {}x{} instead of {}x{}",
+            size[0],
+            size[1],
+            job.size[0],
+            job.size[1]
+        );
+    }
+    let world = world::resolve(&job.world)?;
+    let preset = job.preset.as_deref().map(|p| world::resolve_preset(world, p)).transpose()?;
+    let entry = &WORLDS[world];
     let out = match (&job.out, &job.video) {
         (Some(path), _) => Some(path.clone()),
         (None, None) => {
-            Some(PathBuf::from("renders").join(format!("{}-{}-s{}.png", world.id(), slug(preset_name), job.seed)))
+            let name = (entry.presets)()[preset.unwrap_or(0)];
+            Some(PathBuf::from("renders").join(format!("{}-{}-s{}.png", entry.id, slug(name), job.seed)))
         }
         (None, Some(_)) => None,
     };
     if let Some(path) = &out {
-        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
-            bail!("output image must be a .png file (got '{}')", path.display());
+        if !has_extension(path, &["png"]) {
+            return Err(Failure::Usage.error(format!("output image must be a .png file (got '{}')", path.display())));
         }
+        check_writable_file(path)?;
     }
+    if let Some(path) = &job.video {
+        if !has_extension(path, VIDEO_EXTENSIONS) {
+            let (last, rest) = VIDEO_EXTENSIONS.split_last().expect("video extensions");
+            return Err(Failure::Usage.error(format!(
+                "--video must name a .{} or .{last} file (got '{}')",
+                rest.join(", ."),
+                path.display()
+            )));
+        }
+        check_writable_file(path)?;
+    }
+    if job.every > 0 {
+        check_writable_dir(&job.frames_dir)?;
+    }
+    if let Some(path) = &job.metrics {
+        if entry.metrics.is_empty() {
+            return Err(Failure::Usage.error(format!("{} does not publish measurements", entry.name)));
+        }
+        check_writable_file(path)?;
+    }
+    Ok(Plan { world, preset, size, out })
+}
+
+fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
+    let size = plan.size;
+    let max = gpu.device.limits().max_texture_dimension_2d;
+    if size[0] > max || size[1] > max {
+        return Err(Failure::Usage.error(format!(
+            "{}x{} exceeds this GPU's maximum texture size of {max}",
+            size[0], size[1]
+        )));
+    }
+
+    let mut world = world::create_at(gpu, plan.world, size, plan.preset, job.seed)?;
+    let preset = world.preset();
+    let preset_name = world.presets().get(preset).copied().unwrap_or("custom");
+    let out = plan.out;
     let progress_level = if job.quiet { log::Level::Debug } else { log::Level::Info };
     log::log!(
         progress_level,
@@ -195,19 +349,20 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         preset_name,
         size[0],
         size[1],
-        job.frames,
+        job.frames.max(1),
         job.seed
     );
+    let series = world.comparison_labels();
     let mut metrics = match &job.metrics {
-        Some(_) if world.metrics().is_empty() => bail!("{} does not publish measurements", world.name()),
         Some(path) => {
-            if let Some(labels) = world.comparison_labels() {
+            if let Some(labels) = &series {
                 log::log!(progress_level, "measurement series 0: {} · series 1: {}", labels[0], labels[1]);
             }
             Some((CsvLog::create(path, world.metrics())?, Sampler::new(gpu, Sampler::HEADLESS_SLOTS)))
         }
         None => None,
     };
+    let mut last_sample: Option<Sample> = None;
 
     let mut look = world.post_settings();
     if let Some(e) = job.exposure {
@@ -241,6 +396,7 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
     let frames = job.frames.max(1);
     let started = Instant::now();
     let mut next_report = 0.1;
+    let mut frame_files = Vec::new();
     for f in 0..frames {
         let frame = Frame {
             gpu,
@@ -256,8 +412,9 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         if let Some((log, sampler)) = &mut metrics {
             // Never skip a frame of the log: wait for the ring when it is full.
             if sampler.is_full() {
-                for sample in sampler.flush(gpu)? {
+                for sample in sampler.flush(gpu).map_err(|e| Failure::Gpu.tag(e))? {
                     log.write(&sample)?;
+                    last_sample = Some(sample);
                 }
             }
             let mut sink = sampler.begin(frame.frame, frame.time);
@@ -277,17 +434,18 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
             sampler.map();
         }
         if let Some(problem) = gpu.fatal_error() {
-            bail!("GPU error while rendering: {problem}");
+            return Err(Failure::Gpu.error(format!("GPU error while rendering: {problem}")));
         }
 
         if capture {
-            let pixels = readback.read(gpu)?;
+            let pixels = readback.read(gpu).map_err(|e| Failure::Gpu.tag(e))?;
             if let Some(encoder) = ffmpeg.as_mut() {
                 encoder.write(&pixels)?;
             }
             if save_frame {
                 let path = job.frames_dir.join(format!("{}_{:05}.png", world.id(), f + 1));
                 capture::save_png(&path, size, pixels.clone())?;
+                frame_files.push(path);
             }
             if last {
                 if let Some(path) = &out {
@@ -302,6 +460,7 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
         if let Some((log, sampler)) = &mut metrics {
             for sample in sampler.collect(gpu) {
                 log.write(&sample)?;
+                last_sample = Some(sample);
             }
         }
         if job.max_fps > 0.0 {
@@ -327,18 +486,23 @@ pub fn render_with(gpu: &Gpu, job: &RenderJob) -> Result<Option<PathBuf>> {
 
     if let Some(encoder) = ffmpeg {
         encoder.finish()?;
-        log::info!("wrote {}", job.video.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
+        log::log!(progress_level, "wrote {}", job.video.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
     }
-    if let Some((mut log, mut sampler)) = metrics {
-        for sample in sampler.flush(gpu)? {
-            log.write(&sample)?;
+    let metrics = match metrics {
+        Some((mut log, mut sampler)) => {
+            for sample in sampler.flush(gpu).map_err(|e| Failure::Gpu.tag(e))? {
+                log.write(&sample)?;
+                last_sample = Some(sample);
+            }
+            let (path, rows) = log.finish()?;
+            log::log!(progress_level, "wrote {} ({rows} rows)", path.display());
+            Some(MetricsLog { path, rows, series, last: last_sample })
         }
-        let (path, rows) = log.finish()?;
-        log::log!(progress_level, "wrote {} ({rows} rows)", path.display());
-    }
+        None => None,
+    };
     let secs = started.elapsed().as_secs_f32();
     log::log!(progress_level, "done: {frames} frames in {secs:.1}s ({:.1} fps)", frames as f32 / secs.max(1e-3));
-    Ok(out)
+    Ok(RenderSummary { world: plan.world, preset, size, frames, png: out, video: job.video.clone(), frame_files, metrics, secs })
 }
 
 pub(crate) fn frame_deadline(started: Instant, frames: u32, max_fps: f32) -> Result<Instant> {
@@ -358,7 +522,7 @@ pub struct GalleryJob {
     pub size: [u32; 2],
     pub frames: u32,
     pub seed: u64,
-    /// Restrict to one world (id, name or alias).
+    /// Restrict to one world (id, name, alias or number).
     pub world: Option<String>,
     /// Also write `contact-sheet.png`, every image tiled into one overview.
     pub sheet: bool,
@@ -366,26 +530,44 @@ pub struct GalleryJob {
     pub max_fps: f32,
 }
 
+/// What a finished gallery wrote.
+#[derive(Clone, Debug)]
+pub struct GallerySummary {
+    /// `(world index, 0-based preset, image)` in render order.
+    pub images: Vec<(usize, usize, PathBuf)>,
+    pub sheet: Option<PathBuf>,
+    pub secs: f32,
+}
+
+impl GallerySummary {
+    /// Every file written, in the order they were written.
+    pub fn files(&self) -> Vec<&Path> {
+        let mut files: Vec<&Path> = self.images.iter().map(|(_, _, path)| path.as_path()).collect();
+        files.extend(self.sheet.as_deref());
+        files
+    }
+}
+
 /// Renders the final frame of every preset of every world into `out_dir`.
-pub fn gallery(job: &GalleryJob) -> Result<()> {
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))?;
-    let only = match &job.world {
-        Some(q) => Some(world::find(q).with_context(|| format!("unknown world '{q}'"))?),
-        None => None,
-    };
+pub fn gallery(job: &GalleryJob) -> Result<GallerySummary> {
+    let only = job.world.as_deref().map(world::resolve).transpose()?;
+    check_size(job.size)?;
+    frame_deadline(Instant::now(), job.frames.max(1), job.max_fps).map_err(|e| Failure::Usage.tag(e))?;
+    check_writable_dir(&job.out_dir)?;
     let mut todo = Vec::new();
     for (index, entry) in WORLDS.iter().enumerate() {
         if only.is_some_and(|o| o != index) {
             continue;
         }
-        let presets = (entry.create)(&gpu, [64, 64], job.seed).presets();
-        todo.extend(presets.iter().enumerate().map(|(i, name)| (entry, i, *name)));
+        todo.extend((entry.presets)().iter().enumerate().map(|(i, name)| (index, i, *name)));
     }
+    let gpu = open_gpu()?;
 
     let total = todo.len();
     let started = Instant::now();
-    let mut rendered: Vec<(&'static str, PathBuf)> = Vec::with_capacity(total);
-    for (n, (entry, i, name)) in todo.into_iter().enumerate() {
+    let mut images = Vec::with_capacity(total);
+    for (n, (index, i, name)) in todo.into_iter().enumerate() {
+        let entry = &WORLDS[index];
         let out = job.out_dir.join(format!("{}-{:02}-{}.png", entry.id, i + 1, slug(name)));
         let t = Instant::now();
         let render = RenderJob {
@@ -407,18 +589,23 @@ pub fn gallery(job: &GalleryJob) -> Result<()> {
             out.display(),
             t.elapsed().as_secs_f32()
         );
-        rendered.push((entry.id, out));
+        images.push((index, i, out));
     }
-    if job.sheet && !rendered.is_empty() {
+    let sheet = if job.sheet && !images.is_empty() {
+        let tiles: Vec<(&str, PathBuf)> = images.iter().map(|(index, _, path)| (WORLDS[*index].id, path.clone())).collect();
         let sheet = job.out_dir.join("contact-sheet.png");
-        contact_sheet(&rendered, &sheet, 5, 4)?;
+        contact_sheet(&tiles, &sheet, 5, 4)?;
         log::info!("wrote {}", sheet.display());
-    }
-    log::info!("gallery done: {total} images in {:.1}s", started.elapsed().as_secs_f32());
-    Ok(())
+        Some(sheet)
+    } else {
+        None
+    };
+    let secs = started.elapsed().as_secs_f32();
+    log::info!("gallery done: {total} images in {secs:.1}s");
+    Ok(GallerySummary { images, sheet, secs })
 }
 
-/// Tiles gallery images (quarter size) into one overview image. Each world
+// Tiles gallery images (quarter size) into one overview image. Each world
 /// starts a new row; rows hold at most `cols` images.
 /// Tiles `images` (each paired with a grouping key: a new row starts when the
 /// key changes) at `1 / divisor` of the first image's size.
@@ -474,10 +661,10 @@ pub fn slug(name: &str) -> String {
 pub fn spawn_ffmpeg(path: &Path, size: [u32; 2], fps: u32, encode: Encode) -> Result<Child> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    let exe = std::env::var("PRIMORDIA_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+    let exe = ffmpeg_exe();
     let mut cmd = Command::new(&exe);
     cmd.args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba"])
         .args(["-s", &format!("{}x{}", size[0], size[1])])
@@ -494,17 +681,52 @@ pub fn spawn_ffmpeg(path: &Path, size: [u32; 2], fps: u32, encode: Encode) -> Re
             .args(["-color_trc", "bt709", "-color_range", "tv", "-movflags", "+faststart"]);
     }
     cmd.arg(path).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit());
-    cmd.spawn()
-        .with_context(|| format!("failed to start '{exe}' - is ffmpeg installed? (set PRIMORDIA_FFMPEG to its path)"))
+    cmd.spawn().map_err(|e| missing_ffmpeg(&exe, &e))
+}
+
+/// The ffmpeg executable: `PRIMORDIA_FFMPEG`, or `ffmpeg` on the `PATH`.
+fn ffmpeg_exe() -> String {
+    std::env::var("PRIMORDIA_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+/// How to get ffmpeg on this platform.
+pub fn ffmpeg_install_hint() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "install it with `winget install Gyan.FFmpeg` or set PRIMORDIA_FFMPEG to ffmpeg.exe"
+    } else if cfg!(target_os = "macos") {
+        "install it with `brew install ffmpeg` or set PRIMORDIA_FFMPEG to its path"
+    } else {
+        "install it with your package manager (e.g. `sudo apt install ffmpeg`) or set PRIMORDIA_FFMPEG to its path"
+    }
+}
+
+fn missing_ffmpeg(exe: &str, err: &std::io::Error) -> anyhow::Error {
+    Failure::Ffmpeg.error(format!("cannot start ffmpeg ('{exe}': {err}); {}", ffmpeg_install_hint()))
+}
+
+/// Checks that ffmpeg runs, so a missing encoder is reported before any frame is simulated.
+pub fn probe_ffmpeg() -> Result<()> {
+    let exe = ffmpeg_exe();
+    let status = Command::new(&exe)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| missing_ffmpeg(&exe, &e))?;
+    if !status.success() {
+        return Err(Failure::Ffmpeg.error(format!("'{exe} -version' exited with {status}; {}", ffmpeg_install_hint())));
+    }
+    Ok(())
 }
 
 /// Turns a failed write into an error that includes ffmpeg's exit status.
 pub fn ffmpeg_failure(mut child: Child, err: std::io::Error) -> anyhow::Error {
     drop(child.stdin.take());
-    match child.wait() {
+    Failure::Ffmpeg.tag(match child.wait() {
         Ok(status) => anyhow!("ffmpeg exited with {status} while encoding ({err})"),
         Err(wait_err) => anyhow!("ffmpeg failed while encoding ({err}; {wait_err})"),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -519,6 +741,48 @@ mod tests {
         }
         assert_eq!(frame_deadline(start, 600, 0.0).unwrap(), start);
         assert_eq!(frame_deadline(start, 600, 60.0).unwrap() - start, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn plans_check_names_file_types_and_output_folders_before_the_gpu() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = RenderJob { out: Some(dir.path().join("a").join("b").join("final.png")), ..RenderJob::new("rd") };
+        let plan = plan(&RenderJob { preset: Some("mito".into()), ..job.clone() }).unwrap();
+        assert_eq!((WORLDS[plan.world].id, plan.preset, plan.size), ("reaction-diffusion", Some(1), [1920, 1080]));
+        let folder = dir.path().join("a").join("b");
+        assert!(folder.is_dir(), "output folders are created up front");
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "the write probe leaves nothing behind");
+
+        // A video needs even sizes and a known file type; without -o no still is written.
+        let video = super::plan(&RenderJob { out: None, video: Some(dir.path().join("v.MP4")), size: [321, 181], ..job.clone() })
+            .unwrap();
+        assert_eq!((video.size, video.out), ([320, 180], None));
+
+        let file = dir.path().join("afile");
+        std::fs::write(&file, "").unwrap();
+        std::fs::create_dir(dir.path().join("folder.png")).unwrap();
+        let cases = [
+            (RenderJob { world: "physarm".into(), ..job.clone() }, "did you mean 'physarum'?"),
+            (RenderJob { world: "p".into(), ..job.clone() }, "it could be physarum or particle-life"),
+            (RenderJob { preset: Some("99".into()), ..job.clone() }, "Reaction-Diffusion has presets 1-10"),
+            (RenderJob { out: Some(dir.path().join("x.jpg")), ..job.clone() }, "must be a .png file"),
+            (RenderJob { out: Some(dir.path().join("folder.png")), ..job.clone() }, "is a folder"),
+            (RenderJob { video: Some(dir.path().join("clip")), ..job.clone() }, "--video must name a .mp4, .mov"),
+            (RenderJob { out: Some(file.join("x.png")), ..job.clone() }, "cannot write to"),
+            (RenderJob { every: 5, frames_dir: file.join("frames"), ..job.clone() }, "cannot write to"),
+            (RenderJob { metrics: Some(file.join("m.csv")), ..job.clone() }, "cannot write to"),
+            (RenderJob { size: [8, 1080], ..job.clone() }, "8x1080 is not a supported size"),
+            (RenderJob { max_fps: -1.0, ..job.clone() }, "--max-fps"),
+        ];
+        for (bad, expected) in cases {
+            let error = super::plan(&bad).expect_err("the plan must fail");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(crate::failure::exit_code(&error), 2, "{error:#}");
+        }
+
+        let missing = missing_ffmpeg("no-such-ffmpeg", &std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(crate::failure::exit_code(&missing), 4);
+        assert!(missing.to_string().contains("'no-such-ffmpeg'") && missing.to_string().contains("PRIMORDIA_FFMPEG"));
     }
 
     #[test]
@@ -537,7 +801,14 @@ mod tests {
             metrics: Some(csv.clone()),
             ..RenderJob::new("symbiosis")
         };
-        render_with(&gpu, &job).unwrap();
+        let summary = render_with(&gpu, &job).unwrap();
+        assert_eq!((WORLDS[summary.world].id, summary.preset, summary.frames), ("symbiosis", 0, 8));
+        assert_eq!(summary.frame_files, [3, 6].map(|f| dir.path().join("frames").join(format!("symbiosis_{f:05}.png"))));
+        assert_eq!(summary.png.as_deref(), Some(dir.path().join("final.png").as_path()));
+        let log = summary.metrics.as_ref().unwrap();
+        assert_eq!((log.rows, log.series.is_none()), (8, true));
+        assert_eq!(log.last.unwrap().frame, 7, "the last row is the last frame");
+        assert!(summary.files().iter().all(|f| f.exists()) && summary.files().len() == 4);
 
         let text = std::fs::read_to_string(&csv).unwrap();
         let mut lines = text.lines();

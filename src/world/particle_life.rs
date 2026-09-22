@@ -78,7 +78,7 @@ const SLOW_REF: f32 = 0.1;
 const DENSE_FACTOR: f32 = 3.0;
 
 /// Lane order of `particle_life_measure.wgsl`.
-const METRICS: &[MetricDesc] = &[
+pub(crate) const METRICS: &[MetricDesc] = &[
     MetricDesc {
         id: "speed",
         label: "Mean speed",
@@ -215,6 +215,11 @@ const SCHEMES: &[Scheme] = &[
 // JEWELS is the highest index referenced by name: this fails the build if the
 // table ever loses an entry the presets rely on.
 const _: () = assert!(JEWELS < SCHEMES.len());
+
+/// Names of the colour schemes, in the order `Colors::Scheme` indexes them.
+pub(crate) fn scheme_names() -> Vec<&'static str> {
+    SCHEMES.iter().map(|s| s.name).collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Colors {
@@ -570,7 +575,7 @@ const PRESETS: &[Preset] = &[
     },
 ];
 
-fn preset_names() -> &'static [&'static str] {
+pub(crate) fn preset_names() -> &'static [&'static str] {
     static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
     NAMES.get_or_init(|| PRESETS.iter().map(|p| p.name).collect())
 }

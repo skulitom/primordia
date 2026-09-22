@@ -11,6 +11,8 @@ use crate::world::{Camera, lenia, particle_life, physarum, reaction_diffusion, s
 
 /// Recipes contain parameters, not snapshots or embedded images.
 const MAX_SAVE_BYTES: u64 = 4 * 1024 * 1024;
+/// `SavedWorld::version` of the recipes this build reads and writes.
+pub const RECIPE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "world", rename_all = "kebab-case")]
@@ -75,7 +77,7 @@ impl SavedWorld {
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(self.version == 1, "This save requires a different version of Primordia");
+        ensure!(self.version == RECIPE_VERSION, "This save requires a different version of Primordia");
         validate_name(&self.name)?;
         ensure!(self.output_size.iter().all(|n| (16..=16384).contains(n)), "Invalid saved world dimensions");
         ensure!(self.camera.zoom.is_finite() && (0.5..=64.0).contains(&self.camera.zoom), "Invalid saved zoom");
@@ -139,7 +141,12 @@ impl Library {
         Ok(())
     }
 
-    pub fn save(&mut self, mut saved: SavedWorld) -> Result<()> {
+    pub fn save(&mut self, saved: SavedWorld) -> Result<()> {
+        self.save_as_new(saved).map(drop)
+    }
+
+    /// Saves `saved` into a new file of its own and returns the file's path.
+    pub fn save_as_new(&mut self, mut saved: SavedWorld) -> Result<PathBuf> {
         saved.name = saved.name.trim().to_owned();
         saved.validate()?;
         std::fs::create_dir_all(&self.directory).context("Creating the library folder")?;
@@ -150,9 +157,9 @@ impl Library {
         file.as_file().sync_all()?;
         let name = file.path().file_name().context("Missing save filename")?.to_string_lossy();
         let path = self.directory.join(format!("world-{name}.json"));
-        file.persist_noclobber(path).map_err(|e| e.error).context("Writing saved world")?;
+        file.persist_noclobber(&path).map_err(|e| e.error).context("Writing saved world")?;
         self.refresh();
-        Ok(())
+        Ok(path)
     }
 
     pub fn rename(&mut self, index: usize, name: &str) -> Result<()> {
@@ -189,7 +196,7 @@ fn read_save(path: &Path) -> Result<SavedWorld> {
         }
     }
     ensure!(check_numbers(&header), "Saved settings contain a number outside the supported range");
-    if header.get("version").and_then(|v| v.as_u64()) != Some(1) {
+    if header.get("version").and_then(|v| v.as_u64()) != Some(u64::from(RECIPE_VERSION)) {
         bail!("Unsupported save version");
     }
     let saved: SavedWorld = serde_json::from_value(header)?;
@@ -212,7 +219,8 @@ pub fn default_directory() -> PathBuf {
     }
     if cfg!(target_os = "windows") {
         if let Some(path) = std::env::var_os("APPDATA") {
-            return PathBuf::from(path).join("Primordia/library");
+            // Joined per component so the path prints with Windows separators only.
+            return PathBuf::from(path).join("Primordia").join("library");
         }
     } else if cfg!(target_os = "macos") {
         if let Some(path) = std::env::var_os("HOME") {

@@ -32,7 +32,10 @@ is a complete, full-featured reference that uses every convention below.
 
 1. **Module.** Add `src/world/my_world.rs` exposing
    `pub fn create(gpu: &Gpu, output_size: [u32; 2], seed: u64) -> Box<dyn World>`
-   and register it in `WORLDS` in `src/world/mod.rs` (id, name, aliases, tagline).
+   and register it in `WORLDS` in `src/world/mod.rs`: id, name, aliases, tagline, and
+   the static tables that `primordia list` and name lookups use without a GPU (the
+   preset names, the `METRICS` table, the vital measurement ids explore uses to spot
+   dead candidates, the palette names and the recipe field that picks one).
    `create` chooses the simulation domain size, usually proportional to the output.
 2. **Shaders.** Put WGSL in `src/shaders/my_world.wgsl` and compile it with
    `gpu.shader(label, include_str!(...))`. The prelude (`src/shaders/common.wgsl`) is

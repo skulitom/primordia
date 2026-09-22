@@ -85,6 +85,11 @@ pub const PALETTES: &[Palette] = &[
     },
 ];
 
+/// Names of the shared palettes, in menu order.
+pub fn names() -> Vec<&'static str> {
+    PALETTES.iter().map(|p| p.name).collect()
+}
+
 /// Index of the palette whose name matches `name` (case-insensitive).
 pub fn find(name: &str) -> Option<usize> {
     PALETTES.iter().position(|p| p.name.eq_ignore_ascii_case(name))

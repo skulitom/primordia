@@ -55,7 +55,7 @@ const FILLED_V: f32 = 0.4;
 const ACTIVE_DV: f32 = 1e-3;
 
 /// Lane order of `reaction_diffusion_measure.wgsl`.
-const METRICS: &[MetricDesc] = &[
+pub(crate) const METRICS: &[MetricDesc] = &[
     MetricDesc {
         id: "alive",
         label: "Alive cells",
@@ -613,7 +613,7 @@ const PRESETS: &[Preset] = &[
     },
 ];
 
-fn preset_names() -> &'static [&'static str] {
+pub(crate) fn preset_names() -> &'static [&'static str] {
     static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
     NAMES.get_or_init(|| PRESETS.iter().map(|p| p.name).collect())
 }

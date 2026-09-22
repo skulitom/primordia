@@ -74,7 +74,7 @@ const DENSE_A: f32 = 0.5;
 const ACTIVE_DA: f32 = 1e-3;
 
 /// Lane order of `lenia_measure.wgsl`.
-const METRICS: &[MetricDesc] = &[
+pub(crate) const METRICS: &[MetricDesc] = &[
     MetricDesc {
         id: "mass",
         label: "Mean density",
@@ -498,6 +498,10 @@ impl SimKey {
 
 const PRESET_NAMES: &[&str] =
     &["Orbium", "Leviathans", "Menagerie", "Pearl Reef", "Necklaces", "Hydrogeminium", "Tessellatium"];
+
+pub(crate) fn preset_names() -> &'static [&'static str] {
+    PRESET_NAMES
+}
 
 struct PresetDef {
     params: Params,

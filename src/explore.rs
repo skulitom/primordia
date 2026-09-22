@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
 use crate::capture::{self, Readback};
+use crate::failure::Failure;
 use crate::gpu::Gpu;
 use crate::headless::{self, contact_sheet, frame_deadline, OUTPUT_FORMAT};
 use crate::library::{Library, SavedWorld, WorldSettings};
@@ -35,22 +36,9 @@ const CHILD_ATTEMPTS: u32 = 8;
 const DUPLICATE: f32 = 1e-6;
 /// Scaled values are bounded so one exploded candidate cannot dominate every distance.
 const SCALED_LIMIT: f32 = 6.0;
-/// A vital measurement's late mean below this marks a candidate as inert.
+/// A vital measurement's late mean below this marks a candidate as inert (the
+/// vital measurements of each world are registered in `WorldEntry::vital`).
 const INERT: f32 = 1e-3;
-
-/// Measurements that must stay above zero for a candidate to count as alive:
-/// a dead, empty or frozen world is novel in behaviour space but never worth
-/// an archive slot. `--keep-inert` lifts the rule.
-fn vital_metrics(world_id: &str) -> &'static [&'static str] {
-    match world_id {
-        "physarum" => &["ground"],
-        "particle-life" => &["speed"],
-        "lenia" => &["mass", "active"],
-        "reaction-diffusion" => &["alive", "active"],
-        "symbiosis" => &["growth_cover", "growth_active"],
-        _ => &[],
-    }
-}
 
 /// How the archive is chosen from the evaluated candidates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,13 +179,37 @@ pub struct Candidate {
 
 #[derive(Debug)]
 pub struct Summary {
+    /// Index into `WORLDS`.
+    pub world: usize,
+    /// 0-based preset the search started from.
+    pub preset: usize,
     pub candidates: Vec<Candidate>,
     /// Indices of the kept candidates in rank order.
     pub kept: Vec<usize>,
+    /// Image and recipe of each kept candidate, in rank order.
     pub images: Vec<PathBuf>,
     pub recipes: Vec<PathBuf>,
+    /// Library files written by `--install`, in rank order.
+    pub installed: Vec<PathBuf>,
+    /// Every candidate's final frame under `all/` (with `--all`).
+    pub all: Vec<PathBuf>,
     pub sheet: Option<PathBuf>,
     pub csv: PathBuf,
+    pub secs: f32,
+}
+
+impl Summary {
+    /// Every file written, in the order they were written.
+    pub fn files(&self) -> Vec<&Path> {
+        let mut files: Vec<&Path> = self.all.iter().map(PathBuf::as_path).collect();
+        for (rank, (image, recipe)) in self.images.iter().zip(&self.recipes).enumerate() {
+            files.extend([image.as_path(), recipe.as_path()]);
+            files.extend(self.installed.get(rank).map(PathBuf::as_path));
+        }
+        files.push(&self.csv);
+        files.extend(self.sheet.as_deref());
+        files
+    }
 }
 
 // --- behaviour descriptors -----------------------------------------------------
@@ -518,7 +530,7 @@ impl Bench<'_> {
                 gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("explore frame") });
             self.world.step(&frame, &mut encoder);
             if self.sampler.is_full() {
-                samples.extend(self.sampler.flush(gpu)?);
+                samples.extend(self.sampler.flush(gpu).map_err(|e| Failure::Gpu.tag(e))?);
             }
             {
                 let mut sink = self.sampler.begin(frame.frame, frame.time);
@@ -533,7 +545,7 @@ impl Bench<'_> {
             gpu.queue.submit([encoder.finish()]);
             self.sampler.map();
             if let Some(problem) = gpu.fatal_error() {
-                bail!("GPU error while exploring: {problem}");
+                return Err(Failure::Gpu.error(format!("GPU error while exploring: {problem}")));
             }
             if f % 4 == 3 && !last {
                 // Keep the CPU from queueing hundreds of frames ahead of the GPU.
@@ -548,8 +560,8 @@ impl Bench<'_> {
                 }
             }
         }
-        samples.extend(self.sampler.flush(gpu)?);
-        let pixels = if capture { Some(self.readback.read(gpu)?) } else { None };
+        samples.extend(self.sampler.flush(gpu).map_err(|e| Failure::Gpu.tag(e))?);
+        let pixels = if capture { Some(self.readback.read(gpu).map_err(|e| Failure::Gpu.tag(e))?) } else { None };
         Ok((samples, pixels))
     }
 }
@@ -592,7 +604,7 @@ fn file_stem(rank: usize, seed: u64) -> String {
 
 fn recipe(world_name: &str, candidate: &Candidate, rank: usize, size: [u32; 2]) -> SavedWorld {
     SavedWorld {
-        version: 1,
+        version: crate::library::RECIPE_VERSION,
         name: format!("{world_name} explore #{rank:02} (seed {})", candidate.seed),
         seed: candidate.seed,
         output_size: size,
@@ -604,8 +616,10 @@ fn recipe(world_name: &str, candidate: &Candidate, rank: usize, size: [u32; 2]) 
     }
 }
 
-fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate]) -> Result<()> {
-    let mut text = String::from("index,round,origin,parent,seed,preset,rank,novelty,status,secs");
+/// `candidates.csv`: one row per candidate. `preset` is 1-based like `--preset`
+/// (recipes store it 0-based), followed by the preset's name.
+fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate], presets: &[&str]) -> Result<()> {
+    let mut text = String::from("index,round,origin,parent,seed,preset,preset_name,rank,novelty,status,secs");
     for dim in dims {
         text.push(',');
         text.push_str(dim);
@@ -623,10 +637,17 @@ fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate]) -> Result<(
             (Some(_), true) => "inert",
             (Some(_), false) => "ok",
         };
+        // Preset names never contain commas or quotes (checked in `world::tests`).
+        let preset_name = presets.get(c.preset).copied().unwrap_or("custom");
         let _ = write!(
             text,
-            "{},{},{origin},{parent},{},{},{rank},{:.6},{status},{:.3}",
-            c.index, c.round, c.seed, c.preset, c.novelty, c.secs
+            "{},{},{origin},{parent},{},{},{preset_name},{rank},{:.6},{status},{:.3}",
+            c.index,
+            c.round,
+            c.seed,
+            c.preset + 1,
+            c.novelty,
+            c.secs
         );
         for d in 0..dims.len() {
             match c.descriptor.as_ref().and_then(|v| v.get(d)) {
@@ -641,8 +662,41 @@ fn write_csv(path: &Path, dims: &[String], candidates: &[Candidate]) -> Result<(
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
-pub fn explore(job: &ExploreJob) -> Result<()> {
-    let gpu = pollster::block_on(Gpu::new(Gpu::create_instance(), None))?;
+/// An exploration's names resolved and its inputs checked, before any GPU work.
+struct Plan {
+    /// Index into `WORLDS`.
+    world: usize,
+    /// 0-based base preset; `None` keeps the world's first.
+    preset: Option<usize>,
+    /// Metric lane of a `max:`/`min:` selection.
+    lane: Option<usize>,
+}
+
+/// Resolves and checks `job` without a GPU: world, preset and metric names,
+/// size and pacing, and that the output (and library) folders can be written.
+fn plan(job: &ExploreJob) -> Result<Plan> {
+    frame_deadline(Instant::now(), job.frames.max(1), job.max_fps).map_err(|e| Failure::Usage.tag(e))?;
+    headless::check_size(job.size)?;
+    let world = world::resolve(&job.world)?;
+    let preset = job.preset.as_deref().map(|p| world::resolve_preset(world, p)).transpose()?;
+    let entry = &WORLDS[world];
+    if entry.metrics.is_empty() {
+        return Err(Failure::Usage.error(format!("{} does not publish measurements", entry.name)));
+    }
+    let lane = match &job.select {
+        Select::Novelty => None,
+        Select::Max(id) | Select::Min(id) => Some(world::resolve_metric(world, id)?),
+    };
+    headless::check_writable_dir(&job.out_dir)?;
+    if let Some(library) = &job.library {
+        headless::check_writable_dir(library)?;
+    }
+    Ok(Plan { world, preset, lane })
+}
+
+pub fn explore(job: &ExploreJob) -> Result<Summary> {
+    plan(job)?;
+    let gpu = headless::open_gpu()?;
     let summary = explore_with(&gpu, job)?;
     log::info!(
         "kept {} of {} candidates: {} images and {} recipes in {}, {}{}",
@@ -652,44 +706,38 @@ pub fn explore(job: &ExploreJob) -> Result<()> {
         summary.recipes.len(),
         job.out_dir.display(),
         summary.csv.display(),
-        summary.sheet.map(|s| format!(" and {}", s.display())).unwrap_or_default()
+        summary.sheet.as_ref().map(|s| format!(" and {}", s.display())).unwrap_or_default()
     );
-    Ok(())
+    Ok(summary)
 }
 
 pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
-    frame_deadline(Instant::now(), job.frames.max(1), job.max_fps)?;
-    let size = [job.size[0].clamp(16, 16384), job.size[1].clamp(16, 16384)];
+    let Plan { world: world_index, preset, lane } = plan(job)?;
+    let size = job.size;
     let max = gpu.device.limits().max_texture_dimension_2d;
     if size[0] > max || size[1] > max {
-        bail!("{}x{} exceeds this GPU's maximum texture size of {max}", size[0], size[1]);
+        return Err(Failure::Usage.error(format!(
+            "{}x{} exceeds this GPU's maximum texture size of {max}",
+            size[0], size[1]
+        )));
     }
     let keep = job.keep.max(1);
-    let (world_index, world) = world::create(gpu, &job.world, size, job.preset.as_deref(), job.seed)?;
-    let world_name = WORLDS[world_index].name;
+    let world = world::create_at(gpu, world_index, size, preset, job.seed)?;
+    let entry = &WORLDS[world_index];
+    let world_name = entry.name;
+    let presets = world.presets();
+    let base_preset = world.preset();
     let metrics = world.metrics();
-    if metrics.is_empty() {
-        bail!("{world_name} does not publish measurements");
-    }
-    let lane = match &job.select {
-        Select::Novelty => None,
-        Select::Max(id) | Select::Min(id) => Some(metrics.iter().position(|m| m.id == id).ok_or_else(|| {
-            let ids: Vec<&str> = metrics.iter().map(|m| m.id).collect();
-            anyhow!("{world_name} has no measurement '{id}' (available: {})", ids.join(", "))
-        })?),
-    };
     let dims = dim_names(metrics);
     let metric_count = metrics.len();
-    let vital: Vec<usize> = vital_metrics(WORLDS[world_index].id)
-        .iter()
-        .filter_map(|id| metrics.iter().position(|m| m.id == *id))
-        .collect();
+    let vital: Vec<usize> =
+        entry.vital.iter().filter_map(|id| metrics.iter().position(|m| m.id == *id)).collect();
     std::fs::create_dir_all(&job.out_dir).with_context(|| format!("creating {}", job.out_dir.display()))?;
     let started = Instant::now();
     let total = 1 + job.runs + job.refine * job.children;
     log::info!(
         "exploring {world_name} / {} at {}x{}: {} mutations, {} rounds of {} children, {} frames each, keeping {keep} by {}",
-        world.presets().get(world.preset()).copied().unwrap_or("custom"),
+        presets.get(base_preset).copied().unwrap_or("custom"),
         size[0],
         size[1],
         job.runs,
@@ -702,7 +750,8 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     let mut bench = Bench::new(gpu, world, size, job.frames.max(1), job.max_fps);
     let mut rng = Rng::new(job.seed ^ SEED_SALT);
     let mut candidates: Vec<Candidate> = Vec::new();
-    let evaluate = |bench: &mut Bench, candidates: &mut Vec<Candidate>, round: u32, origin: Origin, seed: u64| -> Result<()> {
+    let mut all = Vec::new();
+    let mut evaluate = |bench: &mut Bench, candidates: &mut Vec<Candidate>, round: u32, origin: Origin, seed: u64| -> Result<()> {
         let index = candidates.len();
         let clock = Instant::now();
         let settings = bench.world.settings()?;
@@ -714,6 +763,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         if let Some(pixels) = pixels {
             let path = job.out_dir.join("all").join(format!("{index:03}-r{round}-seed{seed}.png"));
             capture::save_png(&path, size, pixels)?;
+            all.push(path);
         }
         let secs = clock.elapsed().as_secs_f32();
         log::info!(
@@ -741,7 +791,6 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         });
         Ok(())
     };
-
     // Round 0: the base preset, then fresh mutations.
     evaluate(&mut bench, &mut candidates, 0, Origin::Preset, job.seed)?;
     for _ in 0..job.runs {
@@ -820,6 +869,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
 
     let mut images = Vec::new();
     let mut recipes = Vec::new();
+    let mut installed = Vec::new();
     let recipe_dir = job.out_dir.join("recipes");
     let mut library = job.library.clone().map(Library::open);
     for (rank, &i) in kept.iter().enumerate() {
@@ -838,7 +888,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         json.push('\n');
         std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
         if let Some(library) = &mut library {
-            library.save(saved).with_context(|| format!("installing {}", path.display()))?;
+            installed.push(library.save_as_new(saved).with_context(|| format!("installing {}", path.display()))?);
         }
         log::info!(
             "#{rank:02} = candidate {i} ({}), seed {}, novelty {:.3} -> {}",
@@ -854,7 +904,7 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
         log::info!("installed {} recipes into {}", kept.len(), library.directory.display());
     }
     let csv = job.out_dir.join("candidates.csv");
-    write_csv(&csv, &dims, &candidates)?;
+    write_csv(&csv, &dims, &candidates, presets)?;
     let sheet = if job.sheet {
         let tiles: Vec<(&str, PathBuf)> = images.iter().map(|p| ("kept", p.clone())).collect();
         let path = job.out_dir.join("contact-sheet.png");
@@ -863,8 +913,21 @@ pub fn explore_with(gpu: &Gpu, job: &ExploreJob) -> Result<Summary> {
     } else {
         None
     };
-    log::info!("explore done in {:.1}s", started.elapsed().as_secs_f32());
-    Ok(Summary { candidates, kept, images, recipes, sheet, csv })
+    let secs = started.elapsed().as_secs_f32();
+    log::info!("explore done in {secs:.1}s");
+    Ok(Summary {
+        world: world_index,
+        preset: base_preset,
+        candidates,
+        kept,
+        images,
+        recipes,
+        installed,
+        all,
+        sheet,
+        csv,
+        secs,
+    })
 }
 
 #[cfg(test)]
@@ -1052,19 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn every_world_names_vital_measurements_that_exist() {
-        let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
-        for entry in WORLDS {
-            let (_, world) = world::create(&gpu, entry.id, [64, 64], None, 1).unwrap();
-            let vital = vital_metrics(entry.id);
-            assert!(!vital.is_empty(), "{}: no vital measurement", entry.id);
-            for id in vital {
-                assert!(world.metrics().iter().any(|m| m.id == *id), "{}: unknown vital measurement {id}", entry.id);
-            }
-        }
-    }
-
-    #[test]
     fn explore_keeps_the_most_novel_symbiosis_candidates_and_writes_loadable_recipes() {
         let Some((_guard, gpu)) = crate::gpu::test_gpu() else { return };
         let dir = tempfile::tempdir().unwrap();
@@ -1098,6 +1148,11 @@ mod tests {
         }
         assert!(summary.sheet.as_ref().unwrap().exists());
         assert_eq!(std::fs::read_dir(job.out_dir.join("all")).unwrap().count(), 6);
+        assert_eq!(summary.all.len(), 6);
+        assert_eq!((WORLDS[summary.world].id, summary.preset), ("symbiosis", 0));
+        let files = summary.files();
+        assert_eq!(files.len(), 6 + 2 * 3 + 2, "all/, image + recipe + install per kept candidate, csv, sheet");
+        assert!(files.iter().all(|f| f.exists()), "{files:?}");
 
         let csv = std::fs::read_to_string(&summary.csv).unwrap();
         let mut lines = csv.lines();
@@ -1105,17 +1160,26 @@ mod tests {
         let expected_dims = dim_names(world::create(&gpu, "symbiosis", [96, 64], None, 1).unwrap().1.metrics());
         assert_eq!(
             header,
-            format!("index,round,origin,parent,seed,preset,rank,novelty,status,secs,{}", expected_dims.join(","))
+            format!(
+                "index,round,origin,parent,seed,preset,preset_name,rank,novelty,status,secs,{}",
+                expected_dims.join(",")
+            )
         );
         let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
         assert_eq!(rows.len(), 6);
+        // The preset column is 1-based like --preset; mutations may come from any preset.
+        assert_eq!((rows[0][5], rows[0][6]), ("1", "Living Reef"));
         for row in &rows {
-            assert_eq!(row.len(), 10 + expected_dims.len());
-            assert!(row[8] == "ok" || row[8] == "inert", "{row:?}");
-            assert!(row[9..].iter().all(|v| v.parse::<f32>().unwrap().is_finite()), "{row:?}");
+            assert_eq!(row.len(), 11 + expected_dims.len());
+            let preset: usize = row[5].parse().unwrap();
+            assert_eq!(row[6], world::symbiosis::preset_names()[preset - 1], "{row:?}");
+            assert!(row[9] == "ok" || row[9] == "inert", "{row:?}");
+            assert!(row[10..].iter().all(|v| v.parse::<f32>().unwrap().is_finite()), "{row:?}");
         }
         assert!(summary.kept.iter().all(|&i| !summary.candidates[i].inert), "inert candidates are never kept");
         assert_eq!(summary.recipes.len(), 2);
+        assert_eq!(summary.installed.len(), 2);
+        assert!(summary.installed.iter().all(|p| p.starts_with(dir.path().join("lib"))));
 
         let recipes = Library::open(job.out_dir.join("recipes"));
         assert!(recipes.warnings.is_empty(), "{:?}", recipes.warnings);
@@ -1153,5 +1217,27 @@ mod tests {
         };
         assert!(error.contains("growth_cover"), "{error}");
         assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
+    }
+
+    #[test]
+    fn plans_reject_bad_names_and_sizes_before_any_gpu_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = ExploreJob { out_dir: dir.path().join("out"), ..ExploreJob::new("symbiosis") };
+        let select = Select::Max("growth_cover".into());
+        let plan = plan(&ExploreJob { preset: Some("coral".into()), select, ..job.clone() }).unwrap();
+        assert_eq!((WORLDS[plan.world].id, plan.preset, plan.lane), ("symbiosis", Some(2), Some(0)));
+        assert!(job.out_dir.is_dir(), "the output folder is created and probed up front");
+        let cases = [
+            (ExploreJob { world: "symbiosys".into(), ..job.clone() }, "did you mean 'symbiosis'?"),
+            (ExploreJob { preset: Some("9".into()), ..job.clone() }, "Symbiosis has presets 1-6"),
+            (ExploreJob { select: Select::Min("growth_cove".into()), ..job.clone() }, "did you mean 'growth_cover'?"),
+            (ExploreJob { size: [8, 64], ..job.clone() }, "8x64 is not a supported size"),
+            (ExploreJob { size: [640, 20000], ..job.clone() }, "each side must be 16-16384 pixels"),
+        ];
+        for (bad, expected) in cases {
+            let error = super::plan(&bad).err().expect("the plan must fail");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(crate::failure::exit_code(&error), 2, "{error:#}");
+        }
     }
 }

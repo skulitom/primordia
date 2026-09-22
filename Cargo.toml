@@ -29,6 +29,8 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# "Did you mean" suggestions for world, preset and measurement names (clap already depends on it).
+strsim = "0.11"
 tempfile = "3"
 
 [profile.dev]

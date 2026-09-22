@@ -22,6 +22,10 @@ mod tests;
 
 const PRESETS: &[&str] = &["Living Reef", "Wandering Veins", "Coral Maze", "Spore Tide", "Root Atlas", "Fallow Gardens"];
 
+pub(crate) fn preset_names() -> &'static [&'static str] {
+    PRESETS
+}
+
 /// Activator concentration from which a cell counts as growth.
 const GROWTH_THRESHOLD: f32 = 0.1;
 /// Fertility below which ground counts as exhausted.
@@ -36,7 +40,7 @@ const ACTIVE_THRESHOLD: f32 = 1e-3;
 const ROUTE_THRESHOLD: f32 = 0.6;
 
 /// Lane order of `symbiosis_measure.wgsl`.
-const METRICS: &[MetricDesc] = &[
+pub(crate) const METRICS: &[MetricDesc] = &[
     MetricDesc {
         id: "growth_cover",
         label: "Growth cover",
