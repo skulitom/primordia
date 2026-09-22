@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use wgpu::util::DeviceExt as _;
 
 /// WGSL prelude prepended to every shader created through [`Gpu::shader`].
@@ -11,6 +11,22 @@ pub const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 
 /// Format of the HDR scene texture every world renders into.
 pub const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Restricts wgpu to these graphics backends (comma-separated, read by wgpu).
+pub const BACKEND_ENV: &str = "WGPU_BACKEND";
+/// Picks the adapter whose name contains this text, ignoring case (read by [`Gpu::new`]).
+pub const ADAPTER_NAME_ENV: &str = "WGPU_ADAPTER_NAME";
+/// The values of [`BACKEND_ENV`] worth suggesting.
+const BACKEND_VALUES: &str = "vulkan, dx12, metal, gl";
+
+/// What wgpu needs on this platform, for the no-GPU message.
+const GRAPHICS_APIS: &str = if cfg!(target_os = "macos") {
+    "Metal"
+} else if cfg!(windows) {
+    "Vulkan or DirectX 12"
+} else {
+    "Vulkan"
+};
 
 /// Hold this before creating an instance and until its GPU is dropped. The
 /// Windows Vulkan loader can crash during concurrent instance creation/drop
@@ -53,26 +69,39 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Creates a wgpu instance honouring the usual `WGPU_BACKEND` style env vars.
+    /// Creates a wgpu instance honouring the usual `WGPU_BACKEND` style env vars,
+    /// warning about backend names wgpu does not know (it ignores them silently).
     pub fn create_instance() -> wgpu::Instance {
+        if let Some(warning) = std::env::var(BACKEND_ENV).ok().and_then(|value| backend_env_warning(&value)) {
+            log::warn!("{warning}");
+        }
         wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default())
     }
 
-    /// Picks the high-performance adapter (compatible with `surface`, if given)
-    /// and opens a device with every limit the adapter supports.
+    /// Picks an adapter and opens a device with every limit the adapter
+    /// supports. `WGPU_ADAPTER_NAME` names the adapter (any part of its name,
+    /// ignoring case); otherwise wgpu picks the high-performance one
+    /// (`WGPU_POWER_PREF=low` asks for the other). Either way it must be able to
+    /// draw to `surface`, if given.
     pub async fn new(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Self> {
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::from_env()
-                    .unwrap_or(wgpu::PowerPreference::HighPerformance),
-                force_fallback_adapter: false,
-                compatible_surface: surface,
-            })
-            .await
-            .context("no suitable GPU adapter found")?;
+        let adapter = match env_value(ADAPTER_NAME_ENV) {
+            Some(wanted) => named_adapter(&instance, surface, &wanted)?,
+            None => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::from_env()
+                        .unwrap_or(wgpu::PowerPreference::HighPerformance),
+                    force_fallback_adapter: false,
+                    compatible_surface: surface,
+                })
+                .await
+                .map_err(|e| {
+                    log::debug!("wgpu found no adapter: {e}");
+                    anyhow!(no_gpu_message(std::env::var(BACKEND_ENV).ok().as_deref()))
+                })?,
+        };
 
         let info = adapter.get_info();
-        log::info!("GPU: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
+        log::info!("GPU: {}", describe_adapter(&info));
 
         // Optional niceties; only requested when the adapter has them.
         let wanted = wgpu::Features::FLOAT32_FILTERABLE;
@@ -312,6 +341,89 @@ impl Gpu {
     }
 }
 
+/// A variable's value, or `None` when it is unset or blank.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// "NVIDIA GeForce RTX 4090 (Vulkan, DiscreteGpu)".
+pub fn describe_adapter(info: &wgpu::AdapterInfo) -> String {
+    format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type)
+}
+
+/// The first adapter whose name contains `wanted` (ignoring case) and that can
+/// draw to `surface`, if given. The error lists every adapter wgpu found.
+fn named_adapter(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+    wanted: &str,
+) -> Result<wgpu::Adapter> {
+    let mut adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    if adapters.is_empty() {
+        bail!(no_gpu_message(std::env::var(BACKEND_ENV).ok().as_deref()));
+    }
+    let infos: Vec<wgpu::AdapterInfo> = adapters.iter().map(wgpu::Adapter::get_info).collect();
+    let usable: Vec<bool> = adapters.iter().map(|a| surface.is_none_or(|s| a.is_surface_supported(s))).collect();
+    match find_adapter(&infos, &usable, wanted) {
+        Some(index) => Ok(adapters.swap_remove(index)),
+        None => bail!(no_adapter_match_message(wanted, &infos, &usable)),
+    }
+}
+
+/// Index of the first usable adapter whose name contains `wanted`, ignoring case.
+fn find_adapter(infos: &[wgpu::AdapterInfo], usable: &[bool], wanted: &str) -> Option<usize> {
+    let wanted = wanted.trim().to_lowercase();
+    infos.iter().zip(usable).position(|(info, &ok)| ok && info.name.to_lowercase().contains(&wanted))
+}
+
+/// Why no adapter matched [`ADAPTER_NAME_ENV`], listing every adapter once.
+fn no_adapter_match_message(wanted: &str, infos: &[wgpu::AdapterInfo], usable: &[bool]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (info, &ok) in infos.iter().zip(usable) {
+        let line = format!("  {}{}", describe_adapter(info), if ok { "" } else { " - cannot draw to this window" });
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    format!(
+        "{ADAPTER_NAME_ENV}='{wanted}' matches no GPU adapter. Available adapters:\n{}\n\
+         Set {ADAPTER_NAME_ENV} to part of one of these names, or unset it to choose automatically.",
+        lines.join("\n")
+    )
+}
+
+/// The error when wgpu finds no adapter at all. `backend_env` is [`BACKEND_ENV`]'s value, if set.
+fn no_gpu_message(backend_env: Option<&str>) -> String {
+    let mut message = format!(
+        "Primordia needs a GPU with {GRAPHICS_APIS} support and could not find one. \
+         Update your graphics driver, then run `primordia selftest` to check it."
+    );
+    if let Some(value) = backend_env {
+        message += &format!(
+            "\n{BACKEND_ENV}='{value}' limits the search to those backends (valid values: {BACKEND_VALUES}); \
+             unset it to try them all."
+        );
+    }
+    message
+}
+
+/// A warning about entries of [`BACKEND_ENV`] (`value`) that name no backend;
+/// wgpu skips them without a word, and with none left it finds no GPU.
+fn backend_env_warning(value: &str) -> Option<String> {
+    let unknown: Vec<&str> =
+        value.split(',').map(str::trim).filter(|b| wgpu::Backends::from_comma_list(b).is_empty()).collect();
+    if wgpu::Backends::from_comma_list(value).is_empty() {
+        Some(format!(
+            "{BACKEND_ENV}='{value}' names no graphics backend (valid values: {BACKEND_VALUES}), so no GPU can be found"
+        ))
+    } else if !unknown.is_empty() {
+        let unknown = unknown.join("', '");
+        Some(format!("{BACKEND_ENV}: ignoring unknown backend '{unknown}' (valid values: {BACKEND_VALUES})"))
+    } else {
+        None
+    }
+}
+
 /// Records a render pass that draws the fullscreen triangle once into `target`.
 /// `clear = None` keeps (loads) the existing contents, e.g. for additive blending.
 pub fn fullscreen_pass(
@@ -427,4 +539,96 @@ pub fn dispatch_linear(count: u32, wg: u32) -> (u32, u32) {
     let groups = count.div_ceil(wg).max(1);
     const MAX: u32 = 65535;
     if groups <= MAX { (groups, 1) } else { (MAX, groups.div_ceil(MAX)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpu::{Backend, DeviceType};
+
+    fn info(name: &str, backend: Backend, device_type: DeviceType) -> wgpu::AdapterInfo {
+        let (driver, driver_info) = (String::new(), String::new());
+        wgpu::AdapterInfo { name: name.to_string(), vendor: 0, device: 0, device_type, driver, driver_info, backend }
+    }
+
+    /// The adapters of the development machine, in wgpu's order.
+    fn machine() -> Vec<wgpu::AdapterInfo> {
+        vec![
+            info("NVIDIA GeForce RTX 4090", Backend::Vulkan, DeviceType::DiscreteGpu),
+            info("AMD Radeon(TM) Graphics", Backend::Vulkan, DeviceType::IntegratedGpu),
+            info("NVIDIA GeForce RTX 4090", Backend::Dx12, DeviceType::DiscreteGpu),
+            info("AMD Radeon(TM) Graphics", Backend::Dx12, DeviceType::IntegratedGpu),
+            info("NVIDIA GeForce RTX 4090", Backend::Dx12, DeviceType::DiscreteGpu),
+            info("Microsoft Basic Render Driver", Backend::Dx12, DeviceType::Cpu),
+            info("NVIDIA GeForce RTX 4090/PCIe/SSE2", Backend::Gl, DeviceType::Other),
+        ]
+    }
+
+    #[test]
+    fn adapters_are_described_by_name_backend_and_type() {
+        let text = describe_adapter(&info("AMD Radeon(TM) Graphics", Backend::Vulkan, DeviceType::IntegratedGpu));
+        assert_eq!(text, "AMD Radeon(TM) Graphics (Vulkan, IntegratedGpu)");
+    }
+
+    #[test]
+    fn adapter_names_match_any_part_ignoring_case() {
+        let infos = machine();
+        let all = vec![true; infos.len()];
+        assert_eq!(find_adapter(&infos, &all, "radeon"), Some(1), "the first match wins");
+        assert_eq!(find_adapter(&infos, &all, "  RTX 4090 "), Some(0));
+        assert_eq!(find_adapter(&infos, &all, "basic render"), Some(5));
+        assert_eq!(find_adapter(&infos, &all, "sse2"), Some(6));
+        assert_eq!(find_adapter(&infos, &all, "nonexistent"), None);
+        // Adapters that cannot draw to the window are passed over.
+        let usable = [false, false, true, true, true, true, true];
+        assert_eq!(find_adapter(&infos, &usable, "radeon"), Some(3));
+        assert_eq!(find_adapter(&infos, &[false; 7], "radeon"), None);
+    }
+
+    #[test]
+    fn a_missing_adapter_name_lists_every_adapter_once() {
+        let infos = machine();
+        let mut usable = vec![true; infos.len()];
+        usable[6] = false;
+        let message = no_adapter_match_message("nonexistent", &infos, &usable);
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(lines[0], "WGPU_ADAPTER_NAME='nonexistent' matches no GPU adapter. Available adapters:");
+        assert_eq!(
+            &lines[1..7],
+            [
+                "  NVIDIA GeForce RTX 4090 (Vulkan, DiscreteGpu)",
+                "  AMD Radeon(TM) Graphics (Vulkan, IntegratedGpu)",
+                "  NVIDIA GeForce RTX 4090 (Dx12, DiscreteGpu)",
+                "  AMD Radeon(TM) Graphics (Dx12, IntegratedGpu)",
+                "  Microsoft Basic Render Driver (Dx12, Cpu)",
+                "  NVIDIA GeForce RTX 4090/PCIe/SSE2 (Gl, Other) - cannot draw to this window",
+            ]
+        );
+        assert!(lines[7].starts_with("Set WGPU_ADAPTER_NAME to part of one of these names"), "{message}");
+    }
+
+    #[test]
+    fn the_no_gpu_message_says_what_to_do_and_names_wgpu_backend() {
+        let plain = no_gpu_message(None);
+        assert!(plain.starts_with(&format!("Primordia needs a GPU with {GRAPHICS_APIS} support")), "{plain}");
+        assert!(plain.contains("Update your graphics driver") && plain.contains("`primordia selftest`"), "{plain}");
+        assert!(!plain.contains("WGPU_BACKEND"), "{plain}");
+        let limited = no_gpu_message(Some("bogus"));
+        assert!(limited.starts_with(&plain), "{limited}");
+        assert!(limited.contains("WGPU_BACKEND='bogus' limits the search"), "{limited}");
+        assert!(limited.contains("vulkan, dx12, metal, gl"), "{limited}");
+    }
+
+    #[test]
+    fn unknown_wgpu_backend_values_are_reported() {
+        for fine in ["vulkan", "DX12", "vulkan, dx12", "gl", "metal"] {
+            assert_eq!(backend_env_warning(fine), None, "{fine}");
+        }
+        let none = backend_env_warning("bogus").unwrap();
+        assert!(none.starts_with("WGPU_BACKEND='bogus' names no graphics backend"), "{none}");
+        assert!(none.ends_with("so no GPU can be found"), "{none}");
+        assert!(backend_env_warning("").is_some(), "an empty value disables every backend");
+        let partly = backend_env_warning("vulkan,bogus,dx13").unwrap();
+        assert!(partly.starts_with("WGPU_BACKEND: ignoring unknown backend 'bogus', 'dx13'"), "{partly}");
+    }
 }
