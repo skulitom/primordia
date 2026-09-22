@@ -1,0 +1,6 @@
+# Link the C runtime statically into Windows (MSVC) builds, so the exe runs on
+# a PC without the Visual C++ redistributable (VCRUNTIME140.dll). Scoped to the
+# target, as ripgrep does, so `cargo build` and `cargo install` both pick it up
+# and other platforms are left untouched.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
