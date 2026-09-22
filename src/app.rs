@@ -1190,10 +1190,9 @@ impl State {
         Ok(())
     }
 
-    /// `<world>_<preset>_<utc timestamp>` for screenshot / recording file names.
+    /// File name (without extension) for this moment's screenshot, recording or measurement log.
     fn capture_stem(&self) -> String {
-        let mutated = if self.modified { "-mutated" } else { "" };
-        format!("{}_{}{mutated}_{}", self.world.id(), headless::slug(self.preset_name()), utc_timestamp())
+        capture_stem(self.world.id(), self.preset_name(), self.modified, self.seed, &utc_timestamp())
     }
 
     fn save_screenshot(&mut self) -> Result<PathBuf> {
@@ -1796,6 +1795,15 @@ fn recording_frames_due(elapsed: Duration, written: u64) -> u32 {
     total.saturating_sub(written).min(u64::from(u32::MAX)) as u32
 }
 
+/// `<world>_<preset>[-mutated]_s<seed>_<utc timestamp>`, e.g.
+/// `lenia_pearl-reef_s1234_2026-09-22_10-15-00`. With the seed, `primordia
+/// render --world lenia --preset "Pearl Reef" --seed 1234` starts from the same
+/// initial state (at the same simulation size).
+fn capture_stem(world: &str, preset: &str, mutated: bool, seed: u64, timestamp: &str) -> String {
+    let mutated = if mutated { "-mutated" } else { "" };
+    format!("{world}_{}{mutated}_s{seed}_{timestamp}", headless::slug(preset))
+}
+
 /// Title-bar and taskbar icons for a window on a display with this scale factor.
 fn with_icons(mut attrs: WindowAttributes, scale_factor: f64) -> WindowAttributes {
     let icon = |points: f64| {
@@ -1853,6 +1861,18 @@ fn utc_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_names_carry_the_seed() {
+        let stem = capture_stem("lenia", "Pearl Reef", false, 1234, "2026-09-22_10-15-00");
+        assert_eq!(stem, "lenia_pearl-reef_s1234_2026-09-22_10-15-00");
+        let stem = capture_stem("particle-life", "Predator & Prey", true, u64::MAX, "2026-09-22_10-15-00");
+        assert_eq!(stem, format!("particle-life_predator-prey-mutated_s{}_2026-09-22_10-15-00", u64::MAX));
+        // The stamp keeps its own format and stays a valid file name everywhere.
+        let stem = capture_stem("physarum", "Dendrites", false, 7, &utc_timestamp());
+        assert!(stem.starts_with("physarum_dendrites_s7_20"), "{stem}");
+        assert!(stem.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)), "{stem}");
+    }
 
     #[test]
     fn recording_catches_up_after_slow_or_skipped_frames() {
