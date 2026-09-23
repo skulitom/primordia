@@ -134,9 +134,9 @@ cargo run --release -- --world symbiosis --preset "Fallow Gardens" --seed 42
 
 You need a GPU with Vulkan, DirectX 12 or Metal. [ffmpeg](https://ffmpeg.org) is optional and is only used for video.
 
-**Windows:** download the executable from the [latest release](https://github.com/skulitom/primordia/releases/latest) and run it. It is not code-signed, so SmartScreen may ask you to choose **More info → Run anyway**.
+**Download:** the [latest release](https://github.com/skulitom/primordia/releases/latest) has archives for Windows (x86-64), Linux (x86-64, glibc 2.35 or newer, such as Ubuntu 22.04 or Debian 12) and macOS (Apple silicon and Intel). Unpack one and run `primordia`; put its folder on your PATH to use the commands in this README. The binaries are not code-signed. On Windows, SmartScreen may ask you to choose **More info → Run anyway**. On macOS, if it refuses to open, allow it under **System Settings → Privacy & Security**, or run `xattr -d com.apple.quarantine primordia`. On Linux it needs a Vulkan driver, such as Mesa's.
 
-**Any platform, with Rust 1.86 or newer:** install the `primordia` command that the examples in this README use,
+**With Rust 1.86 or newer, on any platform:** install the `primordia` command that the examples in this README use,
 
 ```bash
 cargo install --locked --git https://github.com/skulitom/primordia

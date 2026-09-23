@@ -105,9 +105,10 @@ folder or from `primordia explore`, so others can load it too.
 
 ## Releases
 
-Maintainers set `version` in `Cargo.toml`, commit, and push a tag such as `v0.2.0`. `.github/workflows/release.yml`
-then builds Windows, Linux and macOS archives and attaches them, with `SHA256SUMS.txt`, to a draft release to review
-and publish by hand. The workflow stops if the tag and `Cargo.toml` disagree.
+Maintainers describe the version in `CHANGELOG.md`, set it in `Cargo.toml` and `CITATION.cff` (with the date), commit,
+and push a tag such as `v0.2.0`. `.github/workflows/release.yml` then builds Windows, Linux and macOS archives and
+attaches them, with `SHA256SUMS.txt`, to a draft release to review and publish by hand. The workflow stops if the tag
+and `Cargo.toml` disagree.
 
 ## License
 
