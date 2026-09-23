@@ -8,10 +8,7 @@
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
 
 <p align="center">
-  <picture>
-    <source srcset="docs/images/hero.webp" type="image/webp">
-    <img src="docs/images/physarum.png" alt="Primordia in motion: a Physarum galaxy, particle-life serpents, a Lenia pearl reef and Gray-Scott spiral waves" width="800">
-  </picture>
+  <img src="docs/images/hero.webp" alt="Primordia in motion: a Physarum galaxy, particle-life serpents, a Lenia pearl reef and Gray-Scott spiral waves" width="800">
 </p>
 
 Primordia is a playground for **emergence** and **self-organisation**. It has four classic artificial-life (ALife) systems plus **Symbiosis**, an experiment that couples agents and chemistry, **42 presets** and a *Mutate* button for exploring new settings. A cinematic HDR pipeline is shared by all five worlds. Use it as a screensaver, a generative-art tool, a teaching aid for agent-based models and cellular automata, or as a starting point for your own GPU simulations.
@@ -31,47 +28,47 @@ Primordia is a playground for **emergence** and **self-organisation**. It has fo
 
 ### 1 · Physarum (slime mould)
 
-![Physarum slime-mould transport network, Dendrites preset](docs/images/physarum.png)
+![Physarum slime-mould transport network, Dendrites preset](docs/images/physarum.webp)
 
 A multi-species version of Jeff Jones' *Physarum polycephalum* agent model, in the spirit of Sage Jenson's work. About **3-6 million agents** (at 1080p) sense the chemical trail ahead of them, steer toward it and deposit more. Out of that loop grow self-optimising transport networks: white-hot arteries fed by fine capillaries that keep remodelling. Up to four species attract or repel each other through an interaction matrix and fight over territory. Left-click drops food; right-click repels.
 
 **Presets:** Dendrites · Neural Lace · Mycelium · Rival Colonies · Symbiosis · Honeycomb · Synapses · Currents · Chasing Waves · Galaxy
 
-![All Physarum presets](docs/images/physarum-presets.png)
+![All Physarum presets](docs/images/physarum-presets.webp)
 
 ### 2 · Particle Life
 
-![Particle Life serpents: chains of particles self-assembled from asymmetric attraction rules](docs/images/particle-life.png)
+![Particle Life serpents: chains of particles self-assembled from asymmetric attraction rules](docs/images/particle-life.webp)
 
 Particle life after Jeffrey Ventrella's *Clusters* and Tom Mohr: up to 8 species, each with its own asymmetric attraction or repulsion toward every other species. Those simple pairwise rules produce membranes, cells, serpents, rotating suns and predator-prey chases. Neighbour search is a GPU uniform grid rebuilt every step, and forces are summed in fixed point, so every run replays exactly from its seed. Left-click attracts; right-click scatters.
 
 **Presets:** Tidepool · Living Cells · Serpents · Rotating Suns · Lace · Marbling · Predator & Prey · Plankton · Necklaces
 
-![All Particle Life presets](docs/images/particle-life-presets.png)
+![All Particle Life presets](docs/images/particle-life-presets.webp)
 
 ### 3 · Lenia
 
-![Lenia continuous cellular automaton: Orbium gliders among pearl colonies](docs/images/lenia.png)
+![Lenia continuous cellular automaton: Orbium gliders among pearl colonies](docs/images/lenia.webp)
 
 Bert Chan's Lenia, a continuous cellular automaton, in its multi-channel, multi-kernel "expanded" form: up to 3 channels and 16 kernels. The classic **Orbium** gliders are hatched from the published pattern and released at random headings. Around them live giants and minnows, pearl reefs that grow into rings, the worm colonies of *Hydrogeminium* and the gyrating *Tessellatium*. Left-click paints life; right-click erases it.
 
 **Presets:** Orbium · Leviathans · Menagerie · Pearl Reef · Necklaces · Hydrogeminium · Tessellatium
 
-![All Lenia presets](docs/images/lenia-presets.png)
+![All Lenia presets](docs/images/lenia-presets.webp)
 
 ### 4 · Reaction-Diffusion (Gray-Scott)
 
-![Gray-Scott reaction-diffusion: pink coral colonies in relief on deep navy](docs/images/reaction-diffusion.png)
+![Gray-Scott reaction-diffusion: pink coral colonies in relief on deep navy](docs/images/reaction-diffusion.webp)
 
 Two virtual chemicals, U and V, react (`U + 2V → 3V`) and diffuse. Depending on the feed and kill rates, that gives coral, dividing cells, fingerprints, worms, solitons, crescent gliders, spiral waves or soap-film foam. Slow, periodic "weather" keeps every pattern alive and evolving. The *Morphology Atlas* preset sweeps feed and kill across space, so the whole Pearson zoo lives on one seamless torus. The field is lit as a height map in one of five materials, including thin-film nacre and ink on paper. Left-click seeds chemistry; right-click erases.
 
 **Presets:** Coral Reef · Mitosis · Fingerprints · Worms · Solitons · Crescent Gliders · Spiral Waves · Bubbles · Spots & Stripes · Morphology Atlas
 
-![All reaction-diffusion presets](docs/images/reaction-diffusion-presets.png)
+![All reaction-diffusion presets](docs/images/reaction-diffusion-presets.webp)
 
 ### 5. Symbiosis
 
-![Symbiosis: pale agent networks crossing turquoise chemical colonies](docs/images/symbiosis.png)
+![Symbiosis: pale agent networks crossing turquoise chemical colonies](docs/images/symbiosis.webp)
 
 A coupled-world experiment with three **Relationships**. **Cultivate** agents tend growth margins and nourish colonies. **Graze** agents pursue and consume growth, leaving depleted routes behind them. **Weave** agents germinate new growth along their busiest trails. Both directions respond to one **Coupling strength** slider; at zero, chemistry and agents keep running independently. This uses a dedicated shared habitat, with a bounded grid to keep larger displays responsive.
 
@@ -88,23 +85,23 @@ The presets explore different growth scales, steering and chemical regimes:
 
 **Habitat & growth** controls the pattern scale and a seamless fertility landscape generated from the seed. Choose scattered islands, clustered colonies, living threads or broken wave fronts, then **Restart this seed** to apply the seeding layout. **Mutate** explores these layouts, scale, geography, agent behaviour and fertility cycles across all six preset families. **Trail light**, under Look, balances the visible network against the chemistry.
 
-![The first five Symbiosis presets after 3600 frames (Fallow Gardens is shown below): seed 42 in the top row, seed 314159 below](docs/images/symbiosis-presets.png)
+![The first five Symbiosis presets after 3600 frames (Fallow Gardens is shown below): seed 42 in the top row, seed 314159 below](docs/images/symbiosis-presets.webp)
 
 Switch the **View** between Together, Chemistry, Agent trails and Fertility to inspect the interaction. Changes to the relationship and coupling take effect immediately; the existing habitat carries its history forward. Left-drag seeds chemistry; right-drag clears chemistry and trails. The library keeps the relationship, habitat, seed, settings, palette and view. Earlier recipes retain their original cultivation behaviour, uniform habitat and seeding settings.
 
 Enable **Compare habitats** to restart two habitats from the same seed. The left uses your settings; choose **Coupling off** or **Fertility cycle off** for the right-hand reference. The latter keeps agent–chemistry coupling intact and removes only depletion and its effects. All other settings, brush strokes, pan and zoom are shared. Changing the reference or choosing **Restart comparison** repeats the experiment from that seed with your current settings; turning comparison off keeps the left habitat running. The mode and reference are saved with your recipe; earlier comparison saves retain their coupling-off reference. Press **H / Tab** to give both panes more room. Comparison runs two simulations, so it uses more GPU time and memory.
 
-![Living Reef, seed 42 after 720 frames: coupling 0.70 on the left, coupling off on the right](docs/images/symbiosis-comparison.png)
+![Living Reef, seed 42 after 720 frames: coupling 0.70 on the left, coupling off on the right](docs/images/symbiosis-comparison.webp)
 
 **Fertility cycle** gives the ground a slower memory. Concentrated traffic depletes local reserves, increasing chemical loss and making new growth harder to germinate. When traffic moves away, fertility gradually returns. **Depletion strength** controls the effect; zero bypasses it. **Recovery time (s)** is the time to recover about 63% of missing fertility on rested ground at 60 simulation frames per second. It follows simulation frames, pauses with the world, and is independent of chemistry steps and growth scale. Coupling at zero also removes depletion and its effects.
 
 The **Fertility** view uses rust for exhausted ground and teal for fertile ground, with faint colony outlines. Clearing chemistry leaves this history intact; restarting restores full reserves. Saved recipes retain the cycle settings but restart the habitat, just like other library saves. The five earlier presets and older recipes keep depletion off; **Fallow Gardens** starts with it enabled and selects the fertility-off reference for comparison.
 
-![Fallow Gardens, seed 42 after 6000 frames: fertility cycle enabled on the left and disabled on the right](docs/images/fallow-gardens-comparison.png)
+![Fallow Gardens, seed 42 after 6000 frames: fertility cycle enabled on the left and disabled on the right](docs/images/fallow-gardens-comparison.webp)
 
 The same moment in the fertility view shows depleted routes on the left; the reference keeps full reserves. In this seed-42 experiment, the cycle leaves larger open regions between routes while the reference develops a denser mesh. Both habitats remain active through 7200 frames (two minutes at 60 frames/s).
 
-![Fallow Gardens fertility reserves at the same moment: rust marks exhausted ground, teal marks fertile ground](docs/images/fallow-gardens-fertility.png)
+![Fallow Gardens fertility reserves at the same moment: rust marks exhausted ground, teal marks fertile ground](docs/images/fallow-gardens-fertility.webp)
 
 ```bash
 cargo run --release -- --world symbiosis --preset "Living Reef"
