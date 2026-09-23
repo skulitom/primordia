@@ -174,8 +174,10 @@ enum Command {
         "  primordia render --recipe mito.png -o mito-again.png\n\n",
         "--recipe reproduces a recipe exactly at its own size, seed, look and camera; --width and --height run the ",
         "same rules on a larger or smaller world, and the other options override the recipe's. Every PNG written ",
-        "carries its recipe, the command that renders it again and the GPU that rendered it (runs repeat exactly ",
-        "only on the same GPU, driver and backend).\n\n",
+        "carries its recipe, how many frames it ran and at what rate, the command that renders it again and the GPU ",
+        "that rendered it (runs repeat exactly only on the same GPU, driver and backend). Given a PNG, --recipe also ",
+        "takes its frame count and rate as the defaults of --frames and --fps, so `render --recipe image.png` ",
+        "renders that image again; a .json recipe runs 600 frames at 60 fps unless they say otherwise.\n\n",
         "Output, environment variables and exit status: see `primordia --help`."
     ))]
     Render(RenderArgs),
@@ -307,6 +309,12 @@ fn image_side() -> clap::builder::RangedI64ValueParser<u32> {
     clap::value_parser!(u32).range(i64::from(headless::MIN_SIZE)..=i64::from(headless::MAX_SIZE))
 }
 
+/// `1..=1000` frames per simulated second.
+fn fps_value() -> clap::builder::RangedI64ValueParser<u32> {
+    let range = headless::FPS_RANGE;
+    clap::value_parser!(u32).range(i64::from(*range.start())..=i64::from(*range.end()))
+}
+
 #[derive(Args)]
 struct ListArgs {
     /// Only this world (an id, 1-5, an alias or a unique prefix)
@@ -336,12 +344,13 @@ struct RenderArgs {
     /// recipe's]
     #[arg(long, value_parser = image_side())]
     height: Option<u32>,
-    /// Frames to simulate before the final image
-    #[arg(short, long, default_value_t = 600, value_parser = at_least_one)]
-    frames: u32,
-    /// Frames per simulated second: sets the time step (1/fps) and the video frame rate
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=1000))]
-    fps: u32,
+    /// Frames to simulate before the final image [default: 600, or the frame count of a PNG given to --recipe]
+    #[arg(short, long, value_parser = at_least_one)]
+    frames: Option<u32>,
+    /// Frames per simulated second: sets the time step (1/fps) and the video frame rate [default: 60, or the
+    /// rate of a PNG given to --recipe]
+    #[arg(long, value_parser = fps_value())]
+    fps: Option<u32>,
     /// Output PNG of the final frame [default: renders/<world>-<preset>-s<seed>.png, or
     /// renders/<recipe file name>.png; skipped when only --video is given]
     #[arg(short, long)]
@@ -713,8 +722,29 @@ fn recipe_defaults(recipe: Option<&recipe::Recipe>, seed: Option<u64>, size: [Op
     (seed.or(saved.map(|s| s.seed)).unwrap_or(1), [size[0].unwrap_or(width), size[1].unwrap_or(height)])
 }
 
+/// The frames and frames per simulated second of a render: the options given,
+/// else what a PNG given to `--recipe` records, else 600 at 60. Says so when
+/// the PNG's values are used.
+fn render_run(recipe: Option<&recipe::Recipe>, frames: Option<u32>, fps: Option<u32>) -> (u32, u32) {
+    let recorded = recipe.and_then(|r| r.run).unwrap_or_default();
+    let taken: Vec<String> = [
+        recorded.frames.filter(|_| frames.is_none()).map(|n| format!("{n} frames")),
+        recorded.fps.filter(|_| fps.is_none()).map(|f| format!("{f} fps")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let (Some(recipe), false) = (recipe, taken.is_empty()) {
+        let (what, png) = (taken.join(" at "), recipe.path.display());
+        log::info!("using the {what} that {png} records (--frames and --fps change them)");
+    }
+    let frames = frames.or(recorded.frames).unwrap_or(headless::DEFAULT_FRAMES);
+    (frames, fps.or(recorded.fps).unwrap_or(headless::DEFAULT_FPS))
+}
+
 /// The render job for `r`, reading its `--recipe`: the recipe's seed, size and
-/// camera apply unless the options replace them.
+/// camera apply unless the options replace them, and so do a recipe PNG's
+/// frame count and time step.
 fn render_job(r: RenderArgs) -> Result<headless::RenderJob> {
     if !r.center.is_empty() && r.center.len() != 2 {
         return Err(Failure::Usage.error("--center expects two comma-separated numbers, e.g. --center 0.25,0.5"));
@@ -729,6 +759,7 @@ fn render_job(r: RenderArgs) -> Result<headless::RenderJob> {
     });
     let source = r.recipe.as_deref().map(recipe::Recipe::load).transpose()?;
     let (seed, size) = recipe_defaults(source.as_ref(), r.seed, [r.width, r.height]);
+    let (frames, fps) = render_run(source.as_ref(), r.frames, r.fps);
     let mut camera = source.as_ref().map_or_else(world::Camera::default, |s| s.saved.camera);
     if let Some(zoom) = r.zoom {
         camera.zoom = zoom;
@@ -743,8 +774,8 @@ fn render_job(r: RenderArgs) -> Result<headless::RenderJob> {
         sets: r.set,
         seed,
         size,
-        frames: r.frames,
-        fps: r.fps,
+        frames,
+        fps,
         out: r.out,
         save_recipe: r.save_recipe,
         video: r.video,
@@ -1071,6 +1102,19 @@ mod tests {
         let args = render_args(&["--recipe", reef, "--zoom", "4"]);
         assert_eq!(render_job(args).unwrap().camera, world::Camera { zoom: 4.0, ..saved.camera });
 
+        // A PNG's frame count and rate are the defaults of --frames and --fps; a .json recipe's are 600 and 60.
+        let png = dir.path().join("reef.png");
+        let run = Some(capture::Run { frames: 42, fps: 30 });
+        let provenance = capture::Provenance { recipe: Some(saved.clone()), run, ..Default::default() };
+        capture::write_png(&png, [4, 4], &[0; 64], &provenance).unwrap();
+        let png = png.to_str().unwrap();
+        let run = |argv: &[&str]| render_job(render_args(argv)).map(|job| (job.frames, job.fps)).unwrap();
+        assert_eq!(run(&["--recipe", png]), (42, 30));
+        assert_eq!(run(&["--recipe", png, "--frames", "5"]), (5, 30));
+        assert_eq!(run(&["--recipe", png, "--fps", "60"]), (42, 60));
+        assert_eq!(run(&["--recipe", reef]), (600, 60));
+        assert_eq!(run(&["-w", "rd", "--fps", "24"]), (600, 24));
+
         // A recipe replaces --world and --preset; --set and --save-recipe work without one.
         for conflict in [&["-w", "rd"][..], &["--preset", "2"], &["--world=lenia"]] {
             let argv: Vec<&str> = ["primordia", "render", "--recipe", reef].iter().chain(conflict).copied().collect();
@@ -1107,6 +1151,9 @@ mod tests {
         }
         let help = cli.find_subcommand_mut("render").unwrap().render_long_help().to_string();
         assert!(help.contains("--save-recipe") && help.contains("same GPU, driver and backend"), "{help}");
+        for text in ["or the frame count of a PNG given to --recipe]", "defaults of --frames and --fps"] {
+            assert!(help.contains(text), "missing {text:?}: {help}");
+        }
     }
 
     /// The PNG an image path holds, as RGBA bytes.
@@ -1151,20 +1198,21 @@ mod tests {
             for (rank, (image, recipe)) in summary.images.iter().zip(&summary.recipes).enumerate() {
                 let original = pixels(image);
                 colours = colours.max(original.chunks(4).collect::<std::collections::HashSet<_>>().len());
-                for (source, name) in [(recipe, "from-json.png"), (image, "from-png.png")] {
+                // The explore PNG records its 12 frames; the .json recipe needs them said.
+                let sources = [(recipe, "from-json.png", &["--frames", "12"][..]), (image, "from-png.png", &[])];
+                for (source, name, frames) in sources {
                     let out = dir.path().join(format!("{}-{rank}-{name}", entry.id));
-                    let args = [
-                        "--recipe", source.to_str().unwrap(), "--frames", "12", "-o", out.to_str().unwrap(),
-                    ];
+                    let (source, out) = (source.to_str().unwrap(), out.to_str().unwrap());
+                    let args = [&["--recipe", source, "-o", out][..], frames].concat();
                     let rendered = render_cli(&gpu, &args);
+                    assert_eq!(rendered.frames, 12);
                     assert_eq!(rendered.size, [96, 64], "the recipe's own size");
                     assert!(
-                        pixels(&out) == original,
-                        "{} #{} ({}): {} does not reproduce {}",
+                        pixels(Path::new(out)) == original,
+                        "{} #{} ({}): {source} does not reproduce {}",
                         entry.id,
                         rank + 1,
                         origins[rank],
-                        source.display(),
                         image.display()
                     );
                 }
@@ -1196,26 +1244,41 @@ mod tests {
         assert_eq!((embedded.seed, embedded.output_size, embedded.preset), (7, [90, 60], 1));
         assert_eq!(embedded.camera, world::Camera { center: [0.4, 0.6], zoom: 1.5 });
         assert_eq!((embedded.look.exposure, embedded.name.as_str()), (1.3, "Reaction-Diffusion · Mitosis (seed 7)"));
-        let comment = |png: &str| {
+        let text = |png: &str, key: &str| {
             let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(png).unwrap()));
             let reader = decoder.read_info().unwrap();
-            let chunk = reader.info().uncompressed_latin1_text.iter().find(|c| c.keyword == "Comment").cloned();
-            chunk.expect("a Comment chunk").text
+            let chunk = reader.info().uncompressed_latin1_text.iter().find(|c| c.keyword == key).cloned();
+            chunk.map(|c| c.text)
         };
-        assert_eq!(comment(&first), "primordia render --recipe first.png --frames 9");
+        let comment = |png: &str| text(png, "Comment").expect("a Comment chunk");
+        let run = |png: &str| (text(png, "primordia:frames"), text(png, "primordia:fps"));
+        // The PNG records its frames and rate, so its Comment needs nothing but the PNG.
+        assert_eq!(comment(&first), "primordia render --recipe first.png");
+        assert_eq!(run(&first), (Some("9".into()), Some("60".into())));
 
-        for (source, frames_arg, expected) in [
-            (first.clone(), "9", first.clone()),
-            (saved.clone(), "9", first.clone()),
-            (file("frames/reaction-diffusion_00006.png"), "6", file("frames/reaction-diffusion_00006.png")),
-        ] {
-            let again = file(&format!("again-{frames_arg}.png"));
-            render_cli(&gpu, &["--recipe", &source, "--frames", frames_arg, "-o", &again]);
-            let same = pixels(Path::new(&again)) == pixels(Path::new(&expected));
+        // A PNG replays its own frame count and rate without --frames; a .json recipe needs --frames.
+        let sixth = file("frames/reaction-diffusion_00006.png");
+        let cases = [(&first, None, &first), (&saved, Some("9"), &first), (&sixth, None, &sixth)];
+        for (i, (source, frames, expected)) in cases.into_iter().enumerate() {
+            let again = file(&format!("again-{i}.png"));
+            let mut args = vec!["--recipe", source.as_str(), "-o", &again];
+            args.extend(frames.map(|n| ["--frames", n]).into_iter().flatten());
+            render_cli(&gpu, &args);
+            let same = pixels(Path::new(&again)) == pixels(Path::new(expected));
             assert!(same, "{source} does not render {expected} again");
         }
-        let frame = comment(&file("frames/reaction-diffusion_00006.png"));
-        assert!(frame.ends_with("--recipe reaction-diffusion_00006.png --frames 6"), "{frame}");
+        assert!(comment(&sixth).ends_with("--recipe reaction-diffusion_00006.png"), "{}", comment(&sixth));
+        assert_eq!(run(&sixth), (Some("6".into()), Some("60".into())));
+
+        // So does a render at another rate, bit for bit; the options still override what the PNG records.
+        let slow = file("slow.png");
+        let args = ["-w", "rd", "-p", "mitosis", "--width", "64", "--height", "48", "--frames", "7", "--fps", "24"];
+        render_cli(&gpu, &[&args[..], &["-o", &slow]].concat());
+        assert_eq!(run(&slow), (Some("7".into()), Some("24".into())));
+        let again = file("slow-again.png");
+        let replay = render_cli(&gpu, &["--recipe", &slow, "-o", &again]);
+        assert_eq!((replay.frames, replay.size), (7, [64, 48]));
+        assert!(pixels(Path::new(&again)) == pixels(Path::new(&slow)), "a PNG at 24 fps renders again from itself");
 
         // An unedited preset's PNG names the preset instead, and that command renders it again.
         // Use soup seeding: this checks the PNG's command, not the expensive Orbium nursery.

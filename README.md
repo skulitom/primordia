@@ -216,7 +216,7 @@ primordia render --world symbiosis --preset "Fallow Gardens" --seed 42 --frames 
 
 # Render a recipe again: a library or explore .json, or any PNG Primordia wrote
 primordia render --recipe explore/lenia-orbium-s1/recipes/01-seed1.json --width 3840 --height 2160
-primordia render --recipe physarum.png --frames 600 --out physarum-again.png
+primordia render --recipe physarum.png --out physarum-again.png
 
 # Change any setting of a preset from the command line
 primordia render --world reaction-diffusion --preset mitosis --set params.feed=0.031 --save-recipe mito.json
@@ -228,7 +228,7 @@ primordia selftest                # verify this GPU's shader maths and list its 
 
 Worlds and presets accept a name, a unique prefix, a number or an alias (`rd`, `pl`, `slime`, `gray-scott`); a typo gets a suggestion. Headless renders are capped at 240 fps by default, so long batch jobs don't run your GPU flat out; `--max-fps 0` removes the cap. `primordia help render` lists every option.
 
-Every PNG that Primordia writes names the program and its source and carries its recipe, the GPU and a command that reproduces it, in PNG text chunks (`Software`, `Source`, `Title`, `Comment`, `primordia:gpu` and `primordia:recipe`). The same seed, settings and frame count give the same image on the same GPU, driver and backend. Other GPUs give the same kind of pattern, but the chaotic worlds (Particle Life, Physarum, Symbiosis) diverge within a few hundred frames.
+Every PNG that Primordia writes names the program and its source and carries its recipe, how many frames the world ran and at what rate, the GPU and a command that reproduces it, in PNG text chunks (`Software`, `Source`, `Title`, `Comment`, `primordia:gpu`, `primordia:frames`, `primordia:fps` and `primordia:recipe`). The same seed, settings and frame count give the same image on the same GPU, driver and backend. Other GPUs give the same kind of pattern, but the chaotic worlds (Particle Life, Physarum, Symbiosis) diverge within a few hundred frames.
 
 ## Exploring by novelty
 
@@ -258,7 +258,7 @@ Primordia is built to be driven by scripts and AI agents as well as by hand.
 - **Discovery without a GPU.** `primordia list --json` describes every world: ids, aliases, presets, measurements (id, unit, range, meaning, and whether explore treats it as vital) and palettes, plus the library folder.
 - **Output.** Logs and progress go to stderr (`-q` keeps warnings and errors, `-v` adds debug). stdout carries results only: the path of every file written, one per line, or with `--json` a single JSON object at the end, `{"ok":true,"command":"render",...}` or `{"ok":false,"error":{"kind":...,"message":...}}`. Seeds are JSON strings, because they can exceed what JavaScript numbers hold exactly.
 - **Exit status.** 0 success, 1 another failure (such as file I/O), 2 invalid input (an unknown or ambiguous world, preset, measurement or setting, an unreadable recipe, a size out of range or an unwritable output path), 3 no usable GPU or a GPU failure, 4 ffmpeg missing or failed. Names and output paths are checked before the GPU starts.
-- **Recipes.** `render --recipe` and `explore --recipe` take a library or explore JSON file or a PNG written by Primordia. `--set KEY=VALUE` (repeatable) edits a setting by its path, such as `params.feed=0.031`, `palette=Frost` or `post.exposure=1.2`; an unknown key lists the valid ones. `render --save-recipe` writes the recipe it rendered, and `primordia recipe` prints a preset's or recipe's complete JSON. A recipe restarts from its seed; pass the same `--frames` to reach the same moment.
+- **Recipes.** `render --recipe` and `explore --recipe` take a library or explore JSON file or a PNG written by Primordia. `--set KEY=VALUE` (repeatable) edits a setting by its path, such as `params.feed=0.031`, `palette=Frost` or `post.exposure=1.2`; an unknown key lists the valid ones. `render --save-recipe` writes the recipe it rendered, and `primordia recipe` prints a preset's or recipe's complete JSON. A recipe restarts from its seed. Given a PNG, `render --recipe` also runs the frame count and rate the PNG records, so it reaches the same moment; for a JSON recipe, pass the same `--frames`.
 - **Bare `primordia` opens a window** and blocks until it is closed; add `--exit-after SECS` in scripts.
 
 | Environment variable | Effect |

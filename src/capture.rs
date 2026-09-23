@@ -90,6 +90,10 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, 
 /// Keyword of the iTXt chunk that carries a PNG's recipe: the JSON of a
 /// library save ([`SavedWorld`]), which `render --recipe` reads back.
 pub const RECIPE_KEYWORD: &str = "primordia:recipe";
+/// Keyword of the tEXt chunk with the number of frames simulated before the image.
+pub const FRAMES_KEYWORD: &str = "primordia:frames";
+/// Keyword of the tEXt chunk with the frames per simulated second (the time step is 1/fps).
+pub const FPS_KEYWORD: &str = "primordia:fps";
 
 /// What a PNG written by Primordia says about where it came from. Every PNG
 /// gets tEXt `Software` ("Primordia <version>") and `Source` (the repository);
@@ -103,19 +107,36 @@ pub struct Provenance {
     /// `primordia:gpu`: the GPU that rendered it (a run replays exactly only on
     /// the same GPU, driver and backend).
     pub gpu: Option<String>,
+    /// [`FRAMES_KEYWORD`] and [`FPS_KEYWORD`]: how long the world ran before
+    /// the image, and at what time step; `render --recipe` defaults to them.
+    pub run: Option<Run>,
     /// iTXt [`RECIPE_KEYWORD`]: the recipe of the world shown.
     pub recipe: Option<SavedWorld>,
+}
+
+/// How far a world had run when an image of it was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    /// Frames simulated from the recipe's start.
+    pub frames: u32,
+    /// Frames per simulated second: each frame advanced the world by 1/fps seconds.
+    pub fps: u32,
 }
 
 impl Provenance {
     /// An image of `recipe` rendered on `gpu`, titled "<World> · <Preset>".
     pub fn of(recipe: &SavedWorld, gpu: &Gpu) -> Self {
-        Self { title: Some(title(recipe)), command: None, gpu: Some(gpu_name(gpu)), recipe: Some(recipe.clone()) }
+        Self { title: Some(title(recipe)), gpu: Some(gpu_name(gpu)), recipe: Some(recipe.clone()), ..Self::default() }
     }
 
     /// The same, with `command` as the `Comment`.
     pub fn with_command(self, command: String) -> Self {
         Self { command: Some(command), ..self }
+    }
+
+    /// The same, taken after `frames` frames of `1 / fps` seconds.
+    pub fn with_run(self, frames: u32, fps: u32) -> Self {
+        Self { run: Some(Run { frames, fps }), ..self }
     }
 }
 
@@ -155,6 +176,9 @@ pub fn write_png(path: &Path, size: [u32; 2], rgba: &[u8], provenance: &Provenan
     text.extend(provenance.title.clone().map(|t| ("Title", t)));
     text.extend(provenance.command.clone().map(|c| ("Comment", c)));
     text.extend(provenance.gpu.clone().map(|g| ("primordia:gpu", g)));
+    if let Some(run) = provenance.run {
+        text.extend([(FRAMES_KEYWORD, run.frames.to_string()), (FPS_KEYWORD, run.fps.to_string())]);
+    }
     let recipe = provenance.recipe.as_ref().map(serde_json::to_string).transpose().context("serialising the recipe")?;
 
     let written = (|| -> Result<()> {
@@ -184,17 +208,45 @@ pub fn write_png(path: &Path, size: [u32; 2], rgba: &[u8], provenance: &Provenan
     written.with_context(|| format!("writing {}", path.display()))
 }
 
-/// The JSON text of the recipe a PNG carries ([`RECIPE_KEYWORD`]), or `None`.
-/// Only the chunks before the image data are read, which is where
-/// [`write_png`] puts them.
-pub fn read_recipe(path: &Path) -> Result<Option<String>> {
+/// Whether the file at `path` starts with [`PNG_SIGNATURE`].
+pub fn is_png(path: &Path) -> Result<bool> {
+    use std::io::Read as _;
+    let mut signature = [0u8; 8];
+    Ok(std::fs::File::open(path)?.read_exact(&mut signature).is_ok() && signature == PNG_SIGNATURE)
+}
+
+/// What a PNG written by Primordia carries for `render --recipe`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Embedded {
+    /// The JSON text of its recipe ([`RECIPE_KEYWORD`]).
+    pub recipe: Option<String>,
+    /// [`FRAMES_KEYWORD`], when it holds a whole number.
+    pub frames: Option<u32>,
+    /// [`FPS_KEYWORD`], when it holds a whole number.
+    pub fps: Option<u32>,
+}
+
+/// Reads what the PNG at `path` carries. Only the chunks before the image
+/// data are read, which is where [`write_png`] puts them.
+pub fn read_embedded(path: &Path) -> Result<Embedded> {
     let file = std::fs::File::open(path)?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     // Text chunks count against this limit: a recipe needs a few kilobytes.
     decoder.set_limits(png::Limits { bytes: 4 * crate::library::MAX_SAVE_BYTES as usize });
     let reader = decoder.read_info().context("not a readable PNG")?;
-    let chunk = reader.info().utf8_text.iter().find(|chunk| chunk.keyword == RECIPE_KEYWORD);
-    chunk.map(|chunk| chunk.get_text().context("reading the recipe chunk")).transpose()
+    let info = reader.info();
+    let chunk = info.utf8_text.iter().find(|chunk| chunk.keyword == RECIPE_KEYWORD);
+    let recipe = chunk.map(|chunk| chunk.get_text().context("reading the recipe chunk")).transpose()?;
+    let number = |keyword: &str| {
+        let chunk = info.uncompressed_latin1_text.iter().find(|chunk| chunk.keyword == keyword);
+        chunk.and_then(|chunk| chunk.text.trim().parse().ok())
+    };
+    Ok(Embedded { recipe, frames: number(FRAMES_KEYWORD), fps: number(FPS_KEYWORD) })
+}
+
+/// The JSON text of the recipe a PNG carries ([`RECIPE_KEYWORD`]), or `None`.
+pub fn read_recipe(path: &Path) -> Result<Option<String>> {
+    read_embedded(path).map(|embedded| embedded.recipe)
 }
 
 #[cfg(test)]
@@ -226,8 +278,9 @@ mod tests {
         let path = dir.path().join("nested").join("reef.png");
         let provenance = Provenance {
             title: Some(title(&fixture())),
-            command: Some("primordia render --recipe reef.png --frames 600".into()),
+            command: Some("primordia render --recipe reef.png".into()),
             gpu: Some("Test GPU (Vulkan)".into()),
+            run: Some(Run { frames: 240, fps: 30 }),
             recipe: Some(fixture()),
         };
         write_png(&path, size, &pixels(size), &provenance).unwrap();
@@ -240,13 +293,17 @@ mod tests {
         assert_eq!(get("Software"), Some((concat!("Primordia ", env!("CARGO_PKG_VERSION")), false)));
         assert_eq!(get("Source"), Some(("https://github.com/skulitom/primordia", false)));
         assert_eq!(get("Title"), Some(("Reaction-Diffusion · Coral Reef", false)), "Latin-1 text stays tEXt");
-        assert_eq!(get("Comment"), Some(("primordia render --recipe reef.png --frames 600", false)));
+        assert_eq!(get("Comment"), Some(("primordia render --recipe reef.png", false)));
         assert_eq!(get("primordia:gpu"), Some(("Test GPU (Vulkan)", false)));
+        assert_eq!((get(FRAMES_KEYWORD), get(FPS_KEYWORD)), (Some(("240", false)), Some(("30", false))));
         let (recipe, itxt) = get(RECIPE_KEYWORD).unwrap();
         assert!(itxt, "the recipe is an iTXt chunk");
         let back: SavedWorld = serde_json::from_str(recipe).unwrap();
         assert_eq!(serde_json::to_value(back).unwrap(), serde_json::to_value(fixture()).unwrap());
         assert_eq!(read_recipe(&path).unwrap().as_deref(), Some(recipe));
+        let embedded = read_embedded(&path).unwrap();
+        assert_eq!((embedded.frames, embedded.fps, embedded.recipe.as_deref()), (Some(240), Some(30), Some(recipe)));
+        assert!(is_png(&path).unwrap());
 
         // Text outside Latin-1 goes into iTXt; a plain save has only the two fixed chunks.
         let plain = dir.path().join("plain.png");
@@ -258,7 +315,8 @@ mod tests {
         save_png(&plain, size, pixels(size)).unwrap();
         let keys: Vec<String> = text_chunks(&plain).into_iter().map(|c| c.0).collect();
         assert_eq!(keys, ["Software", "Source"]);
-        assert_eq!(read_recipe(&plain).unwrap(), None);
+        assert_eq!(read_embedded(&plain).unwrap(), Embedded::default());
+        assert!(!is_png(Path::new("tests/fixtures/reaction-diffusion.json")).unwrap());
         assert!(write_png(&plain, [8, 8], &pixels(size), &Provenance::default()).is_err(), "wrong buffer size");
     }
 

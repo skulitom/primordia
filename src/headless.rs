@@ -10,8 +10,9 @@
 //! so a typo or an unwritable folder fails in milliseconds, not after the run.
 //!
 //! A render starts from a preset or a recipe (`--recipe`), edited by `--set`
-//! ([`crate::recipe`]). Every PNG it writes carries the recipe it shows and a
-//! command that renders it again ([`capture::write_png`]).
+//! ([`crate::recipe`]). Every PNG it writes carries the recipe it shows, the
+//! frames and time step it ran for, and a command that renders it again
+//! ([`capture::write_png`]).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,12 @@ pub struct RenderJob {
 
 /// Default headless frame-rate ceiling (see [`RenderJob::max_fps`]).
 pub const DEFAULT_MAX_FPS: f32 = 240.0;
+/// Frames a render simulates unless `--frames` (or a PNG given to `--recipe`) says otherwise.
+pub const DEFAULT_FRAMES: u32 = 600;
+/// Frames per simulated second unless `--fps` (or a PNG given to `--recipe`) says otherwise.
+pub const DEFAULT_FPS: u32 = 60;
+/// The frames per simulated second a render accepts.
+pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 1..=1000;
 
 /// A mouse button held for the whole render, either at a fixed spot or orbiting
 /// the centre of the world (one lap every four seconds of simulated time).
@@ -107,8 +114,8 @@ impl RenderJob {
             sets: Vec::new(),
             seed: 1,
             size: [1920, 1080],
-            frames: 600,
-            fps: 60,
+            frames: DEFAULT_FRAMES,
+            fps: DEFAULT_FPS,
             out: None,
             save_recipe: None,
             video: None,
@@ -384,7 +391,7 @@ pub(crate) fn shell_word(word: &str) -> String {
 /// A command that renders `png` again after `frames` frames: the preset form
 /// when the render started from a preset without `--set`, otherwise
 /// `--recipe` with the PNG itself, which carries the recipe with its seed,
-/// size, look and camera.
+/// size, look and camera, and the frame count and time step.
 fn reproduce_command(job: &RenderJob, rendered: &SavedWorld, frames: u32, png: &Path) -> String {
     let mut words: Vec<String> = vec!["primordia".into(), "render".into()];
     if job.recipe.is_none() && job.sets.is_empty() {
@@ -408,13 +415,13 @@ fn reproduce_command(job: &RenderJob, rendered: &SavedWorld, frames: u32, png: &
         if camera.center != [0.5, 0.5] {
             words.push(format!("--center={},{}", camera.center[0], camera.center[1]));
         }
+        words.extend(["--frames".into(), frames.to_string()]);
+        if job.fps != DEFAULT_FPS {
+            words.extend(["--fps".into(), job.fps.to_string()]);
+        }
     } else {
         let name = png.file_name().map_or_else(|| png.display().to_string(), |n| n.to_string_lossy().into_owned());
         words.extend(["--recipe".into(), name]);
-    }
-    words.extend(["--frames".into(), frames.to_string()]);
-    if job.fps != 60 {
-        words.extend(["--fps".into(), job.fps.to_string()]);
     }
     if let Some(brush) = job.brush {
         words.extend(["--brush", if brush.secondary { "secondary" } else { "primary" }].map(String::from));
@@ -490,7 +497,9 @@ fn execute(gpu: &Gpu, job: &RenderJob, plan: Plan) -> Result<RenderSummary> {
         Err(e) => return Err(e),
     };
     let provenance = |frames: u32, png: &Path| match &rendered {
-        Some(saved) => Provenance::of(saved, gpu).with_command(reproduce_command(job, saved, frames, png)),
+        Some(saved) => Provenance::of(saved, gpu)
+            .with_command(reproduce_command(job, saved, frames, png))
+            .with_run(frames, job.fps),
         None => Provenance::default(),
     };
 
@@ -1064,10 +1073,14 @@ mod tests {
              --height 1008 --exposure 1.5 --zoom 0.575 --center=0.4186335,0.944689 --frames 90 --fps 30 --brush secondary \
              --brush-radius 12 --brush-at=0.25,-0.5"
         );
-        let edited = RenderJob { sets: vec!["params.feed=0.03".parse().unwrap()], brush: None, ..job };
+        // The PNG itself carries the recipe, the frame count and the time step.
+        let edited = RenderJob { sets: vec!["params.feed=0.03".parse().unwrap()], brush: None, ..job.clone() };
+        let command = reproduce_command(&edited, &saved, 90, Path::new("out/my shot.png"));
+        assert_eq!(command, "primordia render --recipe \"my shot.png\"");
+        let brushed = RenderJob { sets: edited.sets.clone(), ..job };
         assert_eq!(
-            reproduce_command(&edited, &saved, 90, Path::new("out/my shot.png")),
-            "primordia render --recipe \"my shot.png\" --frames 90 --fps 30"
+            reproduce_command(&brushed, &saved, 90, Path::new("shot.png")),
+            "primordia render --recipe shot.png --brush secondary --brush-radius 12 --brush-at=0.25,-0.5"
         );
         assert_eq!(shell_word("C:\\renders\\a.png"), "\"C:\\\\renders\\\\a.png\"");
         assert_eq!(shell_word(""), "\"\"");

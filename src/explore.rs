@@ -52,6 +52,8 @@ const SCALED_LIMIT: f32 = 6.0;
 /// A vital measurement's late mean below this marks a candidate as inert (the
 /// vital measurements of each world are registered in `WorldEntry::vital`).
 const INERT: f32 = 1e-3;
+/// Frames per simulated second of every candidate: each frame advances 1/60 s.
+const FPS: u32 = 60;
 
 /// How the archive is chosen from the evaluated candidates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -583,7 +585,7 @@ impl Bench<'_> {
         let gpu = self.gpu;
         let view = ViewXform::fit(self.world.size(), self.size, &Camera::default());
         let look = self.world.post_settings();
-        let dt = 1.0 / 60.0;
+        let dt = 1.0 / FPS as f32;
         let mut samples = Vec::with_capacity(self.frames as usize);
         let started = Instant::now();
         self.sampler.discard();
@@ -698,12 +700,12 @@ fn recipe(world_name: &str, candidate: &Candidate, rank: usize, size: [u32; 2]) 
     }
 }
 
-/// What an explore image says about itself: its recipe, and that `render
-/// --recipe <image> --frames <frames>` renders it again.
+/// What an explore image says about itself: its recipe, the frames it ran
+/// for, and that `render --recipe <image>` renders it again.
 fn image_provenance(saved: &SavedWorld, gpu: &Gpu, image: &Path, frames: u32) -> Provenance {
     let name = image.file_name().map_or_else(|| image.display().to_string(), |n| n.to_string_lossy().into_owned());
-    let command = format!("primordia render --recipe {} --frames {frames}", headless::shell_word(&name));
-    Provenance::of(saved, gpu).with_command(command)
+    let command = format!("primordia render --recipe {}", headless::shell_word(&name));
+    Provenance::of(saved, gpu).with_command(command).with_run(frames, FPS)
 }
 
 /// The columns of `candidates.csv` before the descriptor, with what they hold

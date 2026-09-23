@@ -241,10 +241,7 @@ fn read_save(path: &Path) -> Result<SavedWorld> {
 /// file included, is invalid input ([`Failure::Usage`]).
 pub fn load(path: &Path) -> Result<SavedWorld> {
     let loaded = (|| -> Result<SavedWorld> {
-        let mut signature = [0u8; 8];
-        let png = std::fs::File::open(path)?.read_exact(&mut signature).is_ok()
-            && signature == crate::capture::PNG_SIGNATURE;
-        if !png {
+        if !crate::capture::is_png(path)? {
             return read_save(path);
         }
         let text = crate::capture::read_recipe(path)?.context(

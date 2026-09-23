@@ -257,12 +257,32 @@ pub fn changed(sets: &[Setting]) -> String {
 pub struct Recipe {
     pub path: PathBuf,
     pub saved: SavedWorld,
+    /// How far the world had run in the PNG the recipe came from
+    /// (`primordia:frames` and `primordia:fps`); `None` for a `.json` file.
+    pub run: Option<RecordedRun>,
+}
+
+/// The frames and time step a PNG records; each is `None` when missing or
+/// out of the range `render` accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordedRun {
+    pub frames: Option<u32>,
+    pub fps: Option<u32>,
 }
 
 impl Recipe {
-    /// Reads and checks the recipe in `path` (see [`library::load`]).
+    /// Reads and checks the recipe in `path` (see [`library::load`]), and for
+    /// a PNG how far its world had run.
     pub fn load(path: &Path) -> Result<Self> {
-        Ok(Self { path: path.to_owned(), saved: library::load(path)? })
+        let saved = library::load(path)?;
+        let run = match crate::capture::is_png(path) {
+            Ok(true) => crate::capture::read_embedded(path).ok().map(|embedded| RecordedRun {
+                frames: embedded.frames.filter(|n| *n >= 1),
+                fps: embedded.fps.filter(|n| headless::FPS_RANGE.contains(n)),
+            }),
+            _ => None,
+        };
+        Ok(Self { path: path.to_owned(), saved, run })
     }
 }
 
@@ -588,7 +608,7 @@ mod tests {
 
     #[test]
     fn recipe_sources_resolve_names_seeds_and_settings_without_a_gpu() {
-        let recipe = Recipe { path: PathBuf::from("reef.json"), saved: fixture() };
+        let recipe = Recipe { path: PathBuf::from("reef.json"), saved: fixture(), run: None };
         let source = Source::resolve(Some(&recipe), "ignored", None, 7, &[set("params.kill=0.05")]).unwrap();
         let Source::Recipe(saved) = &source else { panic!("expected the recipe") };
         assert_eq!((saved.seed, source.world(), source.preset()), (7, 3, Some(0)));
@@ -605,6 +625,25 @@ mod tests {
         let error = Source::resolve(Some(&bad), "rd", None, 1, &[]).unwrap_err();
         assert!(error.to_string().contains("names preset 100 of reaction-diffusion, which has presets 1-10"), "{error}");
         assert_eq!(crate::failure::exit_code(&error), 2);
+    }
+
+    #[test]
+    fn recipe_pngs_record_how_long_their_world_ran() {
+        use crate::capture::{write_png, Provenance, Run};
+        let dir = tempfile::tempdir().unwrap();
+        let png = |name: &str, run: Option<Run>| {
+            let path = dir.path().join(name);
+            let provenance = Provenance { recipe: Some(fixture()), run, ..Provenance::default() };
+            write_png(&path, [4, 4], &[9; 64], &provenance).unwrap();
+            path
+        };
+        let recorded = Recipe::load(&png("ran.png", Some(Run { frames: 90, fps: 30 }))).unwrap();
+        assert_eq!(recorded.run, Some(RecordedRun { frames: Some(90), fps: Some(30) }));
+        // Values render would refuse are left out, and so is a PNG from before the chunks existed.
+        let odd = Recipe::load(&png("odd.png", Some(Run { frames: 0, fps: 5000 }))).unwrap();
+        assert_eq!(odd.run, Some(RecordedRun::default()));
+        assert_eq!(Recipe::load(&png("old.png", None)).unwrap().run, Some(RecordedRun::default()));
+        assert_eq!(Recipe::load(Path::new("tests/fixtures/reaction-diffusion.json")).unwrap().run, None);
     }
 
     #[test]
