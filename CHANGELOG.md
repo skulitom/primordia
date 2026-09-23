@@ -36,6 +36,10 @@ edit without the app, and fixes for the v0.1.0 Windows exe.
 - The window and the Windows exe carry the Primordia icon, and the exe its version information.
 - A short report for internal failures (exit status 3) that names the backend and the adapter and says where to
   report it.
+- A page for each world in `docs/worlds/`: what it models, its presets, settings and measurements, and how it runs
+  on the GPU.
+- For AI agents: a `primordia` skill in `.claude/skills/`, a command-line reference in `docs/CLI.md` generated from
+  `--help`, `AGENTS.md` and `llms.txt`.
 - For contributors: `PRIMORDIA_GPU_TESTS=skip` runs the tests without a GPU; CI runs clippy on Rust 1.86 and stable
   and the GPU tests on lavapipe; CONTRIBUTING.md, issue forms, a pull request template and CITATION.cff.
 
@@ -56,6 +60,7 @@ edit without the app, and fixes for the v0.1.0 Windows exe.
 - On DirectX 12, Primordia says when it is compiling shaders, which can take minutes on the first start.
 - Checkboxes are squares, filled with the accent colour when checked.
 - Lenia mutations log their kernel tables only at debug level.
+- The README's images are WebP: 1.9 MB instead of 20 MB.
 
 ### Fixed
 
