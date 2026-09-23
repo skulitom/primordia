@@ -26,11 +26,13 @@ Primordia is a playground for **emergence** and **self-organisation**. It has fo
 
 ## The five worlds
 
+Each world also has a page of its own, with its settings, measurements and how it runs on the GPU: [Physarum](docs/worlds/physarum.md), [Particle Life](docs/worlds/particle-life.md), [Lenia](docs/worlds/lenia.md), [Reaction-Diffusion](docs/worlds/reaction-diffusion.md) and [Symbiosis](docs/worlds/symbiosis.md).
+
 ### 1 · Physarum (slime mould)
 
 ![Physarum slime-mould transport network, Dendrites preset](docs/images/physarum.webp)
 
-A multi-species version of Jeff Jones' *Physarum polycephalum* agent model, in the spirit of Sage Jenson's work. About **3-6 million agents** (at 1080p) sense the chemical trail ahead of them, steer toward it and deposit more. Out of that loop grow self-optimising transport networks: white-hot arteries fed by fine capillaries that keep remodelling. Up to four species attract or repel each other through an interaction matrix and fight over territory. Left-click drops food; right-click repels.
+A multi-species version of Jeff Jones' *Physarum polycephalum* agent model, in the spirit of Sage Jenson's work. About **3-5 million agents** (at 1080p) sense the chemical trail ahead of them, steer toward it and deposit more. Out of that loop grow self-optimising transport networks: white-hot arteries fed by fine capillaries that keep remodelling. Up to four species attract or repel each other through an interaction matrix and fight over territory. Left-click drops food; right-click repels.
 
 **Presets:** Dendrites · Neural Lace · Mycelium · Rival Colonies · Symbiosis · Honeycomb · Synapses · Currents · Chasing Waves · Galaxy
 
