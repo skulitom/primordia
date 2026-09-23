@@ -225,7 +225,7 @@ primordia recipe -w rd -p mitosis # a preset's complete recipe: every key --set 
 primordia selftest                # verify this GPU's shader maths and list its adapters
 ```
 
-Worlds and presets accept a name, a unique prefix, a number or an alias (`rd`, `pl`, `slime`, `gray-scott`); a typo gets a suggestion. Headless renders are capped at 240 fps by default, so long batch jobs don't run your GPU flat out; `--max-fps 0` removes the cap. `primordia help render` lists every option.
+Worlds and presets accept a name, a unique prefix, a number or an alias (`rd`, `pl`, `slime`, `gray-scott`); a typo gets a suggestion. Headless renders are capped at 240 fps by default, so long batch jobs don't run your GPU flat out; `--max-fps 0` removes the cap. `primordia help render` lists every option, and [docs/CLI.md](docs/CLI.md) has every command's.
 
 Every PNG that Primordia writes names the program and its source and carries its recipe, how many frames the world ran and at what rate, the GPU and a command that reproduces it, in PNG text chunks (`Software`, `Source`, `Title`, `Comment`, `primordia:gpu`, `primordia:frames`, `primordia:fps` and `primordia:recipe`). The same seed, settings and frame count give the same image on the same GPU, driver and backend. Other GPUs give the same kind of pattern, but the chaotic worlds (Particle Life, Physarum, Symbiosis) diverge within a few hundred frames.
 
@@ -252,7 +252,7 @@ Every kept candidate is re-simulated from its recipe for its image, which proves
 
 ## Scripting and automation
 
-Primordia is built to be driven by scripts and AI agents as well as by hand.
+Primordia is built to be driven by scripts and AI agents as well as by hand. Agents can load the [primordia skill](.claude/skills/primordia/SKILL.md), which Claude Code picks up in a clone of this repository, and [llms.txt](llms.txt) indexes the documentation.
 
 - **Discovery without a GPU.** `primordia list --json` describes every world: ids, aliases, presets, measurements (id, unit, range, meaning, and whether explore treats it as vital) and palettes, plus the library folder.
 - **Output.** Logs and progress go to stderr (`-q` keeps warnings and errors, `-v` adds debug). stdout carries results only: the path of every file written, one per line, or with `--json` a single JSON object at the end, `{"ok":true,"command":"render",...}` or `{"ok":false,"error":{"kind":...,"message":...}}`. Seeds are JSON strings, because they can exceed what JavaScript numbers hold exactly.

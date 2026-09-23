@@ -1,0 +1,32 @@
+# Primordia
+
+> A GPU artificial-life laboratory in Rust and wgpu. One binary, `primordia`, runs five real-time simulations on compute shaders (Physarum slime mould, Particle Life, Lenia, Gray-Scott reaction-diffusion and Symbiosis, which couples agents with chemistry) with 42 presets, live GPU measurements, a novelty search over parameter mutations, and headless rendering of stills, videos and galleries. MIT licensed.
+
+Without a command, `primordia` opens an interactive window. The commands `list` (no GPU needed), `render`, `gallery`, `recipe`, `explore` and `selftest` run headless and exit, print one JSON object with `--json`, and exit with 2 for invalid input, 3 for GPU failures and 4 for ffmpeg failures. Every PNG it writes carries the recipe that reproduces it. It needs a GPU with Vulkan, DirectX 12 or Metal.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/skulitom/primordia/main/README.md): the worlds, features, quick start, controls, headless rendering, explore, scripting and troubleshooting
+- [Agent skill](https://raw.githubusercontent.com/skulitom/primordia/main/.claude/skills/primordia/SKILL.md): how to drive the command line, with ground rules, recipes, measurements and a cookbook
+- [Command-line reference](https://raw.githubusercontent.com/skulitom/primordia/main/docs/CLI.md): every command and option, generated from `--help`
+- [Measurements](https://raw.githubusercontent.com/skulitom/primordia/main/.claude/skills/primordia/references/measurements.md): every world's measurements with units, meanings and which ones are vital
+
+## Worlds
+
+- [Physarum](https://raw.githubusercontent.com/skulitom/primordia/main/docs/worlds/physarum.md): millions of slime-mould agents that build transport networks
+- [Particle Life](https://raw.githubusercontent.com/skulitom/primordia/main/docs/worlds/particle-life.md): particle species with asymmetric attractions that self-assemble
+- [Lenia](https://raw.githubusercontent.com/skulitom/primordia/main/docs/worlds/lenia.md): a continuous cellular automaton with Orbium gliders
+- [Reaction-Diffusion](https://raw.githubusercontent.com/skulitom/primordia/main/docs/worlds/reaction-diffusion.md): Gray-Scott chemistry, from coral to spiral waves
+- [Symbiosis](https://raw.githubusercontent.com/skulitom/primordia/main/docs/worlds/symbiosis.md): agents and chemistry coupled through three relationships
+
+## Development
+
+- [Agent guide](https://raw.githubusercontent.com/skulitom/primordia/main/AGENTS.md): layout, checks and rules for coding agents
+- [Contributing](https://raw.githubusercontent.com/skulitom/primordia/main/CONTRIBUTING.md): building, tests, style and commit messages
+- [Writing a world](https://raw.githubusercontent.com/skulitom/primordia/main/docs/WRITING_A_WORLD.md): the World trait, the checklist and WGSL gotchas
+
+## Optional
+
+- [Changelog](https://raw.githubusercontent.com/skulitom/primordia/main/CHANGELOG.md)
+- [Citation](https://raw.githubusercontent.com/skulitom/primordia/main/CITATION.cff)
+- [Releases](https://github.com/skulitom/primordia/releases): archives for Windows, Linux and macOS

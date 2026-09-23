@@ -33,6 +33,10 @@ cargo run --release --locked -- selftest
 Clippy has to be clean both on 1.86 and on current stable, since newer compilers add lints;
 `rustup toolchain install 1.86` gets the older one.
 
+`docs/CLI.md` and `.claude/skills/primordia/references/measurements.md` are generated from the help texts and the
+world registry, and tests fail when they are out of date. After changing either, run
+`PRIMORDIA_BLESS=1 cargo test --locked generated_` and commit the files it rewrites.
+
 ### GPU tests
 
 About half of the tests need a GPU adapter, though never a window. They hold a lock for as long as they have a

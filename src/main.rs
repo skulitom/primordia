@@ -1296,4 +1296,241 @@ mod tests {
         assert!(pixels(Path::new(&again)) == pixels(Path::new(&plain)), "the Comment command renders the image again");
         assert!(gpu.fatal_error().is_none(), "{:?}", gpu.fatal_error());
     }
+
+    // --- generated documentation ---------------------------------------------------
+
+    /// Compares `text` with the checked-in file `path` (relative to the crate),
+    /// or rewrites the file when `PRIMORDIA_BLESS=1`. Git may check it out with
+    /// CRLF line endings, which do not count as a difference; it is written with LF.
+    fn check_generated(path: &str, text: &str) {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        if std::env::var("PRIMORDIA_BLESS").is_ok_and(|v| v == "1") {
+            std::fs::write(&file, text).unwrap_or_else(|e| panic!("cannot write {}: {e}", file.display()));
+            return;
+        }
+        let current = std::fs::read_to_string(&file).unwrap_or_default().replace("\r\n", "\n");
+        if current != text {
+            let line = current.lines().zip(text.lines()).take_while(|(old, new)| old == new).count() + 1;
+            panic!(
+                "{path} is out of date (it differs from line {line}): run `PRIMORDIA_BLESS=1 cargo test --locked \
+                 generated_` and commit the file"
+            );
+        }
+    }
+
+    /// Stands for the library folder, which the help names, in docs/CLI.md.
+    const LIBRARY_PLACEHOLDER: &str = "<library folder>";
+
+    /// docs/CLI.md: the long help of `primordia` and of every command, as
+    /// `--help` prints it, with the library folder replaced and no trailing spaces.
+    fn cli_reference() -> String {
+        // Clap only wraps help with its wrap_help feature (off), but the width still steers the layout: pin it.
+        let mut cli = Cli::command().term_width(100);
+        cli.build();
+        let mut sections = vec![("primordia".to_string(), cli.render_long_help().to_string())];
+        let names: Vec<String> =
+            cli.get_subcommands().map(|c| c.get_name().to_string()).filter(|name| name != "help").collect();
+        for name in &names {
+            let help = cli.find_subcommand_mut(name).unwrap().render_long_help().to_string();
+            sections.push((format!("primordia {name}"), help));
+        }
+        let mut text = String::from(
+            "# Command-line reference\n\n\
+             Every option of `primordia` and its commands, as `primordia --help` and `primordia <command> --help` \
+             print them.\n`<library folder>` stands for the folder of saved recipes on the machine running them \
+             (`primordia list` names it).\nThe [README](../README.md) has examples and background; coding agents \
+             start with the [primordia skill](../.claude/skills/primordia/SKILL.md).\n\n\
+             This file is generated from `src/main.rs` by the test `generated_cli_reference_is_current`. After \
+             changing any help text, run\n`PRIMORDIA_BLESS=1 cargo test --locked generated_` and commit the result.\n\n",
+        );
+        let contents: Vec<String> =
+            sections.iter().map(|(title, _)| format!("[{title}](#{})", title.replace(' ', "-"))).collect();
+        text += &format!("Contents: {}\n", contents.join(" · "));
+        for (title, help) in &sections {
+            text += &format!("\n## {title}\n\n```text\n{}\n```\n", help.trim_end());
+        }
+        let library = library::default_directory().display().to_string();
+        let text = text
+            .replace(&format!("[now: {library}]"), &format!("[now: {LIBRARY_PLACEHOLDER}]"))
+            .replace(&format!("library ({library};"), &format!("library ({LIBRARY_PLACEHOLDER};"));
+        // The root help and explore --install name the folder; wherever else it appears it would leak into the file.
+        assert_eq!(text.matches(LIBRARY_PLACEHOLDER).count(), 3, "the library folder is named elsewhere too:\n{text}");
+        text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") + "\n"
+    }
+
+    #[test]
+    fn generated_cli_reference_is_current() {
+        let text = cli_reference();
+        for command in ["list", "render", "gallery", "recipe", "explore", "selftest"] {
+            assert!(text.contains(&format!("\n## primordia {command}\n")), "docs/CLI.md lacks {command}");
+            assert!(text.contains(&format!("Usage: primordia {command} [OPTIONS]")), "{command}");
+        }
+        assert!(text.contains("  --json\n") && text.contains("Exit status:"), "global options and the root help");
+        check_generated("docs/CLI.md", &text);
+    }
+
+    /// The skill's measurement reference: every world's measurements from the
+    /// registry, in CSV column order, with the hints `primordia list` prints.
+    fn measurement_reference() -> String {
+        let mut text = String::from(
+            "# Measurements\n\n\
+             Every measurement of every world, in the order of the columns a `primordia render --metrics` CSV file \
+             has after\n`frame,time,series`. The ids are also what `primordia explore --select max:<id>` and \
+             `min:<id>` take, and\n`<id>_mean`, `<id>_std` and `<id>_drift` are explore's candidates.csv columns. \
+             `primordia list --world <id>` prints\nthe same table, and `primordia list --json` the same data.\n\n\
+             A fraction is a share of cells or agents from 0 to 1; a scalar is a plain number (a mean, a ratio or a \
+             signed\nrate). Explore counts a candidate as inert, and keeps it only with `--keep-inert`, when the \
+             mean of any of its vital\nmeasurements over the last 40% of its frames is below 0.001.\n\n\
+             This file is generated from the world registry (`src/world/mod.rs`) by the test\n\
+             `generated_measurement_reference_is_current` in `src/main.rs`. After changing a measurement, run\n\
+             `PRIMORDIA_BLESS=1 cargo test --locked generated_` and commit the result.\n",
+        );
+        for entry in WORLDS {
+            let vital: Vec<String> = entry.vital.iter().map(|id| format!("`{id}`")).collect();
+            text += &format!("\n## {}\n\n{}. Vital: {}.\n\n", entry.id, entry.name, vital.join(", "));
+            text += "| Id | Unit | Vital | Label | Meaning |\n|---|---|---|---|---|\n";
+            for metric in entry.metrics {
+                let vital = if entry.vital.contains(&metric.id) { "yes" } else { "" };
+                let cells = [metric.unit.name(), vital, metric.label, &metric.hint.replace('|', "\\|")];
+                text += &format!("| `{}` | {} |\n", metric.id, cells.join(" | "));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn generated_measurement_reference_is_current() {
+        check_generated(".claude/skills/primordia/references/measurements.md", &measurement_reference());
+    }
+
+    /// Words of a Markdown line as a shell would split a command in it: inline
+    /// code marks separate words, and quotes group them.
+    fn shell_words(line: &str) -> Vec<String> {
+        let (mut words, mut word, mut quote) = (Vec::new(), None::<String>, None);
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => word.get_or_insert_with(String::new).push(c),
+                (None, '"' | '\'') => {
+                    quote = Some(c);
+                    word.get_or_insert_with(String::new);
+                }
+                (None, c) if c.is_whitespace() || c == '`' => words.extend(word.take()),
+                (None, c) => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        words.extend(word);
+        words
+    }
+
+    /// Placeholders such as `W`, `<id>` or `$SEED` stand for a name the reader picks.
+    fn placeholder(word: &str) -> bool {
+        word.starts_with(['<', '$', '{', '[']) || word.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+    }
+
+    /// The cells of a Markdown table row, trimmed and without inline code marks.
+    fn cells(row: &str) -> Vec<String> {
+        let row = row.trim().trim_start_matches('|').trim_end_matches('|');
+        row.split('|').map(|cell| cell.trim().replace('`', "")).collect()
+    }
+
+    /// The rows of the table whose header row starts with `header`.
+    fn table_rows<'a>(text: &'a str, header: &str) -> Vec<&'a str> {
+        let mut lines = text.lines().skip_while(|line| !line.starts_with(header));
+        assert!(lines.next().is_some(), "no table headed {header:?}");
+        lines.skip(1).take_while(|line| line.starts_with('|')).collect()
+    }
+
+    /// The primordia skill (.claude/skills/primordia/SKILL.md) teaches agents the
+    /// CLI. It must not drift: its tables list every world with its aliases and
+    /// presets and every measurement in CSV order, every world, preset and
+    /// measurement its commands and `max:`/`min:` selections name exists, and its
+    /// front matter fits the Agent Skills format.
+    #[test]
+    fn skill_names_only_registered_worlds_presets_and_measurements() {
+        let skill = include_str!("../.claude/skills/primordia/SKILL.md");
+        let lines: Vec<&str> = skill.lines().collect();
+        assert!(lines.len() < 500, "SKILL.md has {} lines; keep it under 500", lines.len());
+        assert_eq!(lines[0], "---", "SKILL.md starts with YAML front matter");
+        let end = lines[1..].iter().position(|line| *line == "---").expect("the front matter ends with ---") + 1;
+        let field = |key: &str| {
+            let prefix = format!("{key}: ");
+            lines[1..end].iter().find_map(|line| line.strip_prefix(&prefix)).unwrap_or_else(|| panic!("no {key}"))
+        };
+        assert_eq!(field("name"), "primordia", "the name matches the folder");
+        let description = field("description");
+        assert!((1..=1024).contains(&description.chars().count()), "description: {} chars", description.len());
+        assert!(field("compatibility").chars().count() <= 500);
+
+        // The worlds table: number, id, aliases and presets, exactly as registered.
+        let rows = table_rows(skill, "| # | World |");
+        assert_eq!(rows.len(), WORLDS.len(), "one row per world");
+        for (index, (row, entry)) in rows.iter().zip(WORLDS).enumerate() {
+            let cells = cells(row);
+            assert_eq!(cells[0], (index + 1).to_string(), "{row}");
+            assert_eq!(cells[1], entry.id, "{row}");
+            assert_eq!(cells[2], entry.aliases.join(", "), "{}: aliases", entry.id);
+            assert_eq!(cells[3], (entry.presets)().join(", "), "{}: presets", entry.id);
+        }
+
+        // The measurement table: every id in CSV column order, vital ones marked with *.
+        let rows = table_rows(skill, "| World | Measurements");
+        assert_eq!(rows.len(), WORLDS.len(), "one row per world");
+        for (row, entry) in rows.iter().zip(WORLDS) {
+            let cells = cells(row);
+            assert_eq!(cells[0], entry.id, "{row}");
+            let listed: Vec<(&str, bool)> =
+                cells[1].split(',').map(|id| id.trim()).map(|id| (id.trim_end_matches('*'), id.ends_with('*'))).collect();
+            let registered: Vec<(&str, bool)> =
+                entry.metrics.iter().map(|m| (m.id, entry.vital.contains(&m.id))).collect();
+            assert_eq!(listed, registered, "{}: measurements (id, vital) in CSV order", entry.id);
+        }
+
+        // Commands: worlds and presets resolve, and --select names a measurement of the command's world.
+        let metric_exists = |world: Option<usize>, id: &str| match world {
+            Some(w) => world::resolve_metric(w, id).is_ok(),
+            None => (0..WORLDS.len()).any(|w| world::resolve_metric(w, id).is_ok()),
+        };
+        let mut commands = 0;
+        for line in &lines {
+            let words = shell_words(line);
+            for word in &words {
+                if let Some(id) = word.strip_prefix("max:").or_else(|| word.strip_prefix("min:")) {
+                    assert!(placeholder(id) || metric_exists(None, id), "no world measures '{id}': {line}");
+                }
+            }
+            let starts = words.iter().enumerate().filter(|(_, w)| Path::new(w.as_str()).file_stem() == Some("primordia".as_ref()));
+            for (start, _) in starts {
+                commands += 1;
+                let args = &words[start + 1..];
+                let value = |flags: &[&str]| -> Option<&str> {
+                    args.iter().enumerate().find_map(|(i, arg)| {
+                        let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)));
+                        flags.contains(&flag).then(|| inline.or(args.get(i + 1).map(String::as_str))).flatten()
+                    })
+                };
+                let world = match value(&["-w", "--world"]) {
+                    Some(name) if placeholder(name) => None,
+                    Some(name) => Some(world::resolve(name).unwrap_or_else(|e| panic!("{e}: {line}"))),
+                    // Without --recipe a command runs the default world, Physarum.
+                    None => value(&["--recipe"]).is_none().then_some(0),
+                };
+                if let (Some(w), Some(preset)) = (world, value(&["-p", "--preset"])) {
+                    assert!(placeholder(preset) || world::resolve_preset(w, preset).is_ok(), "preset '{preset}': {line}");
+                }
+                if let Some(select) = value(&["--select"]) {
+                    if let Some((_, id)) = select.split_once(':') {
+                        assert!(placeholder(id) || metric_exists(world, id), "measurement '{id}': {line}");
+                    }
+                }
+            }
+        }
+        assert!(commands >= 20, "found only {commands} primordia commands in SKILL.md");
+
+        // The parser itself.
+        assert_eq!(shell_words(r#"`primordia render -w lenia -p "Pearl Reef"` and 'a b'"#), [
+            "primordia", "render", "-w", "lenia", "-p", "Pearl Reef", "and", "a b"
+        ]);
+        assert!(placeholder("W") && placeholder("<id>") && !placeholder("rd"));
+    }
 }
