@@ -10,8 +10,8 @@ abstract: >-
   compute shaders: Physarum slime mould, Particle Life, Lenia, Gray-Scott reaction-diffusion and Symbiosis, which
   couples agents with chemistry. It measures every world live on the GPU, renders stills, videos and galleries
   headlessly, and searches each world's parameters for novel behaviour.
-version: "0.1.0"
-date-released: "2026-09-20"
+version: "0.2.0"
+date-released: "2026-09-23"
 license: MIT
 repository-code: "https://github.com/skulitom/primordia"
 keywords:

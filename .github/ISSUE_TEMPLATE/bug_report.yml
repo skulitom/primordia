@@ -30,7 +30,7 @@ body:
     attributes:
       label: Version
       description: The output of `primordia --version`, or the commit (`git rev-parse --short HEAD`) if you built it.
-      placeholder: primordia 0.1.0
+      placeholder: primordia 0.2.0
     validations:
       required: true
 

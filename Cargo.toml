@@ -1,6 +1,6 @@
 [package]
 name = "primordia"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.86"
 description = "A GPU artificial-life laboratory: slime moulds, particle life, Lenia, reaction-diffusion and a coupled Symbiosis world, with live measurements, novelty search and headless rendering."
