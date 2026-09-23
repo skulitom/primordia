@@ -10,6 +10,20 @@ repository = "https://github.com/skulitom/primordia"
 homepage = "https://github.com/skulitom/primordia"
 keywords = ["artificial-life", "wgpu", "simulation", "generative-art", "physarum"]
 categories = ["simulation", "graphics", "visualization"]
+# What a crates.io package needs to build and test: the README's images stay in the repository, which crates.io
+# links them from. The skill and the CLI reference are read by the tests that keep them current.
+include = [
+    "/src/**",
+    "/build.rs",
+    "/assets/primordia.ico",
+    "/.cargo/config.toml",
+    "/tests/fixtures/**",
+    "/docs/CLI.md",
+    "/.claude/skills/primordia/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
 [dependencies]
 # Rendering / windowing. Versions are pinned to the newest releases that still
